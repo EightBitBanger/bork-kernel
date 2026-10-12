@@ -1,0 +1,16 @@
+# config.txt -- goes on the SD card's FAT boot partition, next to kernel8.img.
+# This is what replaces GRUB + the Multiboot header.
+
+arm_64bit=1
+kernel=kernel8.img
+kernel_address=0x80000
+
+# Keep peripherals at 0xFE000000 / GIC at 0xFF840000 (what interrupt.c assumes)
+arm_peri_high=0
+
+# Firmware still sets up a framebuffer; the mailbox call in boot.c picks the mode
+disable_overscan=1
+framebuffer_depth=32
+
+# Serial console on GPIO 14/15 -- your best friend before the screen works
+enable_uart=1

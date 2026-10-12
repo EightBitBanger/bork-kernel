@@ -1,0 +1,16 @@
+#ifndef _KERNEL_BOOT_IMAGE_H_
+#define _KERNEL_BOOT_IMAGE_H_
+
+#include <stdint.h>
+
+// The boot area this kernel was loaded from: sector 0 (MBR + stage 1),
+// stage 2 and the kernel file, exactly as they sit at the front of the boot
+// disk. Stage 2 hands it over as Multiboot module 0; kmain() moves it into
+// memory the kernel reserves for it. "boot install" writes it to a new disk.
+
+void boot_image_set(uint32_t address, uint32_t size);
+
+// NULL when there is none (booted by another loader, or no RAM to keep it)
+const uint8_t* boot_image_get(uint32_t* size);
+
+#endif
