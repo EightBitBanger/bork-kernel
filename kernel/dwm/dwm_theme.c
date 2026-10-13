@@ -1,3 +1,4 @@
+
 #include <kernel/dwm/dwm.h>
 #include <kernel/dwm/dwm_core_internal.h>
 
@@ -70,6 +71,12 @@ static const struct DWMTheme dwm_default_theme = {
         .used               = 0xFFF700F7,
         .available          = 0xFF0000F6,
     },
+    .notify = {
+        .error_background   = 0xFF2A0808,
+        .error_border       = 0xFFC02020,
+        .error_title        = 0xFFFF7070,
+        .error_text         = 0xFFF0D8D8,
+    },
 };
 
 void dwm_theme_init(void) {
@@ -124,3 +131,4 @@ void dwm_set_theme(const struct DWMTheme* new_theme) {
     // Desktop background and icon labels
     dwm_invalidate_region(0, 0, display_get_width(), display_get_height());
 }
+

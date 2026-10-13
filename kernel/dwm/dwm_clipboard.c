@@ -1,3 +1,4 @@
+
 #include <kernel/dwm/dwm_clipboard.h>
 #include <kernel/dwm/dwm.h>
 #include <kernel/dwm/dwm_core_internal.h>
@@ -8,6 +9,7 @@
 #include <kernel/scheduler/watchdog.h>
 #include <kernel/malloc.h>
 #include <kernel/vfs/vfs.h>
+#include <kernel/resources/resource_io.h>
 #include <kernel/console/display.h>
 #include <kernel/util/list.h>
 #include <kernel/util/string.h>
@@ -536,17 +538,6 @@ static bool paste_path_is_on_device(const char* path) {
     return false;
 }
 
-// vfs_write may move fewer bytes than asked; loop until done
-static bool paste_write_full(File file, const uint8_t* data, uint32_t count) {
-    uint32_t put = 0;
-    while (put < count) {
-        int32_t n = vfs_write(file, data + put, count - put);
-        if (n <= 0) return false;
-        put += (uint32_t)n;
-    }
-    return true;
-}
-
 // Text paste: write the clipboard text into a new "clipping" file. Written
 // straight from the clipboard's own block (a view), so a multi-megabyte
 // paste does not need a second copy of the text on the heap.
@@ -580,7 +571,7 @@ static bool paste_write_text(const char* dir, char* out_path, size_t path_size, 
             file = vfs_open(out_path, VFS_OPEN_READ | VFS_OPEN_WRITE);
             if (file != VFS_INVALID_FILE) {
                 vfs_seek(file, 0);
-                ok = paste_write_full(file, view.data, length);
+                ok = resource_write_exact(file, view.data, length);
                 vfs_close(file);
             }
         }

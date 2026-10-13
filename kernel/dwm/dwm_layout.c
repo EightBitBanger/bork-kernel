@@ -1,3 +1,4 @@
+
 // Desktop icon layout persistence.
 //
 // Icon positions are stored in <home>/usr/icons, next to usr/desktop.
@@ -17,6 +18,7 @@
 
 #include <kernel/kernel.h>
 #include <kernel/vfs/vfs.h>
+#include <kernel/resources/resource_io.h>
 #include <kernel/console/display.h>
 
 #include <kernel/util/string.h>
@@ -110,13 +112,14 @@ bool dwm_desktop_layout_load(void) {
         return false;
     }
 
-    int32_t bytes_read = vfs_read(file, buffer, file_size);
+    // vfs_read may return short counts: read until the whole file is in
+    bool read_ok = resource_read_at(file, 0, buffer, file_size);
     vfs_close(file);
 
     bool ok = false;
     struct DesktopLayoutHeader* header = (struct DesktopLayoutHeader*)buffer;
 
-    if (bytes_read == (int32_t)file_size &&
+    if (read_ok &&
         header->magic[0] == 'I' && header->magic[1] == 'C' &&
         header->magic[2] == 'O' && header->magic[3] == 'N' &&
         header->version == DESKTOP_LAYOUT_VERSION &&
@@ -213,10 +216,10 @@ bool dwm_desktop_layout_save(void) {
     }
 
     vfs_seek(file, 0);
-    int32_t written = vfs_write(file, buffer, total_size);
+    bool written = resource_write_exact(file, buffer, total_size);
     uint32_t final_size = vfs_get_size(file);
     vfs_close(file);
     free(buffer);
 
-    return written == (int32_t)total_size && final_size == total_size;
+    return written && final_size == total_size;
 }

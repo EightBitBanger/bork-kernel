@@ -1,3 +1,4 @@
+
 #include <kernel/dwm/windows/notification.h>
 #include <kernel/dwm/dwm_core_internal.h>
 
@@ -23,6 +24,7 @@
 #define NT_COLS         ((NT_WIDTH - NT_TEXT_X - NT_PAD) / NT_FONT_W)
 #define NT_MAX_LINES    4
 #define NT_MESSAGE_MAX  256
+#define NT_CLOSE_COLS   2       // Title columns given up to the "x" on sticky notifications
 
 #define NT_MAX_VISIBLE  5       // Showing at once (oldest is pushed out)
 #define NT_SLIDE_DIV    4       // Slide speed: 1/4 of the remaining distance per frame
@@ -39,7 +41,8 @@
 // notifications are appended and land on top of the stack.
 
 struct NtEntry {
-    WindowHandle handle;
+    WindowHandle  handle;
+    DWMNotifyKind kind;
 
     char     title[NT_COLS + 1];
     char     lines[NT_MAX_LINES][NT_COLS + 1];
@@ -131,18 +134,22 @@ static uint8_t nt_wrap(const char* src, char lines[NT_MAX_LINES][NT_COLS + 1]) {
     return count;
 }
 
-static void nt_build(struct NtEntry* e, const char* title, const char* message) {
+static void nt_build(struct NtEntry* e, DWMNotifyKind kind, bool sticky,
+                     const char* title, const char* message) {
     memset(e, 0, sizeof(struct NtEntry));
+    e->kind = kind;
 
-    // Title: one line, newlines flattened, "..." when cut
+    // Title: one line, newlines flattened, "..." when cut. A sticky one
+    // leaves room for the "x" in the corner.
+    size_t cols = sticky ? (NT_COLS - NT_CLOSE_COLS) : NT_COLS;
     size_t title_len = strnlen(title, DWM_MAX_TITLE_LEN);
-    size_t n = (title_len > NT_COLS) ? NT_COLS : title_len;
+    size_t n = (title_len > cols) ? cols : title_len;
     memcpy(e->title, title, n);
     e->title[n] = '\0';
     for (size_t i = 0; i < n; i++) {
         if (e->title[i] == '\n') e->title[i] = ' ';
     }
-    if (title_len > NT_COLS) memcpy(&e->title[NT_COLS - 3], "...", 4);
+    if (title_len > cols) memcpy(&e->title[cols - 3], "...", 4);
 
     e->line_count = nt_wrap(message, e->lines);
 
@@ -213,15 +220,26 @@ static void nt_draw(struct WindowObject* window, const struct NtEntry* e) {
     int w = window->w;
     int h = window->h;
 
-    dwm_draw_rect_filled(0, 0, w, h, theme.client.background);
-    dwm_draw_rect_filled(0, 0, NT_ACCENT_W, h, theme.client.accent);
-    dwm_draw_rect(0, 0, w, h, theme.button.border);
+    bool error = (e->kind == DWM_NOTIFY_ERROR);
+    uint32_t background = error ? theme.notify.error_background : theme.client.background;
+    uint32_t accent     = error ? theme.notify.error_border     : theme.client.accent;
+    uint32_t border     = error ? theme.notify.error_border     : theme.button.border;
+    uint32_t title      = error ? theme.notify.error_title      : theme.client.text_value;
+    uint32_t text       = error ? theme.notify.error_text       : theme.client.text_soft;
 
-    dwm_draw_text(NT_TEXT_X, NT_PAD, e->title, theme.client.text_value);
+    dwm_draw_rect_filled(0, 0, w, h, background);
+    dwm_draw_rect_filled(0, 0, NT_ACCENT_W, h, accent);
+    dwm_draw_rect(0, 0, w, h, border);
+
+    dwm_draw_text(NT_TEXT_X, NT_PAD, e->title, title);
+
+    // Sticky: it only goes away when clicked, so say so
+    if (e->expires_ms == 0)
+        dwm_draw_text(w - NT_PAD - NT_FONT_W, NT_PAD, "x", title);
 
     int y = NT_PAD + NT_FONT_H + NT_TITLE_GAP;
     for (uint8_t i = 0; i < e->line_count; i++) {
-        dwm_draw_text(NT_TEXT_X, y, e->lines[i], theme.client.text_soft);
+        dwm_draw_text(NT_TEXT_X, y, e->lines[i], text);
         y += NT_LINE_H;
     }
 }
@@ -299,25 +317,69 @@ void dwm_notification_tick(void) {
 // Public API
 // ==========================================
 
+// An ERROR already showing with exactly this title and message (0 if none)
+static WindowHandle nt_find_duplicate(const struct NtEntry* built) {
+    for (uint32_t i = 0; i < nt_count; i++) {
+        const struct NtEntry* e = &nt_entries[i];
+        if (e->dismissing || e->kind != built->kind) continue;
+        if (e->line_count != built->line_count) continue;
+        if (strcmp(e->title, built->title) != 0) continue;
+
+        bool same = true;
+        for (uint8_t l = 0; l < e->line_count && same; l++)
+            same = (strcmp(e->lines[l], built->lines[l]) == 0);
+        if (same) return e->handle;
+    }
+    return 0;
+}
+
 WindowHandle dwm_notify(const char* title, const char* message, uint32_t timeout_ms) {
+    return dwm_notify_ex(DWM_NOTIFY_INFO, title, message, timeout_ms);
+}
+
+WindowHandle dwm_notify_ex(DWMNotifyKind kind, const char* title, const char* message, uint32_t timeout_ms) {
     DWM_GUARD();
     if (title == NULL)   title = "";
     if (message == NULL) message = "";
+    if (kind != DWM_NOTIFY_ERROR) kind = DWM_NOTIFY_INFO;
 
-    // Out of slots (lots still sliding out): drop the oldest outright
+    bool sticky = (timeout_ms == DWM_NOTIFY_STICKY);
+
+    struct NtEntry built;
+    nt_build(&built, kind, sticky, title, message);
+
+    // The same error again (a program crashing the same way in a loop):
+    // the one already showing covers it
+    if (kind == DWM_NOTIFY_ERROR) {
+        WindowHandle existing = nt_find_duplicate(&built);
+        if (existing != 0) return existing;
+    }
+
+    // Out of slots (lots still sliding out): drop one outright, preferring
+    // one already sliding out, then a timed one, over a sticky one
     if (nt_count >= NT_MAX_ENTRIES) {
-        WindowHandle oldest = nt_entries[0].handle;
-        nt_remove_at(0);
+        uint32_t victim = 0;
+        bool found = false;
+        for (uint32_t i = 0; i < nt_count && !found; i++) {
+            if (nt_entries[i].dismissing) { victim = i; found = true; }
+        }
+        for (uint32_t i = 0; i < nt_count && !found; i++) {
+            if (nt_entries[i].expires_ms != 0) { victim = i; found = true; }
+        }
+
+        WindowHandle oldest = nt_entries[victim].handle;
+        nt_remove_at(victim);
+        nt_layout();
         if (oldest != 0) dwm_destroy_window(oldest);
     }
 
-    struct NtEntry built;
-    nt_build(&built, title, message);
-
-    // Make room: push the oldest out until the new one fits
+    // Make room: push the oldest out until the new one fits. Timed ones go
+    // first, so an unread sticky error is only pushed out when every
+    // notification showing is sticky.
     int avail = display_get_height() - taskbar.height - (NT_MARGIN * 2);
     while (1) {
         struct NtEntry* oldest = NULL;
+        struct NtEntry* oldest_timed = NULL;
         uint32_t active = 0;
         int used = 0;
 
@@ -325,13 +387,14 @@ WindowHandle dwm_notify(const char* title, const char* message, uint32_t timeout
             struct NtEntry* e = &nt_entries[i];
             if (e->dismissing) continue;
             if (oldest == NULL) oldest = e;
+            if (oldest_timed == NULL && e->expires_ms != 0) oldest_timed = e;
             active++;
             used += e->height + NT_GAP;
         }
 
         if (oldest == NULL) break;
         if (active < NT_MAX_VISIBLE && used + built.height <= avail) break;
-        nt_dismiss(oldest);
+        nt_dismiss((oldest_timed != NULL) ? oldest_timed : oldest);
     }
 
     // Join the top of the stack, then create the window just off the right
@@ -378,22 +441,28 @@ WindowHandle dwm_notify(const char* title, const char* message, uint32_t timeout
 }
 
 struct NtPost {
-    char     title[DWM_MAX_TITLE_LEN];
-    char     message[NT_MESSAGE_MAX + 1];
-    uint32_t timeout_ms;
+    DWMNotifyKind kind;
+    char          title[DWM_MAX_TITLE_LEN];
+    char          message[NT_MESSAGE_MAX + 1];
+    uint32_t      timeout_ms;
 };
 
 static void nt_invoke(void* arg) {
     struct NtPost* p = (struct NtPost*)arg;
-    dwm_notify(p->title, p->message, p->timeout_ms);
+    dwm_notify_ex(p->kind, p->title, p->message, p->timeout_ms);
     free(p);
 }
 
 bool dwm_notify_post(const char* title, const char* message, uint32_t timeout_ms) {
+    return dwm_notify_post_ex(DWM_NOTIFY_INFO, title, message, timeout_ms);
+}
+
+bool dwm_notify_post_ex(DWMNotifyKind kind, const char* title, const char* message, uint32_t timeout_ms) {
     struct NtPost* p = (struct NtPost*)malloc(sizeof(struct NtPost));
     if (p == NULL) return false;
 
     memset(p, 0, sizeof(struct NtPost));
+    p->kind = kind;
     if (title != NULL)   strncpy(p->title, title, sizeof(p->title) - 1);
     if (message != NULL) strncpy(p->message, message, sizeof(p->message) - 1);
     p->timeout_ms = timeout_ms;
@@ -425,3 +494,4 @@ uint32_t dwm_notify_count(void) {
     }
     return count;
 }
+

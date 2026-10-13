@@ -1,3 +1,4 @@
+
 #include <kernel/dwm/windows/filecopy.h>
 #include <kernel/dwm/dwm_core_internal.h>
 
@@ -8,6 +9,7 @@
 #include <kernel/scheduler/watchdog.h>
 #include <kernel/malloc.h>
 #include <kernel/vfs/vfs.h>
+#include <kernel/resources/resource_io.h>
 #include <kernel/console/display.h>
 #include <kernel/util/list.h>
 #include <kernel/util/string.h>
@@ -634,27 +636,6 @@ static void fc_count_job(struct FileCopyJob* job) {
 // Copying (copy thread, no locks held on entry or exit)
 // ==========================================
 
-// vfs_read / vfs_write may move fewer bytes than asked; loop until done
-static bool fc_read_full(File file, uint8_t* buffer, uint32_t count) {
-    uint32_t got = 0;
-    while (got < count) {
-        int32_t n = vfs_read(file, buffer + got, count - got);
-        if (n <= 0) return false;
-        got += (uint32_t)n;
-    }
-    return true;
-}
-
-static bool fc_write_full(File file, const uint8_t* buffer, uint32_t count) {
-    uint32_t put = 0;
-    while (put < count) {
-        int32_t n = vfs_write(file, buffer + put, count - put);
-        if (n <= 0) return false;
-        put += (uint32_t)n;
-    }
-    return true;
-}
-
 // Every chunk seeks to its own offset instead of trusting the file position
 // left by the last call: other threads use the VFS between our chunks.
 static bool fc_seek(File file, uint32_t offset) {
@@ -734,8 +715,8 @@ static bool fc_copy_file(struct FileCopyJob* job, const char* src, const char* d
             uint32_t n = size - offset;
             if (n > FILECOPY_CHUNK) n = FILECOPY_CHUNK;
 
-            ok = fc_seek(in, offset)  && fc_read_full(in, job->buffer, n) &&
-                 fc_seek(out, offset) && fc_write_full(out, job->buffer, n);
+            ok = fc_seek(in, offset)  && resource_read_exact(in, job->buffer, n) &&
+                 fc_seek(out, offset) && resource_write_exact(out, job->buffer, n);
 
             if (!ok) {
                 job->last_error = "reading or writing failed";
@@ -762,8 +743,8 @@ static bool fc_copy_file(struct FileCopyJob* job, const char* src, const char* d
             uint32_t n = size - offset;
             if (n > FILECOPY_CHUNK) n = FILECOPY_CHUNK;
 
-            bool same = fc_seek(in, offset)  && fc_read_full(in, job->buffer, n) &&
-                        fc_seek(out, offset) && fc_read_full(out, job->verify_buffer, n);
+            bool same = fc_seek(in, offset)  && resource_read_exact(in, job->buffer, n) &&
+                        fc_seek(out, offset) && resource_read_exact(out, job->verify_buffer, n);
             if (same && memcmp(job->buffer, job->verify_buffer, n) != 0)
                 same = false;
 

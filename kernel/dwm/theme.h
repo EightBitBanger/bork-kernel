@@ -1,3 +1,4 @@
+
 #ifndef _DWM_THEME_H_
 #define _DWM_THEME_H_
 
@@ -90,6 +91,14 @@ struct DWMThemeChart {
     uint32_t available;             // 0xFF0000F6
 };
 
+// Notifications (error style; info notifications use the client colors)
+struct DWMThemeNotify {
+    uint32_t error_background;      // 0xFF2A0808
+    uint32_t error_border;          // 0xFFC02020
+    uint32_t error_title;           // 0xFFFF7070
+    uint32_t error_text;            // 0xFFF0D8D8
+};
+
 struct DWMTheme {
     struct DWMThemeDesktop   desktop;
     struct DWMThemeFrame     frame;
@@ -100,6 +109,7 @@ struct DWMTheme {
     struct DWMThemeTaskbar   taskbar;
     struct DWMThemeStartMenu start_menu;
     struct DWMThemeChart     chart;
+    struct DWMThemeNotify    notify;
 };
 
 // The active theme. The pointer stays valid for the lifetime of the DWM;
@@ -114,3 +124,4 @@ void dwm_theme_get_default(struct DWMTheme* out);
 void dwm_set_theme(const struct DWMTheme* new_theme);
 
 #endif
+

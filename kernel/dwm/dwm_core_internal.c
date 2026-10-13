@@ -1,8 +1,11 @@
+
 #include <kernel/dwm/dwm.h>
 #include <kernel/dwm/dwm_core_internal.h>
 
 #include <kernel/console/display.h>
 #include <kernel/events.h>
+
+#include <kernel/resources/classes/image.h>
 
 #include <kernel/util/string.h>
 #include <kernel/util/list.h>
@@ -489,20 +492,12 @@ WindowHandle dwm_window_get_focus(void) {
     return focused_window ? focused_window->id : 0;
 }
 
+// Register a compiled-in sprite as a drawable image (the expansion lives in
+// the image resource class, shared with images loaded from disk)
 void dwm_resource_sprite_load(const char* resource_name, const struct Sprite* sprite) {
-    struct Image* img = malloc(sizeof(struct Image));
-    if (!img) return;
-    
-    img->width = sprite->width;
-    img->height = sprite->height;
-    
-    img->data = malloc(sizeof(uint32_t) * img->width * img->height);
-    if (!img->data) {
-        free(img);
-        return;
-    }
-    
-    sprite_get_bitmap(img->data, sprite);
+    struct Image* img = resource_image_from_sprite(sprite);
+    if (img == NULL) return;
+
     dwm_resource_load(resource_name, img);
 }
 

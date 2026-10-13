@@ -1,3 +1,4 @@
+
 #include <kernel/dwm/dwm.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/dwm/dwm_core_internal.h>
@@ -5,7 +6,7 @@
 
 #include <kernel/kernel.h>
 #include <kernel/vfs/vfs.h>
-#include <kernel/resources/resource_manager.h>
+#include <kernel/resources/classes/image.h>
 
 #include <kernel/console/mouse.h>
 #include <kernel/console/display.h>
@@ -74,29 +75,11 @@ bool dwm_get_image_directory(char* out, size_t size) {
 }
 
 // Load one sprite resource file (RSRC header + sprite payload, as written by
-// resource_save) and register it under `name`.
+// resource_sprite_save) and register it under `name`.
 static bool dwm_resource_image_load_file(const char* name, const char* path) {
-    struct Sprite* sprite = resource_sprite_load(path);
-    if (sprite == NULL) return false;
-    
-    struct Image* img = (struct Image*)malloc(sizeof(struct Image));
-    if (img == NULL) {
-        resource_free(RESOURCE_TYPE_SPRITE, sprite);
-        return false;
-    }
-    
-    img->width  = sprite->width;
-    img->height = sprite->height;
-    img->data   = (uint32_t*)malloc(sizeof(uint32_t) * img->width * img->height);
-    if (img->data == NULL) {
-        free(img);
-        resource_free(RESOURCE_TYPE_SPRITE, sprite);
-        return false;
-    }
-    
-    sprite_get_bitmap(img->data, sprite);
-    resource_free(RESOURCE_TYPE_SPRITE, sprite);
-    
+    struct Image* img = resource_image_load(path);
+    if (img == NULL) return false;
+
     dwm_resource_load(name, img);
     return true;
 }
