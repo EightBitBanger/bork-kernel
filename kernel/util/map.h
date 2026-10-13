@@ -1,23 +1,17 @@
 #ifndef KERNEL_UTIL_MAP_H
 #define KERNEL_UTIL_MAP_H
 
+// Name-keyed doubly linked list. Names longer than MAP_NAME_MAX - 1 chars
+// are truncated. The map owns its nodes, not the data.
+
 #include <stddef.h>
 #include <stdbool.h>
 
 #include <kernel/util/string.h>
 
-#if defined(KERNEL_PLATFORM_X86)
+#ifdef KERNEL_PLATFORM_X86 
   #include <kernel/arch/x86/heap.h>
-#elif defined(KERNEL_PLATFORM_AVR)
-  #include <kernel/arch/avr/heap.h>
-#else
-  #error "map.h: define KERNEL_PLATFORM_X86 or KERNEL_PLATFORM_AVR"
 #endif
-
-/*
- * Name-keyed doubly linked list. Names longer than MAP_NAME_MAX - 1 chars
- * are truncated. The map owns its nodes, not the data.
- */
 
 #define MAP_NAME_MAX 16
 

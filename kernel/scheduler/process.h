@@ -36,7 +36,7 @@
  *
  * Loading:
  *   CreateProcess()           an ELF32 i386 executable from the VFS
- *                             (scheduler/elf.h). The file must carry
+ *                             (resources/classes/elf.h). The file must carry
  *                             VFS_PERMISSION_EXECUTE. Build programs static
  *                             and non-PIE, linked at 0x40000000.
  *   CreateProcessFromImage()  a flat binary already in kernel memory, mapped
@@ -117,8 +117,11 @@ ProcessId CreateProcessFromImage(const char* name, const ProcessImage* image, Th
 // refused is also written to COM1.
 ProcessId CreateProcess(const char* image_path, ThreadPriority priority);
 
-// Kill every thread of the process and free its address space.
-// Safe to call on the calling thread's own process (does not return then).
+// Close the process's open files, then kill every thread of the process and
+// free its address space. Thread context with interrupts on: closing files
+// takes the VFS lock and may wait (up to SYS_FILES_EXIT_WAIT_MS) for one of
+// its threads to finish a file call. Safe to call on the calling thread's
+// own process (does not return then).
 // Returns PROCESS_OK or a PROCESS_ERR_* code.
 int DestroyProcess(ProcessId pid);
 
@@ -161,3 +164,4 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
                         uint32_t cs, uint32_t address);
 
 #endif
+

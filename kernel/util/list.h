@@ -1,21 +1,15 @@
 #ifndef KERNEL_UTIL_LIST_H
 #define KERNEL_UTIL_LIST_H
 
+// Doubly linked list of void* payloads. The list owns its nodes, not the
+// data: list_remove frees the node only.
+
 #include <stddef.h>
 #include <stdbool.h>
 
-#if defined(KERNEL_PLATFORM_X86)
+#ifdef KERNEL_PLATFORM_X86 
   #include <kernel/arch/x86/heap.h>
-#elif defined(KERNEL_PLATFORM_AVR)
-  #include <kernel/arch/avr/heap.h>
-#else
-  #error "list.h: define KERNEL_PLATFORM_X86 or KERNEL_PLATFORM_AVR"
 #endif
-
-/*
- * Doubly linked list of void* payloads. The list owns its nodes, not the
- * data: list_remove frees the node only.
- */
 
 struct list_node {
     void* data;

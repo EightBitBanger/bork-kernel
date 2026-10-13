@@ -26,7 +26,6 @@ int clamp(int value, int min_val, int max_val) {
 unsigned int isqrt(unsigned int num) {
     unsigned int res = 0;
     // Highest power of 4 representable; the old "1 << 30" overflowed on
-    // 16-bit-int targets such as AVR.
     unsigned int bit = 1u << (sizeof(unsigned int) * CHAR_BIT - 2);
 
     while (bit > num) {

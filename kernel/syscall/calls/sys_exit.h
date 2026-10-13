@@ -7,7 +7,8 @@
 
 // exit(int code): end the calling process. Never returns.
 //
-// Destroys every thread of the process and frees its address space
+// DestroyProcess() closes the process's open files (syscall_process_exit),
+// then destroys every thread of the process and frees its address space
 // (image, stack and heap pages alike).
 static int32_t sys_exit(const SyscallArgs* args) {
     process_exit_current((int32_t)args->arg1);  // Does not return for a process thread
@@ -15,3 +16,4 @@ static int32_t sys_exit(const SyscallArgs* args) {
 }
 
 #endif
+

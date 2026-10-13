@@ -5,7 +5,7 @@
 
 #include <kernel/scheduler/process.h>
 #include <kernel/scheduler/scheduler.h>
-#include <kernel/scheduler/executable/elf.h>
+#include <kernel/resources/classes/elf.h>
 #include <kernel/mutex.h>
 
 #include <kernel/arch/x86/irq.h>
@@ -13,6 +13,8 @@
 #include <kernel/arch/x86/drivers/serial.h>
 
 #include <kernel/vfs/vfs.h>
+#include <kernel/syscall/syscall.h>
+#include <kernel/events.h>
 
 #include <kernel/util/list.h>
 #include <kernel/util/string.h>
@@ -207,9 +209,8 @@ static void process_kill_threads(Process* p) {
 
 // Reporting (COM1)
 
-// "[process] name (pid N) "
-static void process_log_prefix(ProcessId pid) {
-    char name[PROCESS_NAME_MAX];
+// Copy a live process's name ("" when pid is not valid)
+static void process_copy_name(ProcessId pid, char name[PROCESS_NAME_MAX]) {
     name[0] = '\0';
 
     uint32_t irq = irq_save();
@@ -217,6 +218,12 @@ static void process_log_prefix(ProcessId pid) {
     if (p != NULL)
         memcpy(name, p->name, PROCESS_NAME_MAX);
     irq_restore(irq);
+}
+
+// "[process] name (pid N) "
+static void process_log_prefix(ProcessId pid) {
+    char name[PROCESS_NAME_MAX];
+    process_copy_name(pid, name);
 
     serial_puts("[process] ");
     serial_puts(name[0] ? name : "?");
@@ -255,7 +262,7 @@ typedef struct {
     uint32_t size;
 } ElfSource;
 
-// ELF executable: every PT_LOAD segment where it was linked (scheduler/elf.c)
+// ELF executable: every PT_LOAD segment where it was linked (resources/classes/elf.c)
 static int process_load_elf(Process* p, void* ctx) {
     const ElfSource* src = (const ElfSource*)ctx;
     ElfImageInfo info;
@@ -438,7 +445,27 @@ int DestroyProcess(ProcessId pid) {
         irq_restore(irq);
         return PROCESS_ERR_NOT_FOUND;
     }
+    // DYING first: from here on process_current_space() returns NULL for this
+    // pid, so its threads cannot start a new file call (sys_files_acquire
+    // fails) and a second DestroyProcess() returns NOT_FOUND
     p->state = PROCESS_STATE_DYING;
+    irq_restore(irq);
+
+    // Close the process's files before its threads and memory go. This runs
+    // with interrupts on: it takes the VFS lock and may sleep while a thread
+    // of the process finishes a file call already in progress (bounded by
+    // SYS_FILES_EXIT_WAIT_MS). Every way a process ends comes through here.
+    syscall_process_exit((uint32_t)pid);
+
+    irq = irq_save();
+
+    // Only DestroyProcess() frees a slot, and only from RUNNING, so the slot
+    // is still ours (DYING, same pid)
+    p = process_lookup(pid);
+    if (p == NULL || p->state != PROCESS_STATE_DYING) {
+        irq_restore(irq);
+        return PROCESS_ERR_NOT_FOUND;
+    }
 
     // Destroying our own process: get off its page directory before freeing it
     bool self = current_thread != NULL && current_thread->process_id == pid;
@@ -624,6 +651,59 @@ static const char* fault_name(uint32_t vector) {
     }
 }
 
+// Fault report text without depending on snprintf's format support
+typedef struct {
+    char*    buf;
+    uint32_t cap;
+    uint32_t len;
+} FaultText;
+
+static void fault_text_puts(FaultText* t, const char* s) {
+    while (*s && t->len + 1 < t->cap)
+        t->buf[t->len++] = *s++;
+    t->buf[t->len] = '\0';
+}
+
+static void fault_text_hex(FaultText* t, uint32_t v) {
+    char h[11];
+    h[0] = '0';
+    h[1] = 'x';
+    for (int i = 0; i < 8; i++)
+        h[2 + i] = "0123456789abcdef"[(v >> (28 - 4 * i)) & 0xF];
+    h[10] = '\0';
+    fault_text_puts(t, h);
+}
+
+// Tell the kernel thread (and through it the DWM) that pid crashed, so the
+// desktop can show an error notification. Thread context, interrupts on, no
+// locks held: called from process_user_fault before the process is destroyed
+// (its name is gone afterwards).
+static void process_report_fault(ProcessId pid, uint32_t vector, uint32_t error_code,
+                                 uint32_t eip, uint32_t address) {
+    char name[PROCESS_NAME_MAX];
+    process_copy_name(pid, name);
+
+    char text[128];
+    FaultText t = { text, sizeof(text), 0 };
+    text[0] = '\0';
+
+    fault_text_puts(&t, fault_name(vector));
+    fault_text_puts(&t, " at ");
+    fault_text_hex(&t, eip);
+    if (vector == 14) {
+        fault_text_puts(&t, ", address ");
+        fault_text_hex(&t, address);
+        fault_text_puts(&t, (error_code & 1) ? " (protection, " : " (not present, ");
+        fault_text_puts(&t, (error_code & 2) ? "write)" : "read)");
+    } else if (vector == 13 && error_code != 0) {
+        fault_text_puts(&t, ", selector ");
+        fault_text_hex(&t, error_code);
+    }
+
+    if (kernel_event_send(KEVENT_FAULT, name[0] ? name : "process", text))
+        event_signal(&kernel_wakeup_event);
+}
+
 void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
                         uint32_t cs, uint32_t address) {
     // Kernel faults go to the panic screen. A double fault or machine check
@@ -653,8 +733,20 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
     }
     serial_puts("\n");
 
+    // The fault came from ring 3, so this thread holds no kernel lock and
+    // was running with interrupts on (IOPL 0: user code cannot cli). The
+    // exception gate turned them off; turn them back on, because closing
+    // the process's files takes mutexes and may sleep.
+    __asm__ volatile("sti" : : : "memory");
+
+    // Desktop notification (via the kernel event system)
+    if (pid != PROCESS_INVALID_ID)
+        process_report_fault(pid, vector, error_code, eip, address);
+
     process_exit_current((int32_t)(128 + vector));
 
     // Not in the process table (should not happen): end just this thread
     kthread_exit();
 }
+
+
