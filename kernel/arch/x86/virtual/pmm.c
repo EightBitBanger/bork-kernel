@@ -3,7 +3,7 @@
 #include <kernel/util/string.h>
 #include <kernel/arch/x86/irq.h>
 
-#define MAX_PHYS_MEMORY    0x100000000ULL                        // 4 GB
+#define MAX_PHYS_MEMORY    0x100000000ULL                         // 4 GB
 #define PHYS_TOTAL_FRAMES  (MAX_PHYS_MEMORY / PAGE_SIZE)          // 1M frames
 #define PHYS_BITMAP_WORDS  ((uint32_t)(PHYS_TOTAL_FRAMES / 32U))  // 32768 words = 128 KB
 

@@ -6,9 +6,8 @@
 //
 // Every memory block comes from malloc() with a small header in front 
 // that carries the attributes the knode/device layer relies 
-// on (flags, type, permissions, size). Addresses are still handed 
-// out as uint32_t and KMALLOC_NULL still means "none", so
-// nothing built on top of this API needs to change.
+// on (flags, type, permissions, size). Addresses are handed 
+// out as uint32_t and KMALLOC_NULL still means "none"
 //
 //   [ malloc block ............................................ ]
 //   [ KMallocHeader (32 bytes) ][ payload (size bytes, zeroed)  ]
@@ -17,7 +16,7 @@
 // kmalloc_is_valid() accepts any uint32_t: it only reports true for an
 // address kmalloc() returned and kfree() has not released yet. Raw malloc()
 // pointers stored in knodes (mount windows, device contexts) are reported as
-// invalid, exactly as before, because they never fell inside the old heap.
+// invalid because they never fell inside the old heap.
 //
 
 #include <stddef.h>

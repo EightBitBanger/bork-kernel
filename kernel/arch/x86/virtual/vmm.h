@@ -47,12 +47,14 @@ bool     vmm_has_write_combining(void);
 //   0x00000000 - 0x3FFFFFFF   kernel: identity map, kernel VM window
 //                             (0x10000000 - 0x1FFFFFFF)
 //   0x40000000 - 0xBFFFFFFF   user space, private to each address space
-//   0xC0000000 - 0xFFFFFFFF   kernel: identity-mapped MMIO (IOAPIC, ...)
+//   0xC0000000 - 0xFFBFFFFF   kernel: identity-mapped MMIO (IOAPIC, ...)
+//   0xFFC00000 - 0xFFFFFFFF   kernel page tables (recursive directory entry)
 //
-// Every kernel page directory entry is created once, in vmm_init(), and
-// points at the shared static page tables. A kernel mapping made at any time
-// therefore shows up in every address space, and copying the kernel half of
-// the directory when a space is created stays correct forever.
+// Kernel page tables are allocated from the PMM on demand, the first time
+// something is mapped in their 4 MB range, and are never freed. Each new
+// kernel directory entry is written into the kernel directory and into every
+// live address space at once, so a kernel mapping made at any time shows up
+// in every address space.
 //
 // User PDEs point at page tables owned by one AddressSpace. vmm_map_page()
 // and friends only work on the kernel half; use the vmm_user_* calls below
@@ -79,6 +81,8 @@ typedef struct AddressSpace {
     uint32_t* directory;                    // Kernel-virtual address of the page directory
     uint32_t  directory_phys;               // Physical address (the CR3 value)
     uint32_t* tables[VM_USER_PDE_COUNT];    // Kernel-virtual user page tables, NULL = none yet
+    struct AddressSpace* prev;              // Live-space list, so new kernel directory
+    struct AddressSpace* next;              // entries reach every directory (VMM-private)
 } AddressSpace;
 
 extern uint32_t page_directory[];
@@ -159,3 +163,4 @@ bool vmm_user_copy_to(AddressSpace* space, uint32_t vaddr, const void* src, uint
 bool vmm_user_copy_from(AddressSpace* space, void* dst, uint32_t vaddr, uint32_t len);
 
 #endif
+

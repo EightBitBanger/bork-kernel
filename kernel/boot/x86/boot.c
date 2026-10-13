@@ -325,7 +325,6 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     for (unsigned int i=0; i < item_count; i++) {
         
         // Check user directory
-        
         char user_path[128];
         memset(user_path, '\0', sizeof(user_path));
         strncpy(user_path, path_mnt, 128);
@@ -389,6 +388,9 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     irq_restore(irq_flags);
     
     while(1) {
-        thread_sleep(30);
+        
+        //dwm_launch_program("/mnt/ata0p1/usr/desktop/test");
+        
+        thread_sleep(100);
     }
 }
