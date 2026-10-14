@@ -1,3 +1,4 @@
+
 #ifndef _KERNEL_PROCESS_H_
 #define _KERNEL_PROCESS_H_
 
@@ -34,13 +35,20 @@
  * after DestroyProcess() can never refer to a newer process that happened
  * to reuse the same slot.
  *
+ * Working directory: every process starts with one, set before its first
+ * thread runs (syscall_process_start). Relative paths in file syscalls
+ * resolve against it, and the program can change it with SYS_CHDIR.
+ *
  * Loading:
  *   CreateProcess()           an ELF32 i386 executable from the VFS
  *                             (resources/classes/elf.h). The file must carry
  *                             VFS_PERMISSION_EXECUTE. Build programs static
- *                             and non-PIE, linked at 0x40000000.
+ *                             and non-PIE, linked at 0x40000000. Starts in
+ *                             the directory holding the executable.
+ *   CreateProcessIn()         the same, in a working directory of the
+ *                             caller's choice.
  *   CreateProcessFromImage()  a flat binary already in kernel memory, mapped
- *                             read/write at PROCESS_IMAGE_BASE.
+ *                             read/write at PROCESS_IMAGE_BASE. Starts in "/".
  */
 
 #define PROCESS_MAX                64     // Must be <= 256 (8-bit slot field)
@@ -105,17 +113,25 @@ typedef struct {
 
 // Create a process from a flat image and start its main thread in ring 3 at
 // PROCESS_IMAGE_BASE + entry_offset, ESP near PROCESS_STACK_TOP. name labels
-// it in reports (truncated to PROCESS_NAME_MAX - 1). Returns a ProcessId (> 0)
-// or a PROCESS_ERR_* code.
+// it in reports (truncated to PROCESS_NAME_MAX - 1). Its working directory
+// is "/". Returns a ProcessId (> 0) or a PROCESS_ERR_* code.
 ProcessId CreateProcessFromImage(const char* name, const ProcessImage* image, ThreadPriority priority);
 
 // Load the ELF executable at image_path (absolute VFS path) and start its
-// main thread in ring 3 at e_entry. The process is named after the file.
+// main thread in ring 3 at e_entry. The process is named after the file and
+// starts in the directory holding it ("/mnt/ata0p1/bin/hello" starts in
+// "/mnt/ata0p1/bin"). Same as CreateProcessIn(image_path, NULL, priority).
 // Reads the file through the VFS, so: thread context only, and never while
 // holding the DWM lock for long (the DWM launches from a worker thread).
 // Returns a ProcessId (> 0) or a PROCESS_ERR_* code; the reason a load was
 // refused is also written to COM1.
 ProcessId CreateProcess(const char* image_path, ThreadPriority priority);
+
+// CreateProcess with a chosen working directory. cwd is an absolute path
+// (normalized for you); NULL or "" means the directory holding the
+// executable. A cwd that does not exist or is not a directory is not an
+// error: the process starts in "/" and COM1 says why.
+ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriority priority);
 
 // Close the process's open files, then kill every thread of the process and
 // free its address space. Thread context with interrupts on: closing files
@@ -164,4 +180,3 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
                         uint32_t cs, uint32_t address);
 
 #endif
-

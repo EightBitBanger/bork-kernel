@@ -7,14 +7,31 @@
 #include <kernel/arch/x86/heap.h>
 #include <kernel/util/string.h>
 
-// Kernel-wide state that used to live in a kmalloc'd "system object" and was
-// reached through kmem_read / kmem_write (a leftover from when kernel memory
-// could be external RAM). Plain statics now, guarded by the VFS lock: both
-// are VFS state, and the lock is recursive, so a caller already holding it
-// can use these too.
-
 static char kernel_cwd[VFS_PATH_MAX] = "/";
 static struct LocalPaths kernel_paths;
+
+// The root of the in-memory node tree
+// /proc - running processes
+// /dev  - hardware descriptions
+// /mnt  - storage devices are mounted
+void kernel_init(void) {
+    uint32_t root_node = create_knode("", 0);
+    knode_set_root(root_node);
+    
+    uint32_t proc = create_knode("proc", root_node);
+    uint32_t dev  = create_knode("dev", root_node);
+    uint32_t mnt  = create_knode("mnt", root_node);
+    
+    knode_set_permissions(proc, KMALLOC_PERMISSION_READ);
+    knode_set_permissions(dev,  KMALLOC_PERMISSION_READ);
+    knode_set_permissions(mnt,  KMALLOC_PERMISSION_READ);
+    
+    struct LocalPaths fs_paths;
+    memset(&fs_paths, 0, sizeof(fs_paths));
+    kernel_set_local_paths(&fs_paths);
+    
+    kernel_set_working_directory("/");
+}
 
 bool kernel_get_working_directory(char* path, size_t size) {
     if (path == NULL || size == 0)

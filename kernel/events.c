@@ -174,9 +174,9 @@ void kernel_event_update(void) {
         dwm_post_message(dwm_window_get_focus(), DWM_EVENT_REFRESH, 0, 0);
     } else if (action == ACTION_FAULT) {
         char title[64];
-        strncpy(title, name_buffer[0] ? name_buffer : "process", sizeof(title) - 1);
-        title[sizeof(title) - 1] = '\0';
-        strncat(title, " crashed", sizeof(title) - strlen(title) - 1);
+        //strncpy(title, name_buffer[0] ? name_buffer : "process", sizeof(title) - 1);
+        //title[sizeof(title) - 1] = '\0';
+        strncat(title, "Received signal SIGSEGV", sizeof(title) - strlen(title) - 1);
 
         // Copies the strings and creates the notification on the DWM thread,
         // so the kernel thread never waits on the DWM lock

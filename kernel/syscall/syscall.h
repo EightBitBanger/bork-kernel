@@ -1,7 +1,9 @@
+
 #ifndef _KERNEL_SYSCALL_H_
 #define _KERNEL_SYSCALL_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // System call ABI (i386, int 0x81)
 //
@@ -79,8 +81,10 @@
 //
 // Paths are NUL-terminated, at most SYS_PATH_MAX bytes including the
 // terminator. A path not starting with '/' is relative to the process's
-// working directory (SYS_CHDIR; "/" when the process starts). "." and ".."
-// are folded as text before the VFS sees the path.
+// working directory (SYS_CHDIR). The launcher chooses the starting
+// directory: by default the directory holding the executable, "/" for a
+// process with no executable file or when the chosen directory is not
+// usable. "." and ".." are folded as text before the VFS sees the path.
 //
 // Descriptors are private to the process. 0, 1 and 2 are reserved: writing
 // to 1 or 2 prints like SYS_PRINT, anything else on them is SYS_EBADF.
@@ -133,6 +137,18 @@ typedef struct {
 // Kernel side: set up the serial output and locks the syscalls use. The IDT
 // gate is installed by idt_init().
 void syscall_init(void);
+
+struct AddressSpace;
+
+// Kernel side: give a new process its descriptor table and working
+// directory. process_build() calls it after the address space exists and
+// BEFORE the process's first thread is created, so no file call can ever
+// run against a default table. `cwd` is an absolute path; NULL, or one that
+// does not normalize or is not a directory, starts the process in "/".
+// Thread context with interrupts on (it checks the directory through the
+// VFS). Returns false only when out of memory. A process that fails to
+// start after this succeeded must be cleaned up with syscall_process_exit().
+bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd);
 
 // Kernel side: close every file a process has open and drop its descriptor
 // table. DestroyProcess() calls it before freeing the address space, so

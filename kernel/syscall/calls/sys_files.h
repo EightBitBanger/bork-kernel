@@ -1,4 +1,5 @@
 
+
 #ifndef _KERNEL_SYS_FILES_H_
 #define _KERNEL_SYS_FILES_H_
 
@@ -22,9 +23,12 @@
 //
 // Per-process file state: descriptor table and working directory
 //
-// One SysProcessFiles per process that has made a file call, created on
-// first use and kept on a list keyed by process id (the process structure
-// itself knows nothing about files). syscall_process_exit() drops it.
+// One SysProcessFiles per process, kept on a list keyed by process id (the
+// process structure itself knows nothing about files). process_build()
+// creates it through syscall_process_start() before the process's first
+// thread exists, with the working directory the launcher chose. A process
+// started without that hook gets one on its first file call, in "/".
+// syscall_process_exit() drops it.
 //
 // Locking:
 //   - the list and each table's `users` count: interrupts off (irq_save)
@@ -83,6 +87,20 @@ static void sys_files_close_all(SysProcessFiles* t) {
     }
 }
 
+// A fresh, unlinked table for `process_id` in directory `cwd` (absolute,
+// normalized, fits SYS_PATH_MAX). NULL when out of memory.
+static SysProcessFiles* sys_files_new(uint32_t process_id, AddressSpace* space, const char* cwd) {
+    SysProcessFiles* t = (SysProcessFiles*)malloc(sizeof(SysProcessFiles));
+    if (t == NULL)
+        return NULL;
+    memset(t, 0, sizeof(SysProcessFiles));
+    t->process_id = process_id;
+    t->space      = space;
+    memcpy(t->cwd, cwd, strlen(cwd) + 1);
+    mutex_init(&t->lock);
+    return t;
+}
+
 // The calling process's table, created if needed, returned LOCKED.
 // NULL when out of memory.
 static SysProcessFiles* sys_files_acquire(void) {
@@ -91,16 +109,12 @@ static SysProcessFiles* sys_files_acquire(void) {
         return NULL;
     uint32_t process_id = (uint32_t)process_current_id();
 
+    // Normally process_build() made the table already (syscall_process_start)
     uint32_t irq_flags = irq_save();
     SysProcessFiles* t = sys_files_find(process_id);
     if (t == NULL) {
-        t = (SysProcessFiles*)malloc(sizeof(SysProcessFiles));
+        t = sys_files_new(process_id, space, "/");
         if (t != NULL) {
-            memset(t, 0, sizeof(SysProcessFiles));
-            t->process_id = process_id;
-            t->space      = space;
-            t->cwd[0]     = '/';
-            mutex_init(&t->lock);
             t->next = sys_files_list;
             sys_files_list = t;
         }
@@ -145,6 +159,75 @@ static int32_t sys_files_call(SysFilesFn fn, const SyscallArgs* args) {
     return result;
 }
 
+// Wait for the calls still inside an unlinked table to leave, then close
+// its files and free it. Thread context, interrupts on.
+static void sys_files_destroy(SysProcessFiles* t) {
+    uint64_t start = timer_get_ms();
+    while (1) {
+        uint32_t irq_flags = irq_save();
+        uint32_t users = t->users;
+        irq_restore(irq_flags);
+        if (users == 0)
+            break;
+
+        if (timer_get_ms() - start >= SYS_FILES_EXIT_WAIT_MS) {
+            serial_puts("syscall: process ");
+            serial_put_dec(t->process_id);
+            serial_puts(" ended inside a file call; its descriptor table is leaked\n");
+            return;
+        }
+        thread_sleep(1);
+    }
+
+    sys_files_close_all(t);
+    free(t);
+}
+
+static bool sys_files_process_start(uint32_t process_id, AddressSpace* space, const char* cwd) {
+    // Settle the directory first: absolute, normalized, and a directory
+    // that exists right now. Anything else starts the process in "/".
+    char path[SYS_PATH_MAX];
+    bool usable = false;
+
+    if (cwd != NULL && cwd[0] == '/' && vfs_path_normalize("/", cwd, path, sizeof(path)))
+        usable = (path[1] == '\0') || vfs_directory_check(path);
+
+    if (!usable) {
+        if (cwd != NULL) {
+            serial_puts("syscall: process ");
+            serial_put_dec(process_id);
+            serial_puts(": working directory \"");
+            serial_puts(cwd);
+            serial_puts("\" is not usable, starting in /\n");
+        }
+        path[0] = '/';
+        path[1] = '\0';
+    }
+
+    SysProcessFiles* t = sys_files_new(process_id, space, path);
+    if (t == NULL)
+        return false;
+
+    // Swap in the new table. Process ids carry a generation, so an old table
+    // under this id should not exist; drop one if it somehow does.
+    SysProcessFiles* stale = NULL;
+    uint32_t irq_flags = irq_save();
+    for (SysProcessFiles** link = &sys_files_list; *link != NULL; link = &(*link)->next) {
+        if ((*link)->process_id == process_id) {
+            stale = *link;
+            *link = stale->next;
+            break;
+        }
+    }
+    t->next = sys_files_list;
+    sys_files_list = t;
+    irq_restore(irq_flags);
+
+    if (stale != NULL)
+        sys_files_destroy(stale);
+    return true;
+}
+
 static void sys_files_process_exit(uint32_t process_id) {
     uint32_t irq_flags = irq_save();
     SysProcessFiles* t = NULL;
@@ -157,29 +240,9 @@ static void sys_files_process_exit(uint32_t process_id) {
     }
     irq_restore(irq_flags);
 
-    if (t == NULL)
-        return;
-
     // Unlinked: no new call can find it. Wait for the ones already inside.
-    uint64_t start = timer_get_ms();
-    while (1) {
-        irq_flags = irq_save();
-        uint32_t users = t->users;
-        irq_restore(irq_flags);
-        if (users == 0)
-            break;
-
-        if (timer_get_ms() - start >= SYS_FILES_EXIT_WAIT_MS) {
-            serial_puts("syscall: process ");
-            serial_put_dec(process_id);
-            serial_puts(" ended inside a file call; its descriptor table is leaked\n");
-            return;
-        }
-        thread_sleep(1);
-    }
-
-    sys_files_close_all(t);
-    free(t);
+    if (t != NULL)
+        sys_files_destroy(t);
 }
 
 //

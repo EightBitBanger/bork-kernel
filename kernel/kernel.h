@@ -27,8 +27,8 @@
 #define PATH_LENGTH_MAX  VFS_PATH_MAX
 
 struct LocalPaths {
-    char path[PATH_LENGTH_MAX];     // Program search directories
-    char home[PATH_LENGTH_MAX];     // Device local system directory "/sys"
+    char path[PATH_LENGTH_MAX];     // Search directories separated by ";"
+    char home[PATH_LENGTH_MAX];     // Device local "home" system directory "/mnt/<drive>/sys"
 };
 
 // Working directory
@@ -38,15 +38,6 @@ struct LocalPaths {
 // "boot install"; a basefs address does not, and neither does a cached
 // device root. Relative paths are turned into absolute ones against it with
 // vfs_path_normalize().
-//
-// Nothing checks that it still exists: a directory can be removed or its
-// device reformatted underneath it. Whoever uses it (the console) checks
-// and falls back to the nearest existing ancestor.
-//
-// One working directory for the kernel for now. Once processes have their
-// own, this moves into the process and these become its accessors.
-//
-// Thread context only (guarded by the VFS lock).
 
 // Copy the working directory into `path`. False if it does not fit `size`
 // ("/" is copied instead when there is room for it).
@@ -65,11 +56,4 @@ void kernel_init(void);
 uint32_t create_device(const char* name);
 void destroy_device(uint32_t address);
 
-// Hardware identification
-
-void hardware_identify_devices(uint32_t knode_device, uint32_t knode_mount, uint32_t nt_device);
-uint32_t device_get_hardware_address(const char* name);
-void device_get_hardware_data(uint32_t address, char* data_buffer, uint8_t size);
-
 #endif
-

@@ -1,4 +1,5 @@
 
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -40,6 +41,9 @@ _Static_assert(PROCESS_STACK_TOP == VM_USER_STACK_TOP, "stack must end at the to
 _Static_assert((PROCESS_IMAGE_LIMIT & (PAGE_SIZE - 1)) == 0, "image area must end on a page");
 _Static_assert(PROCESS_IMAGE_LIMIT + PROCESS_HEAP_MAX < PROCESS_STACK_BASE - PAGE_SIZE,
                "image, heap and stack (plus its guard page) overlap");
+
+// An executable's directory always fits a syscall path
+_Static_assert(PROCESS_PATH_MAX <= SYS_PATH_MAX, "image paths must fit SYS_PATH_MAX");
 
 // One mapped region of a process's user address space
 typedef struct {
@@ -107,6 +111,22 @@ static void copy_string(char* dst, const char* src, uint32_t capacity) {
             dst[i] = src[i];
     }
     dst[i] = '\0';
+}
+
+// Directory holding an executable: "/mnt/ata0p1/bin/hello" -> "/mnt/ata0p1/bin",
+// "/hello" -> "/". Anything that is not an absolute path gives "/".
+static void process_image_directory(const char* image_path, char out[PROCESS_PATH_MAX]) {
+    if (image_path == NULL || image_path[0] != '/') {
+        copy_string(out, "/", PROCESS_PATH_MAX);
+        return;
+    }
+    copy_string(out, image_path, PROCESS_PATH_MAX);
+
+    char* slash = strrchr(out, '/');
+    if (slash == out)
+        out[1] = '\0';
+    else
+        *slash = '\0';
 }
 
 // Handles
@@ -305,9 +325,10 @@ static int process_load_elf(Process* p, void* ctx) {
 // Build
 
 // Reserve a slot, create the address space, let `load` put the image in it,
-// then add the heap, the stack and the main thread.
-static ProcessId process_build(const char* name, const char* path, ThreadPriority priority,
-                               ProcessLoadFn load, void* ctx) {
+// then add the heap, the stack, the file table (working directory `cwd`)
+// and the main thread.
+static ProcessId process_build(const char* name, const char* path, const char* cwd,
+                               ThreadPriority priority, ProcessLoadFn load, void* ctx) {
     if (priority < PRIORITY_IDLE || priority > PRIORITY_REALTIME)
         return PROCESS_ERR_INVALID_ARG;
     if ((read_cr0() & CR0_PG) == 0)
@@ -319,6 +340,7 @@ static ProcessId process_build(const char* name, const char* path, ThreadPriorit
 
     // The slot is reserved (CREATING), so it can be filled in without the lock
     int error = PROCESS_OK;
+    bool files_ready = false;
     uint32_t irq;
     p->priority = priority;
     copy_string(p->name, (name && name[0]) ? name : "process", PROCESS_NAME_MAX);
@@ -351,6 +373,16 @@ static ProcessId process_build(const char* name, const char* path, ThreadPriorit
         goto fail;
     }
 
+    // Descriptor table and working directory. In place before the main
+    // thread exists, so its very first file call already resolves relative
+    // paths against `cwd`. (Interrupts on: this checks the directory
+    // through the VFS.)
+    if (!syscall_process_start((uint32_t)p->pid, p->space, cwd)) {
+        error = PROCESS_ERR_NO_MEMORY;
+        goto fail;
+    }
+    files_ready = true;
+
     // Main thread. Interrupts stay off until the process is RUNNING, so the
     // thread cannot run (and, say, exit) before its process is complete.
     irq = irq_save();
@@ -380,6 +412,10 @@ static ProcessId process_build(const char* name, const char* path, ThreadPriorit
     return p->pid;
 
 fail:
+    // No thread of this process ever ran, so the table is unused: this
+    // only frees it (interrupts are on here)
+    if (files_ready)
+        syscall_process_exit((uint32_t)p->pid);
     process_free_address_space(p);
     irq = irq_save();
     process_release_slot(p);
@@ -399,10 +435,11 @@ ProcessId CreateProcessFromImage(const char* name, const ProcessImage* image, Th
     if (image->entry_offset >= memory_size)
         return PROCESS_ERR_INVALID_ARG;
 
-    return process_build(name, "<memory>", priority, process_load_flat, (void*)image);
+    // No file to be next to: start at the top
+    return process_build(name, "<memory>", "/", priority, process_load_flat, (void*)image);
 }
 
-ProcessId CreateProcess(const char* image_path, ThreadPriority priority) {
+ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriority priority) {
     if (image_path == NULL || image_path[0] != '/')
         return PROCESS_ERR_INVALID_ARG;
     if (strnlen(image_path, PROCESS_PATH_MAX) >= PROCESS_PATH_MAX)
@@ -421,6 +458,13 @@ ProcessId CreateProcess(const char* image_path, ThreadPriority priority) {
         !(permissions & VFS_PERMISSION_EXECUTE))
         return PROCESS_ERR_NOT_EXECUTABLE;
 
+    // Default working directory: where the program lives
+    char image_dir[PROCESS_PATH_MAX];
+    if (cwd == NULL || cwd[0] == '\0') {
+        process_image_directory(image_path, image_dir);
+        cwd = image_dir;
+    }
+
     File file = vfs_open(image_path, VFS_OPEN_READ);
     if (file == VFS_INVALID_FILE)
         return PROCESS_ERR_LOAD_FAILED;
@@ -431,10 +475,14 @@ ProcessId CreateProcess(const char* image_path, ThreadPriority priority) {
     const char* name = strrchr(image_path, '/');
     name = (name != NULL) ? name + 1 : image_path;
 
-    ProcessId pid = process_build(name, image_path, priority, process_load_elf, &source);
+    ProcessId pid = process_build(name, image_path, cwd, priority, process_load_elf, &source);
 
     vfs_close(file);
     return pid;
+}
+
+ProcessId CreateProcess(const char* image_path, ThreadPriority priority) {
+    return CreateProcessIn(image_path, NULL, priority);
 }
 
 int DestroyProcess(ProcessId pid) {
@@ -748,5 +796,4 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
     // Not in the process table (should not happen): end just this thread
     kthread_exit();
 }
-
 

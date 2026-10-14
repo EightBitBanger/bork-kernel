@@ -1,3 +1,4 @@
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -80,6 +81,10 @@ extern ThreadBlock* current_thread;
 void syscall_init(void) {
     serial_init();
     sys_print_init();
+}
+
+bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd) {
+    return sys_files_process_start(process_id, space, cwd);
 }
 
 void syscall_process_exit(uint32_t process_id) {
