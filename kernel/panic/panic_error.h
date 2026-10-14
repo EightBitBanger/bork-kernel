@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// Kept for files that got draw.h / display.h through this header; the
+// panic screen itself only uses <kernel/gfx/gfx.h>
 #include <kernel/arch/x86/drivers/display/draw.h>
 #include <kernel/console/display.h>
 #include <kernel/console/print.h>
@@ -31,4 +33,5 @@ extern volatile bool kernel_panicking;
 void kernel_crashout(uint32_t error_code, uint32_t faulting_address, uint8_t type, const char* extra);
 
 #endif
+
 
