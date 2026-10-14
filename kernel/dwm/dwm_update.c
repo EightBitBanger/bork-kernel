@@ -94,7 +94,7 @@ void dwm_update(void) {
     
     for (int i = 0; i < context.window_context.dirty_count; i++) {
         struct Rect r = context.window_context.dirty_regions[i];
-        draw_flush_region(r.x, r.y, r.w, r.h);
+        gfx_display_present_rect(r.x, r.y, r.w, r.h);
     }
     
     // Reset frame state
@@ -106,3 +106,4 @@ void dwm_update(void) {
     context.window_context.cursor_height  = images.current_cursor.height;
     context.window_context.dirty_count = 0;
 }
+

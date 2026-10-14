@@ -217,45 +217,43 @@ void dwm_resize_window_buffer(struct WindowObject* window, int new_w, int new_h)
         while (new_capacity_w < new_w) new_capacity_w += DWM_BUFFER_CHUNK_SIZE;
         while (new_capacity_h < new_h) new_capacity_h += DWM_BUFFER_CHUNK_SIZE;
         
-        uint32_t* new_buffer = (uint32_t*)malloc(new_capacity_w * new_capacity_h * sizeof(uint32_t));
+        GfxSurface grown;
+        if (!gfx_surface_create(&grown, new_capacity_w, new_capacity_h))
+            return;     // Out of memory: keep the current size
         
-        // Copy the old pixel data into the new buffer
+        // Copy the old pixels across (the stride changes, so a blit, not a memcpy)
         if (window->frame_buffer != NULL) {
-            for (int y = 0; y < window->h; y++) {
-                // We MUST copy row-by-row because the buffer_w (stride) has changed!
-                memcpy(&new_buffer[y * new_capacity_w], 
-                    &window->frame_buffer[y * window->buffer_w], 
-                    window->w * sizeof(uint32_t));
-            }
+            GfxSurface old;
+            dwm_window_surface(window, &old);
+            GfxRect visible = gfx_rect(0, 0, window->w, window->h);
+            
+            GfxContext gc;
+            gfx_context_init(&gc, &grown);
+            gfx_blit(&gc, &old, &visible, 0, 0);
             free(window->frame_buffer);
         }
         
-        window->frame_buffer = new_buffer;
+        // The window takes over the pixels (it frees them with free())
+        window->frame_buffer = grown.pixels;
         window->buffer_w = new_capacity_w;
         window->buffer_h = new_capacity_h;
     }
     
     // Fill the newly exposed "L-shape" with a background color
     // (Wait for the client app to catch up and draw its actual UI)
+    GfxSurface surface;
+    dwm_window_surface(window, &surface);
+    GfxContext gc;
+    gfx_context_init(&gc, &surface);
+    
     uint32_t bg_color = theme.client.background;
     
-    // Fill the new bottom rectangle
-    if (new_h > window->h) {
-        for (int y = window->h; y < new_h; y++) {
-            for (int x = 0; x < new_w; x++) {
-                window->frame_buffer[y * window->buffer_w + x] = bg_color;
-            }
-        }
-    }
-    
-    // Fill the new right rectangle
-    if (new_w > window->w) {
-        for (int y = 0; y < window->h; y++) { // Only go up to the old height (bottom rect handles the rest)
-            for (int x = window->w; x < new_w; x++) {
-                window->frame_buffer[y * window->buffer_w + x] = bg_color;
-            }
-        }
-    }
+    // New bottom strip (full new width), then the new right strip beside
+    // the old height
+    if (new_h > window->h)
+        gfx_fill_rect(&gc, 0, window->h, new_w, new_h - window->h, bg_color);
+    if (new_w > window->w)
+        gfx_fill_rect(&gc, window->w, 0, new_w - window->w, window->h, bg_color);
     
     // Update logical dimensions
     window->w = new_w;
@@ -326,3 +324,4 @@ void dwm_update_window_capture(struct WindowContext* ctx) {
         dragdrop.captured_window = 0;
     }
 }
+

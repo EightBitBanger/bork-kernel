@@ -6,6 +6,8 @@
 #include <kernel/dwm/dwm_context_menu.h>
 
 #include <kernel/dwm/dwm_platform.h>
+#include <kernel/gfx/gfx.h>
+#include <kernel/gfx/gfx_display.h>
 #include <kernel/dwm/flags.h>
 
 #include <kernel/mutex.h>
@@ -91,6 +93,7 @@ struct DWMDragDrop {
 struct DWMContext {
     struct WindowContext window_context;
     struct WindowObject* event_window;
+    GfxContext* paint_context;      // The event_window's buffer, during its REDRAW
     
     struct IconObject* focused_icon;
     struct IconObject* last_focused_icon;
@@ -242,7 +245,26 @@ void dwm_desktop_rename_draw(const struct WindowContext* ctx);
 struct WindowObject* dwm_get_root_parent(struct WindowObject* window);
 
 void dwm_resize_window_buffer(struct WindowObject* window, int new_w, int new_h);
-void dwm_upload_window_buffer_to_backbuffer(struct WindowObject* window, uint32_t* frame_buffer, uint32_t screen_stride, 
-                                            int clip_x, int clip_y, int clip_w, int clip_h);
+
+// ==========================================
+// Graphics (dwm_draw.c)
+// ==========================================
+//
+// The compositor draws through ONE context on the display back surface,
+// owned by the DWM thread (dwm_screen_context). Its clip is reset to the
+// whole screen at the start of every frame, so code that narrows it must
+// gfx_save / gfx_restore around that.
+//
+// A window's frame buffer is not a struct member yet: dwm_window_surface
+// wraps it in a GfxSurface on demand (stride = buffer_w).
+
+void dwm_graphics_init(void);
+GfxContext* dwm_screen_context(void);
+void dwm_window_surface(const struct WindowObject* window, GfxSurface* out);
+
+// Copy part of a window's client buffer to the screen. The clip is in
+// screen coordinates and is cut to the window's buffer.
+void dwm_upload_window_buffer(struct WindowObject* window, int clip_x, int clip_y, int clip_w, int clip_h);
 
 #endif
+

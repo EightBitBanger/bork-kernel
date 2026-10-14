@@ -281,8 +281,10 @@ void dwm_desktop_rename_draw(const struct WindowContext* ctx) {
     }
     if (!dirty) return;
     
-    draw_rect_filled(box_x, box_y, box_w, box_h, RENAME_COLOR_BG);
-    draw_rect(box_x - 1, box_y - 1, box_w + 2, box_h + 2, RENAME_COLOR_BORDER);
+    GfxContext* gc = dwm_screen_context();
+    
+    gfx_fill_rect(gc, box_x, box_y, box_w, box_h, RENAME_COLOR_BG);
+    gfx_draw_rect(gc, box_x - 1, box_y - 1, box_w + 2, box_h + 2, RENAME_COLOR_BORDER);
     
     // Text that fits is centered like the explorer box. Longer text scrolls
     // so the cursor stays visible.
@@ -303,10 +305,10 @@ void dwm_desktop_rename_draw(const struct WindowContext* ctx) {
     strncpy(shown, &rename_state.text[first], (size_t)visible + 1);
     
     int text_y = box_y + (box_h - RENAME_FONT_H) / 2;
-    draw_text(text_x, text_y, shown, RENAME_COLOR_TEXT);
+    gfx_draw_text(gc, text_x, text_y, shown, RENAME_COLOR_TEXT);
     
     // Two pixel wide cursor, same as the window edit fields
     int cursor_x = text_x + (int)(rename_state.cursor - first) * RENAME_FONT_W;
-    draw_line(cursor_x,     text_y, cursor_x,     text_y + RENAME_FONT_H, RENAME_COLOR_CURSOR);
-    draw_line(cursor_x + 1, text_y, cursor_x + 1, text_y + RENAME_FONT_H, RENAME_COLOR_CURSOR);
+    gfx_fill_rect(gc, cursor_x, text_y, 2, RENAME_FONT_H + 1, RENAME_COLOR_CURSOR);
 }
+

@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/gfx/gfx.h>
 
 #include <kernel/dwm/rendering/image.h>
 
@@ -137,7 +138,17 @@ void* dwm_window_resource_get_by_index(WindowHandle handle, uint32_t index);
 void* dwm_window_resource_get_by_name(WindowHandle handle, const char* name);
 void dwm_window_resource_free_all(WindowHandle handle);
 
-// Primitive drawing
+// Painting
+//
+// While a window procedure handles DWM_EVENT_REDRAW, this returns a
+// GfxContext on that window's frame buffer (client area, (0, 0) = top-left);
+// otherwise NULL. Use it with the gfx_* calls (<kernel/gfx/gfx.h>). The
+// legacy draw_* calls and the dwm_draw_* wrappers below are routed to the
+// same context for the duration of the REDRAW.
+
+GfxContext* dwm_window_paint_context(WindowHandle handle);
+
+// Primitive drawing (wrappers over the paint context; no-ops outside REDRAW)
 
 void dwm_draw_line(int16_t x, int16_t y, int16_t w, int16_t h, uint32_t color);
 void dwm_draw_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint32_t color);
@@ -217,3 +228,4 @@ bool dwm_desktop_layout_save(void);
 void dwm_notify_item_created(const char* path);
 
 #endif
+

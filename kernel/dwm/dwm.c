@@ -1,4 +1,3 @@
-
 #include <kernel/dwm/dwm.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/dwm/dwm_core_internal.h>
@@ -140,6 +139,9 @@ void dwm_initiate(void) {
     
     DWM_GUARD();
     
+    // The compositor's drawing context on the display back buffer
+    dwm_graphics_init();
+    
     // Theme (must come before any window is created)
     dwm_theme_init();
     
@@ -236,8 +238,9 @@ void dwm_initiate(void) {
         dwm_set_cursor(def_cursor->data, def_cursor->width, def_cursor->height);
     }
     
-    draw_rect_filled(0, 0, display_get_width(), display_get_height(), theme.desktop.background);
-    draw_flush_region(0, 0, display_get_width(), display_get_height());
+    GfxContext* gc = dwm_screen_context();
+    gfx_clear(gc, theme.desktop.background);
+    gfx_display_present_all();
 }
 
 WindowHandle dwm_create_window(WindowClass wclass, uint16_t wstyle, WindowProcedure wproc) {
@@ -694,3 +697,4 @@ void dwm_summon_context_menu(WindowHandle window, uint16_t x, uint16_t y, const 
     
     dwm_create_context_menu(posx, posy, DWM_CONTEXT_MENU_USER, options, number_of_items);
 }
+

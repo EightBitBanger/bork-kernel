@@ -1,4 +1,3 @@
-
 #include <kernel/dwm/dwm.h>
 #include <kernel/dwm/dwm_core_internal.h>
 
@@ -377,37 +376,24 @@ void dwm_process_focus_change(void) {
     }
 }
 
-void dwm_upload_window_buffer_to_backbuffer(struct WindowObject* window, uint32_t* frame_buffer, uint32_t screen_stride,
-                                            int clip_x, int clip_y, int clip_w, int clip_h) {
-    int client_start_x = window->x;
-    int client_start_y = window->y + window->titlebar_height;
-    
-    int local_start_x = clip_x - client_start_x;
-    int local_start_y = clip_y - client_start_y;
-    
-    if (local_start_x < 0) { clip_w += local_start_x; local_start_x = 0; }
-    if (local_start_y < 0) { clip_h += local_start_y; local_start_y = 0; }
-    
-    if (local_start_x + clip_w > (int)window->buffer_w) clip_w = (int)window->buffer_w - local_start_x;
-    if (local_start_y + clip_h > (int)window->buffer_h) clip_h = (int)window->buffer_h - local_start_y;
-    
-    if (clip_w <= 0 || clip_h <= 0) return;
-    
-    for (int i = 0; i < clip_h; i++) {
-        int current_local_y  = local_start_y + i;
-        int current_screen_y = clip_y + i;
-        uint32_t* src  = &window->frame_buffer[(current_local_y * window->buffer_w) + local_start_x];
-        uint32_t* dest = &frame_buffer[(current_screen_y * screen_stride) + clip_x];
-        int count = clip_w;
-        
-        asm volatile (
-            "cld;\n\t"
-            "rep movsd;\n\t"
-            : "+S"(src), "+D"(dest), "+c"(count)
-            :
-            : "memory"
-        );
-    }
+// Client area of `window` that falls inside the screen rectangle given,
+// copied from its frame buffer to the back buffer
+void dwm_upload_window_buffer(struct WindowObject* window, int clip_x, int clip_y, int clip_w, int clip_h) {
+    if (window == NULL || clip_w <= 0 || clip_h <= 0) return;
+
+    GfxSurface surface;
+    dwm_window_surface(window, &surface);
+
+    // Buffer pixel (0, 0) sits at the top-left of the client area
+    int client_x = window->x;
+    int client_y = window->y + window->titlebar_height;
+
+    GfxRect src = gfx_rect(clip_x - client_x, clip_y - client_y, clip_w, clip_h);
+    GfxContext* gc = dwm_screen_context();
+
+    GfxBlend old = gfx_set_blend(gc, GFX_BLEND_COPY);
+    gfx_blit(gc, &surface, &src, clip_x, clip_y);
+    gfx_set_blend(gc, old);
 }
 
 void dwm_window_set_parent(WindowHandle child, WindowHandle parent) {
@@ -585,3 +571,4 @@ void dwm_refresh_all_windows(void) {
     // the kernel lock must not be taken while the DWM lock is held.
     dwm_kernel_event_send(KEVENT_DWM_REFRESH, "", "");
 }
+
