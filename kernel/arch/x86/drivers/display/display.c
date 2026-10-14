@@ -3,9 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <kernel/arch/x86/drivers/display/char_rom.h>
-#include <kernel/arch/x86/drivers/display/draw.h>
-#include <kernel/boot/x86/multiboot_info.h>
+#include <kernel/gfx/gfx.h>
+#include <kernel/gfx/gfx_display.h>
 
 #include <kernel/console/display.h>
 #include <kernel/malloc.h>
@@ -13,7 +12,7 @@
 #include <kernel/util/string.h>
 
 //
-// Text console on the linear framebuffer
+// Text console on the display back buffer
 //
 // The console keeps its text as a grid of character cells, not as pixels:
 //
@@ -21,33 +20,30 @@
 //                 row r (0 = top of the screen) lives at physical row
 //                 (ring_top + r) % rows. Scrolling one line is just
 //                 ring_top++ and blanking the row that comes into view: O(1),
-//                 no pixels move. (It used to memmove the whole ~5.7 MB back
-//                 buffer and then copy all of it to VRAM again, per line.)
+//                 no pixels move.
 //
 //   shown_cells   what is currently drawn on screen, per screen cell
 //
 //   row_dirty     screen rows that may differ from shown_cells
 //
 // display_present() compares the dirty rows against shown_cells and redraws
-// only the cells that actually changed, then flushes one span per changed
-// row. A scroll still has to repaint the text that moved, but blank cells
-// and cells that happen to hold the same character are skipped, and only
-// the changed spans reach VRAM.
+// only the cells that actually changed, then presents one span per changed
+// row.
 //
 // Updates are batched: between display_begin_update() and
 // display_end_update() nothing is drawn, so print() of a 40-line listing
 // scrolls 40 times in the grid but repaints the screen once.
 //
-
-// char_rom: 6 column bytes per glyph, bit n of a byte is pixel row n
-#define CHAR_ROM_GLYPH_BYTES  6
-#define CHAR_ROM_GLYPH_ROWS   8
-#define CHAR_ROM_GLYPH_COUNT  (sizeof(char_rom) / CHAR_ROM_GLYPH_BYTES)
+// Drawing goes through the console's OWN GfxContext on the display back
+// surface, with its own font (the char ROM with a 9 pixel line), so nothing
+// the DWM does to its contexts (clip, origin, target) can reach it.
+//
 
 // Kept global: other code reads the cursor directly
 uint16_t cursor_position;   // Column
 uint16_t cursor_line;       // Row
 
+// Screen size in pixels (kept global for older code)
 uint32_t display_width;
 uint32_t display_height;
 
@@ -58,14 +54,11 @@ uint32_t console_height;    // Rows
 uint8_t console_glyph_width  = 6;
 uint8_t console_glyph_height = 9;
 
-extern struct MultibootInfo* vinfo;
+#define CONSOLE_FOREGROUND   0xFFCACACAu
+#define CONSOLE_BACKGROUND   0xFF040404u
 
-extern uint32_t foreground_color;
-extern uint32_t background_color;
-extern uint32_t transparent_color;
-
-extern uint32_t* back_buffer;
-extern uint32_t* front_buffer;
+static GfxContext console_gc;
+static GfxFont    console_font;
 
 static uint8_t* text_cells   = NULL;
 static uint8_t* shown_cells  = NULL;
@@ -81,50 +74,25 @@ static inline uint8_t* ring_row(uint32_t row) {
 // Anything the font has no glyph for is shown as '?'
 static inline uint8_t cell_char(char ch) {
     uint8_t c = (uint8_t)ch;
-    return (c < CHAR_ROM_GLYPH_COUNT) ? c : (uint8_t)'?';
+    return (c >= console_font.first && c - console_font.first < console_font.count) ? c : (uint8_t)'?';
 }
 
 static void mark_all_rows_dirty(void) {
     memset(row_dirty, 1, console_height);
 }
 
-// Draw one cell straight into the back buffer (stride = display width).
-// Writing the pixels directly instead of through draw_glyph() keeps the
-// console independent of the drawing state the DWM changes (origin, clip
-// rectangle, target buffer).
-static void render_cell(uint32_t row, uint32_t col, uint8_t c) {
-    const uint32_t stride = display_width;
-    const uint32_t gw = console_glyph_width;
-    const uint32_t gh = console_glyph_height;
-    const uint32_t fg = foreground_color;
-    const uint32_t bg = background_color;
-
-    const uint8_t* glyph = &char_rom[(uint32_t)c * CHAR_ROM_GLYPH_BYTES];
-    uint32_t* pixel = back_buffer + (size_t)(row * gh) * stride + col * gw;
-
-    for (uint32_t y = 0; y < gh; y++) {
-        for (uint32_t x = 0; x < gw; x++) {
-            uint8_t bits = (x < CHAR_ROM_GLYPH_BYTES) ? glyph[x] : 0;
-            pixel[x] = (y < CHAR_ROM_GLYPH_ROWS && ((bits >> y) & 1)) ? fg : bg;
-        }
-        pixel += stride;
-    }
-}
-
 static void display_present(void) {
-    if (text_cells == NULL || back_buffer == NULL || front_buffer == NULL)
+    if (text_cells == NULL || !gfx_display_ready())
         return;     // Nothing to draw into yet; the dirty state is kept
 
-    const uint32_t gw = console_glyph_width;
-    const uint32_t gh = console_glyph_height;
+    const int32_t gw = console_glyph_width;
+    const int32_t gh = console_glyph_height;
     bool full = repaint_all;
 
     if (full) {
         // Wipe everything, including the pixels outside the cell grid and
         // whatever was drawn here before the console owned the screen
-        size_t total = (size_t)display_width * display_height;
-        for (size_t i = 0; i < total; i++)
-            back_buffer[i] = background_color;
+        gfx_clear(&console_gc, CONSOLE_BACKGROUND);
         memset(shown_cells, ' ', (size_t)console_width * console_height);
         mark_all_rows_dirty();
         repaint_all = false;
@@ -142,18 +110,19 @@ static void display_present(void) {
         for (uint32_t col = 0; col < console_width; col++) {
             if (text[col] == shown[col])
                 continue;
-            render_cell(row, col, text[col]);
+            gfx_draw_char_opaque(&console_gc, (int32_t)col * gw, (int32_t)row * gh, text[col],
+                                 CONSOLE_FOREGROUND, CONSOLE_BACKGROUND);
             shown[col] = text[col];
             if (first < 0) first = (int32_t)col;
             last = (int32_t)col;
         }
 
         if (!full && first >= 0)
-            draw_flush_region(first * (int)gw, (int)(row * gh), (last - first + 1) * (int)gw, (int)gh);
+            gfx_display_present_rect(first * gw, (int32_t)row * gh, (last - first + 1) * gw, gh);
     }
 
     if (full)
-        draw_flush_display();
+        gfx_display_present_all();
 }
 
 static inline void present_if_idle(void) {
@@ -161,17 +130,21 @@ static inline void present_if_idle(void) {
         display_present();
 }
 
+// gfx_display_init() must have run first (kmain does that)
 void display_init(void) {
-    display_width  = vinfo->framebuffer_width;
-    display_height = vinfo->framebuffer_height;
+    display_width  = (uint32_t)gfx_display_width();
+    display_height = (uint32_t)gfx_display_height();
+
+    console_font = *gfx_font_default();
+    console_font.line_height = console_glyph_height;    // One blank pixel row between lines
+    console_glyph_width = console_font.advance;
+
+    gfx_context_init(&console_gc, gfx_display_back());
+    gfx_set_font(&console_gc, &console_font);
 
     // Columns across, rows down
     console_width  = display_width  / console_glyph_width;
     console_height = display_height / console_glyph_height;
-
-    foreground_color  = 0xFFCACACA;
-    background_color  = 0xFF040404;
-    transparent_color = make_color(0, 1, 1, 1);
 
     cursor_line = 0;
     cursor_position = 0;
@@ -207,11 +180,11 @@ uint32_t display_get_device_address(void) {
 void display_busy_wait(void) {}
 
 uint16_t display_get_width(void) {
-    return display_width;
+    return (uint16_t)display_width;
 }
 
 uint16_t display_get_height(void) {
-    return display_height;
+    return (uint16_t)display_height;
 }
 
 uint8_t display_get_glyph_width(void) {
@@ -222,9 +195,7 @@ uint8_t display_get_glyph_height(void) {
     return console_glyph_height;
 }
 
-// Characters per line. (These two returned each other's value, so text
-// wrapped after 100 characters on a 266-column screen and the cursor ran
-// 266 lines down a 100-line screen before anything scrolled.)
+// Characters per line
 uint16_t display_get_columns(void) {
     return console_width;
 }
@@ -262,8 +233,7 @@ void display_clear(void) {
     memset(text_cells, ' ', (size_t)console_width * console_height);
     ring_top = 0;
 
-    // Also wipes non-text pixels. (This used to fill the back buffer and
-    // never flush it, which is why "cls" seemed to do nothing.)
+    // Also wipes non-text pixels
     repaint_all = true;
     present_if_idle();
 }

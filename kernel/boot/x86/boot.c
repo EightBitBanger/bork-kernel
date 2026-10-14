@@ -29,6 +29,11 @@
 
 // Console
 #include <kernel/console/print.h>
+#include <kernel/console/display.h>
+
+// Graphics
+#include <kernel/gfx/gfx.h>
+#include <kernel/gfx/gfx_display.h>
 #include <kernel/console/console.h>
 #include <kernel/console/virtual_key.h>
 
@@ -178,18 +183,17 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     // Event messenger
     kernel_event_init();
     
-    // Initiate display and drawing
-    draw_set_info((uint32_t)mbi);
+    // Graphics: front surface = the VRAM window (hardware pitch), back
+    // surface = the packed buffer right after it. Nothing is presented until
+    // the console's first print, which is after the VRAM mapping below.
+    gfx_display_init(front_buffer, mbi->framebuffer_pitch, back_buffer,
+                     (int32_t)mbi->framebuffer_width, (int32_t)mbi->framebuffer_height);
+    
+    // Text console (its own context on the back surface)
     display_init();
     
     display_cursor_set_line(0);
     display_cursor_set_position(0);
-    
-    // Set drawing frame buffers
-    draw_set_clip_rect(0, 0, mbi->framebuffer_width, mbi->framebuffer_height);
-    draw_set_frame_front_buffer(front_buffer);
-    draw_set_frame_back_buffer(back_buffer);
-    draw_set_buffer_default();
     
     // Map the hardware framebuffer over the reserved window as write-combining
     // (falls back to uncached when the CPU has no PAT). The reservation above
@@ -220,7 +224,7 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     kernel_init();
     
     print("kernel v0.1.0\n");
-    draw_flush_display();
+    gfx_display_present_all();
     
     
     //
@@ -243,7 +247,7 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
                 kb_flush();
                 
                 console_prompt_print();
-                draw_flush_display();
+                gfx_display_present_all();
                 break;
             }
         }
@@ -273,8 +277,12 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     while ((timer_get_ms() - old_ms) <= BOOT_DELAY_MS);
     
     // Blank the screen in preparation for pure graphics mode
-    draw_rect_filled(0, 0, display_get_width(), display_get_height(), 0xFF000000);
-    draw_flush_region(0, 0, display_get_width(), display_get_height());
+    {
+        GfxContext gc;
+        gfx_context_init(&gc, gfx_display_back());
+        gfx_clear(&gc, GFX_COLOR_BLACK);
+        gfx_display_present_all();
+    }
     
     //
     // Load the registry
@@ -387,10 +395,16 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     
     irq_restore(irq_flags);
     
+    char filename[] = "/mnt/ata0p1/usr/desktop/test";
     while(1) {
         
-        //dwm_launch_program("/mnt/ata0p1/usr/desktop/test");
+        // Scheduler thrash / hammer burst test
+        /*
+        for (unsigned int i=0; i < 8; i++) 
+            dwm_launch_program(filename);
+        */
         
         thread_sleep(100);
     }
 }
+

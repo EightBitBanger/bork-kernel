@@ -1,8 +1,27 @@
 #ifndef DRAWING_2D_H
 #define DRAWING_2D_H
 
+// Legacy drawing API (compatibility layer)
+//
+// These are the old global-state draw_* calls, now implemented on top of
+// <kernel/gfx/gfx.h>. They draw through one BOUND GfxContext: by default an
+// internal context targeting the display back buffer. The DWM binds a
+// window's paint context while that window's procedure handles REDRAW, so
+// old window procedures that call draw_* still land in their own window.
+//
+// New code should use a GfxContext directly (dwm_window_paint_context()
+// inside a window procedure, or its own context on its own surface).
+//
+// Each call keeps its historical blending behavior regardless of the
+// bound context's blend mode: *_blend and the gradients alpha-blend,
+// everything else stores colors as given.
+
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+
+#include <kernel/gfx/gfx.h>
+#include <kernel/gfx/gfx_display.h>
 #include <kernel/boot/x86/multiboot_info.h>
 
 #define COLOR(val) (uint16_t)((val) & 0xFFFF), (uint16_t)((val) >> 16)
@@ -15,47 +34,27 @@ struct ClippingPlane {
 };
 
 static inline uint32_t blend_pixels(uint32_t src, uint32_t dest) {
-    int32_t alpha = (int32_t)((src >> 24) & 0xFF);
-    
-    if (alpha == 0)   return dest;
-    if (alpha == 255) return src;
-    
-    // Signed math: (src - dest) is negative whenever the source channel is
-    // darker than the destination. With uint32_t it wrapped, and the division
-    // turned the wrap into garbage that bled into neighbouring channels.
-    int32_t src_r = (int32_t)((src >> 16) & 0xFF);
-    int32_t src_g = (int32_t)((src >> 8)  & 0xFF);
-    int32_t src_b = (int32_t)( src        & 0xFF);
-    
-    int32_t dest_r = (int32_t)((dest >> 16) & 0xFF);
-    int32_t dest_g = (int32_t)((dest >> 8)  & 0xFF);
-    int32_t dest_b = (int32_t)( dest        & 0xFF);
-    
-    uint32_t out_r = (uint32_t)(dest_r + ((src_r - dest_r) * alpha) / 255);
-    uint32_t out_g = (uint32_t)(dest_g + ((src_g - dest_g) * alpha) / 255);
-    uint32_t out_b = (uint32_t)(dest_b + ((src_b - dest_b) * alpha) / 255);
-    
-    return (0xFF000000) | (out_r << 16) | (out_g << 8) | out_b;
+    return gfx_blend_pixel(src, dest);
 }
 
-static inline void draw_pixel(int x, int y, uint32_t color) {
-    extern uint32_t* frame_buffer;
-    extern uint32_t buffer_stride;
-    
-    size_t offset = (size_t)y * buffer_stride + x;
-    uint8_t alpha = (color >> 24) & 0xFF;
-    
-    frame_buffer[offset] = color;
-}
+// The context draw_* calls go through. Pass NULL to bind the internal
+// default context again. Returns the previously bound one.
+GfxContext* draw_bind_context(GfxContext* ctx);
+GfxContext* draw_get_context(void);
+
+void draw_pixel(int x, int y, uint32_t color);
 
 void draw_set_glyph_scheme(uint32_t foreground, uint32_t background, uint32_t transparent);
 
+// Clip is in target (device) coordinates, as it always was
 void draw_set_clip_rect(int32_t x, int32_t y, int32_t w, int32_t h);
 void draw_set_origin(int32_t x, int32_t y);
 
 void draw_set_buffer_default(void);
 void draw_set_buffer(uint32_t* target_buffer, uint32_t width, uint32_t height);
 
+// Deprecated boot-time setup; kmain now calls gfx_display_init() directly.
+// Kept so older callers still bring the display up.
 void draw_set_info(uint32_t mbi);
 void draw_set_frame_front_buffer(uint32_t buffer_ptr);
 void draw_set_frame_back_buffer(uint32_t buffer_ptr);
@@ -85,4 +84,3 @@ void draw_pie_chart(int center_x, int center_y, int radius, const uint32_t* slic
 void draw_pie_chart_isometric(int center_x, int center_y, int radius, int depth, const uint32_t* slices, const uint32_t* colors, size_t count);
 
 #endif
-
