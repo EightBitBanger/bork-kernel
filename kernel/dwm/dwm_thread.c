@@ -1,3 +1,4 @@
+
 // DWM thread, DWM lock and the two cross-thread mailboxes.
 //
 // Everything the DWM owns (window list, icons, dirty rects, context menus,
@@ -38,6 +39,10 @@
 #include <kernel/scheduler/scheduler.h>
 #include <kernel/scheduler/watchdog.h>
 #include <kernel/util/string.h>
+#include <kernel/ipc/ipc.h>
+#include <kernel/console/display.h>
+#include <kernel/console/mouse.h>
+#include <kernel/util/list.h>
 
 #define DWM_FRAME_MS            16
 #define DWM_KEVENT_ARG_MAX      256
@@ -213,14 +218,53 @@ static void dwm_flush_kernel_events(void) {
 // The DWM thread
 // ==========================================
 
+// ==========================================
+// Input grab (SYS_INPUT_OPEN)
+// ==========================================
+//
+// While a process holds the keyboard and mouse it also owns the screen: the
+// DWM leaves both input queues alone and draws nothing (dwm_update is
+// skipped), but still runs invokes and delivers kernel events. When the
+// grab ends, the IPC layer calls dwm_input_released(), and the next frame
+// repaints everything over whatever the process left on the screen.
+
+// DWM thread, dwm_lock held
+static void dwm_repaint_all(void* arg) {
+    (void)arg;
+    for (struct list_node* node = workspace.window_head; node != NULL; node = node->next) {
+        struct WindowObject* window = (struct WindowObject*)node->data;
+        window->flags |= (DWM_WFLAG_REFRESH | DWM_WFLAG_REDECORATE);
+    }
+
+    // The process read every mouse event while it held the grab: pick up
+    // where the mouse is now, so the cursor and hover state are right
+    Point p = mouse_get_position();
+    context.window_context.mouse.x = p.x;
+    context.window_context.mouse.y = p.y;
+    context.window_context.left_button_pressed  = mouse_get_button(MOUSE_BUTTON_LEFT);
+    context.window_context.right_button_pressed = mouse_get_button(MOUSE_BUTTON_RIGHT);
+    input.mouse_last = context.window_context.mouse;
+    input.last_left_button_pressed  = context.window_context.left_button_pressed;
+    input.last_right_button_pressed = context.window_context.right_button_pressed;
+
+    dwm_invalidate_region(0, 0, (int16_t)display_get_width(), (int16_t)display_get_height());
+}
+
+// Called by the IPC layer (any thread, IPC lock held) when the grab ends
+void dwm_input_released(void) {
+    dwm_invoke(dwm_repaint_all, NULL);
+}
+
 static void dwm_thread_main(void) {
     while (1) {
         event_wait(&input_event, DWM_FRAME_MS);
 
         dwm_lock();
 
+        bool grabbed = ipc_input_grabbed();
+
         uint16_t key;
-        while (input_key_pop(&key)) {
+        while (!grabbed && input_key_pop(&key)) {
             // A desktop icon rename takes the keyboard until it ends
             if (dwm_desktop_rename_key(key))
                 continue;
@@ -228,7 +272,8 @@ static void dwm_thread_main(void) {
         }
 
         dwm_run_invokes();
-        dwm_update();
+        if (!grabbed)
+            dwm_update();
 
         dwm_unlock();
 
@@ -254,3 +299,4 @@ ThreadBlock* dwm_start(ThreadPriority priority) {
 ThreadBlock* dwm_get_thread(void) {
     return dwm_thread;
 }
+
