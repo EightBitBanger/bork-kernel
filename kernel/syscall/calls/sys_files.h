@@ -1,5 +1,3 @@
-
-
 #ifndef _KERNEL_SYS_FILES_H_
 #define _KERNEL_SYS_FILES_H_
 

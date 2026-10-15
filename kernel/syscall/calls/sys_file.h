@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_FILE_H_
 #define _KERNEL_SYS_FILE_H_
 
@@ -7,6 +6,7 @@
 #include <kernel/syscall/calls/sys_files.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/syscall/calls/sys_print.h>
+#include <kernel/syscall/calls/sys_security.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/scheduler/process.h>
@@ -100,6 +100,16 @@ static int32_t sys_open_locked(SysProcessFiles* t, const SyscallArgs* args) {
         return SYS_EINVAL;
     if ((flags & SYS_O_EXCL) && !(flags & SYS_O_CREATE))
         return SYS_EINVAL;
+
+    // Reading needs FILE_READ; writing, creating, truncating or appending
+    // needs FILE_WRITE (TRUNC/APPEND already imply WRITE)
+    uint32_t needs = 0;
+    if (flags & SYS_O_READ)
+        needs |= SYS_SEC_FILE_READ;
+    if (flags & (SYS_O_WRITE | SYS_O_CREATE))
+        needs |= SYS_SEC_FILE_WRITE;
+    if (!sys_security_allows(needs))
+        return SYS_EPERM;
 
     char path[SYS_PATH_MAX];
     int32_t result = sys_user_path(process_current_space(), t->cwd, args->arg1, path);
@@ -308,11 +318,16 @@ static int32_t sys_write(const SyscallArgs* args) {
     uint32_t fd = args->arg1;
 
     if (fd == SYS_FD_STDOUT || fd == SYS_FD_STDERR) {
+        // Called directly, so the table's SYS_PRINT check never ran
+        if (!sys_security_allows(SYS_SEC_CONSOLE))
+            return SYS_EPERM;
         SyscallArgs print_args = { .arg1 = args->arg2, .arg2 = args->arg3 };
         return sys_print(&print_args);
     }
     if (fd < SYS_FD_FIRST)
         return SYS_EBADF;
+    if (!sys_security_allows(SYS_SEC_FILE_WRITE))
+        return SYS_EPERM;
     return sys_files_call(sys_write_locked, args);
 }
 

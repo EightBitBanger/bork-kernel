@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_PATH_H_
 #define _KERNEL_SYS_PATH_H_
 

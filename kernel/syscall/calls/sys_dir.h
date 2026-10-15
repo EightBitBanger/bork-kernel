@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_DIR_H_
 #define _KERNEL_SYS_DIR_H_
 

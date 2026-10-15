@@ -16,4 +16,3 @@ static int32_t sys_exit(const SyscallArgs* args) {
 }
 
 #endif
-

@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_USER_H_
 #define _KERNEL_SYS_USER_H_
 
