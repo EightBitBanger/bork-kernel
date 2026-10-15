@@ -1,3 +1,4 @@
+
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -144,6 +145,17 @@ void kb_event_handler(void) {
     kb_console_key((uint8_t)current_character);
 }
 
+// Multi-byte sequences are decoded one byte per IRQ. An E0 (extended) or
+// E1 (Pause) prefix is remembered here until the next byte comes in its own
+// IRQ, instead of being waited for. Waiting used to spin up to 20,000
+// status reads with interrupts off: free in QEMU, which has the next byte
+// ready at once, but on hardware the second byte comes about 1 ms later
+// (a real PS/2 keyboard) or only after this IRQ returns (a USB keyboard
+// behind the BIOS's PS/2 emulation, where every status read also traps into
+// SMM). There each arrow key froze the machine and then got lost.
+static volatile bool    kb_e0_pending = false;
+static volatile uint8_t kb_e1_skip    = 0;
+
 uint16_t kb_getc(void) {
     // Check PS/2 Controller Status Register (Port 0x64)
     // Bit 0 (0x01) is set when the Output Buffer has a scan code waiting to be read.
@@ -158,26 +170,28 @@ uint16_t kb_getc(void) {
         return 0;
     }
     
-    // Read the primary scan code byte from the PS/2 Data Port (Port 0x60)
+    // Read the scan code byte from the PS/2 Data Port (Port 0x60)
     uint8_t scancode = inb(0x60);
-    bool is_extended = false;
     
-    // Handle extended scan codes (0xE0 prefix)
-    if (scancode == 0xE0) {
-        // Spin briefly until the second byte of the sequence lands in the buffer
-        int timeout = 20000;
-        while (!((inb(0x64) & 0x01)) && timeout > 0) {
-            timeout--;
-        }
-        
-        // If the second byte arrived, grab it; otherwise drop the trailing prefix safely
-        if (timeout > 0) {
-            scancode = inb(0x60);
-            is_extended = true;
-        } else {
-            return 0; 
-        }
+    // Pause sends E1 1D 45 E1 9D C5 and nothing on release. Swallow it, so
+    // its 1D / 9D don't press and release Left Ctrl.
+    if (kb_e1_skip > 0) {
+        kb_e1_skip--;
+        return 0;
     }
+    if (scancode == 0xE1) {
+        kb_e1_skip = 5;
+        kb_e0_pending = false;
+        return 0;
+    }
+    
+    // Extended prefix: the key byte follows in the next IRQ
+    if (scancode == 0xE0) {
+        kb_e0_pending = true;
+        return 0;
+    }
+    bool is_extended = kb_e0_pending;
+    kb_e0_pending = false;
     
     // Determine if this is a Make code (press) or Break code (release)
     // In Set 1, a break code has bit 7 (0x80) enabled.
@@ -233,4 +247,5 @@ uint16_t kb_getc(void) {
     
     return (uint16_t)(uint8_t)current_character;
 }
+
 

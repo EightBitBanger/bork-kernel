@@ -151,8 +151,6 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     // Watchdog serial mirror (COM1). Harmless when no UART is present.
     wd_init();
     
-    // COM1 for serial_puts() (process loader and fault reports, sys_print)
-    // and the locks the syscalls use. The int 0x81 gate is set in idt_init().
     syscall_init();
     
     gdt_init();
@@ -365,7 +363,7 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
             if (vfs_directory_check(desktop_item_path)) {
                 dwm_create_folder(posx, posy, desktop_item_name, desktop_item_path);
                 posx += sep;
-            } 
+            }
             
             // File
             else {
@@ -395,13 +393,24 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     
     irq_restore(irq_flags);
     
-    char filename[] = "/mnt/ata0p1/usr/desktop/test";
+    //char nameCrash[] = "/mnt/ahci0p1/bin/test/crash";
+    //char nameHello[] = "/mnt/ahci0p1/bin/test/hello";
+    
     while(1) {
         
-        // Scheduler thrash / hammer burst test
         /*
-        for (unsigned int i=0; i < 8; i++) 
-            dwm_launch_program(filename);
+        // Scheduler thrash / hammer burst test
+        dwm_launch_program(nameCrash);
+        
+        for (unsigned int i=0; i < 32; i++) 
+            dwm_launch_program(nameHello);
+        
+        dwm_launch_program(nameCrash);
+        
+        for (unsigned int i=0; i < 32; i++) 
+            dwm_launch_program(nameHello);
+        
+        dwm_launch_program(nameCrash);
         */
         
         thread_sleep(100);

@@ -1,3 +1,4 @@
+
 #ifndef _KERNEL_INTERRUPT_H_
 #define _KERNEL_INTERRUPT_H_
 
@@ -32,8 +33,12 @@ void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags);
 // Signaled by the keyboard and mouse IRQs whenever new input arrives
 extern Event input_event;
 
-// Pop one queued key code (as returned by kb_getc). Thread context only.
-// Returns false when the queue is empty.
+// Pop one queued key code (as returned by kb_getc). Thread context only;
+// safe with several consumer threads. Returns false when the queue is empty.
 bool input_key_pop(uint16_t* key);
 
+// True if a key is queued (a hint: another consumer may take it first)
+bool input_key_pending(void);
+
 #endif
+

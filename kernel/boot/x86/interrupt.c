@@ -1,3 +1,4 @@
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <kernel/arch/x86/io.h>
@@ -8,6 +9,8 @@
 #include <kernel/dwm/dwm.h>
 #include <kernel/console/keyboard.h>
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/arch/x86/irq.h>
+#include <kernel/ipc/ipc.h>
 extern void scheduler_context(void);
 extern void scheduler_yield_context(void);
 
@@ -137,10 +140,12 @@ void isr_callback_fault_handler(uint32_t error_code, uint32_t faulting_address, 
 //
 // Keyboard ring buffer
 //
-// Single producer (keyboard IRQ) / single consumer (DWM thread). The IRQ only
-// writes head, the consumer only writes tail, so no lock is needed on this
-// single-CPU kernel; the compiler barriers keep the slot write ordered before
-// the index publish. When full, new keys are dropped (the consumer owns tail).
+// Single producer (keyboard IRQ). The IRQ only writes head, consumers only
+// write tail; the compiler barriers keep the slot write ordered before the
+// index publish. When full, new keys are dropped (the consumers own tail).
+// There can be more than one consumer thread (the DWM, and a process that
+// holds the input grab through SYS_INPUT_READ), so a pop runs with
+// interrupts off: two threads never take the same key.
 
 #define INPUT_KEY_QUEUE_SIZE 64   // Must be a power of two
 
@@ -162,15 +167,23 @@ static void input_key_push(uint16_t key) {
 }
 
 bool input_key_pop(uint16_t* key) {
+    uint32_t flags = irq_save();
     uint32_t tail = key_queue_tail;
-    if (tail == key_queue_head)
+    if (tail == key_queue_head) {
+        irq_restore(flags);
         return false;
+    }
 
     __asm__ volatile("" ::: "memory");
     *key = key_queue[tail];
     __asm__ volatile("" ::: "memory");
     key_queue_tail = (tail + 1) & (INPUT_KEY_QUEUE_SIZE - 1);
+    irq_restore(flags);
     return true;
+}
+
+bool input_key_pending(void) {
+    return key_queue_tail != key_queue_head;
 }
 
 void keyboard_handler_c(void) {
@@ -185,12 +198,15 @@ void keyboard_handler_c(void) {
 
     // Also covers mouse bytes that ps2_check_keyboard() routed to the mouse
     event_signal(&input_event);
+    ipc_input_irq();        // A process holding the input grab may be waiting
     interrupt_end();
 }
 
 void mouse_handler_c(void) {
     mouse_event_handler();
     event_signal(&input_event);
+    ipc_input_irq();
 
     slave_interrupt_end();
 }
+

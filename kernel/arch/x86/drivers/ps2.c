@@ -1,3 +1,4 @@
+
 #include <kernel/arch/x86/io.h>
 #include <kernel/arch/x86/drivers/display/draw.h>
 #include <kernel/arch/x86/drivers/keyboard.h>
@@ -5,6 +6,7 @@
 #include <kernel/boot/x86/interrupt.h>
 #include <kernel/console/keyboard.h>
 #include <kernel/console/mouse.h>
+#include <kernel/ipc/ipc.h>
 
 // Longest the console sleeps with no input before looking again. Only a
 // backstop: every keyboard and mouse IRQ signals input_event.
@@ -35,6 +37,10 @@ void ps2_route_console(void) {
 
     // print() flushes each character cell as it draws, so no full-screen
     // flush is needed per key any more (that was ~5.7 MB to VRAM per key)
+    // A process holding the input grab gets the keys instead
+    if (ipc_input_grabbed())
+        return;
+
     uint16_t key;
     while (input_key_pop(&key))
         kb_console_key(key);
@@ -45,3 +51,4 @@ void flush_keyboard_buffer(void) {
         inb(PS2_DATA_REG);
     }
 }
+

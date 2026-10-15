@@ -1,3 +1,4 @@
+
 #include <ctype.h>
 #include <stdint.h>
 #include <kernel/arch/x86/io.h>
@@ -151,19 +152,24 @@ void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middl
 }
 
 bool mouse_dequeue_event(MouseEvent* out_event) {
-    // If head == tail, the buffer is empty
-    if (mouse_queue_head == mouse_queue_tail) {
-        return false; 
-    }
-    
-    // Copy with the IRQ masked: when the queue is full the producer coalesces
-    // into the newest slot, which is the tail slot when only one is queued.
+    // Check and copy with the IRQ masked: when the queue is full the producer
+    // coalesces into the newest slot, which is the tail slot when only one is
+    // queued. The check is inside too, because there can be two consumer
+    // threads (the DWM and a process holding the input grab).
     uint32_t flags = irq_save();
+    if (mouse_queue_head == mouse_queue_tail) {
+        irq_restore(flags);
+        return false;
+    }
     *out_event = mouse_queue[mouse_queue_tail];
     mouse_queue_tail = (mouse_queue_tail + 1) % MOUSE_QUEUE_SIZE;
     irq_restore(flags);
     
     return true;
+}
+
+bool mouse_event_pending(void) {
+    return mouse_queue_head != mouse_queue_tail;
 }
 
 void mouse_event_handler(void) {
@@ -229,3 +235,4 @@ void mouse_event_handler(void) {
         mouse_enqueue_event(mouse_x, mouse_y, mouse_left_clicked, mouse_right_clicked, mouse_middle_clicked);
     }
 }
+
