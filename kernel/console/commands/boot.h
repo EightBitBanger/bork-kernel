@@ -17,7 +17,7 @@
 
 #include <kernel/resources/resource_manager.h>
 
-#include <kernel/programs/user_test/hello_elf.h>
+#include <kernel/console/commands/boot_dropper.h>
 
 #ifdef ADD_IMAGE_LIB
 #include <kernel/dwm/dwm.h>   // dwm_builtin_images, dwm_get_image_directory
@@ -25,7 +25,7 @@
 
 // Initial system setup / installation
 //
-//   boot install <disk>          format the disk to a blank file system and install the kernel
+//   boot install <disk>          format the disk to a blank BaseFS file system and install the kernel
 //   boot repair <disk> [force]   recreate missing system folders and system files (DWM images),
 //                                fix their permissions, and check the boot area
 //   boot update <disk>           replace the boot loader and kernel only, keeping the

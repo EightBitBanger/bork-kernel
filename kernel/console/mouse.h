@@ -1,3 +1,4 @@
+
 #ifndef MOUSE_H
 #define MOUSE_H
 
@@ -45,4 +46,8 @@ bool mouse_get_button(uint8_t button);
 void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middle);
 bool mouse_dequeue_event(MouseEvent* out_event);
 
+// True if an event is queued (a hint: another consumer may take it first)
+bool mouse_event_pending(void);
+
 #endif
+

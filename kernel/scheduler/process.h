@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_PROCESS_H_
 #define _KERNEL_PROCESS_H_
 
@@ -6,50 +5,57 @@
 #include <stdbool.h>
 
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/syscall/syscall.h>     // SYS_SEC_* (security mask bits)
 
-/*
- * Processes
- *
- * A process owns a private user address space (page directory), the image
- * and stack mapped into it, and a list of threads. Its threads run in ring 3
- * and reach the kernel only through interrupts, faults and syscalls
- * (int 0x81, see syscall/syscall.h).
- *
- * User address space layout (vmm.h has the full map):
- *
- *   0x40000000 - 0x4FFFFFFF    image area (PROCESS_IMAGE_MAX). A flat image
- *                              sits at PROCESS_IMAGE_BASE; an ELF executable's
- *                              PT_LOAD segments go wherever they were linked,
- *                              as long as they stay inside this area
- *   next page after the image  heap: grows up with sbrk, at most
- *                              PROCESS_HEAP_MAX bytes
- *   ...                        unmapped
- *   0xBFFF0000 - 0xBFFFFFFF    PROCESS_STACK_PAGES of stack, top at 0xC0000000
- *                              (the unmapped page below it catches overflow)
- *
- * Everything below 0x40000000 and from 0xC0000000 up is kernel, mapped
- * supervisor-only: a user access there page-faults and kills the process.
- *
- * ProcessId layout: [ generation (23 bits) | slot (8 bits) ], always > 0.
- * The generation is bumped every time a slot is freed, so a stale id held
- * after DestroyProcess() can never refer to a newer process that happened
- * to reuse the same slot.
- *
- * Working directory: every process starts with one, set before its first
- * thread runs (syscall_process_start). Relative paths in file syscalls
- * resolve against it, and the program can change it with SYS_CHDIR.
- *
- * Loading:
- *   CreateProcess()           an ELF32 i386 executable from the VFS
- *                             (resources/classes/elf.h). The file must carry
- *                             VFS_PERMISSION_EXECUTE. Build programs static
- *                             and non-PIE, linked at 0x40000000. Starts in
- *                             the directory holding the executable.
- *   CreateProcessIn()         the same, in a working directory of the
- *                             caller's choice.
- *   CreateProcessFromImage()  a flat binary already in kernel memory, mapped
- *                             read/write at PROCESS_IMAGE_BASE. Starts in "/".
- */
+// Processes
+//
+// A process owns a private user address space (page directory), the image
+// and stack mapped into it, and a list of threads. Its threads run in ring 3
+// and reach the kernel only through interrupts, faults and syscalls
+// (int 0x81, see syscall/syscall.h).
+//
+// User address space layout (vmm.h has the full map):
+//
+//   0x40000000 - 0x4FFFFFFF    image area (PROCESS_IMAGE_MAX). A flat image
+//                              sits at PROCESS_IMAGE_BASE; an ELF executable's
+//                              PT_LOAD segments go wherever they were linked,
+//                              as long as they stay inside this area
+//   next page after the image  heap: grows up with sbrk, at most
+//                              PROCESS_HEAP_MAX bytes
+//   ...                        unmapped
+//   0xBFFF0000 - 0xBFFFFFFF    PROCESS_STACK_PAGES of stack, top at 0xC0000000
+//                              (the unmapped page below it catches overflow)
+//
+// Everything below 0x40000000 and from 0xC0000000 up is kernel, mapped
+// supervisor-only: a user access there page-faults and kills the process.
+//
+// ProcessId layout: [ generation (23 bits) | slot (8 bits) ], always > 0.
+// The generation is bumped every time a slot is freed, so a stale id held
+// after DestroyProcess() can never refer to a newer process that happened
+// to reuse the same slot.
+//
+// Working directory: every process starts with one, set before its first
+// thread runs (syscall_process_start). Relative paths in file syscalls
+// resolve against it, and the program can change it with SYS_CHDIR.
+//
+// Loading:
+//   CreateProcess()           an ELF32 i386 executable from the VFS
+//                             (resources/classes/elf.h). The file must carry
+//                             VFS_PERMISSION_EXECUTE. Build programs static
+//                             and non-PIE, linked at 0x40000000. Starts in
+//                             the directory holding the executable.
+//   CreateProcessIn()         the same, in a working directory of the
+//                             caller's choice.
+//   CreateProcessFromImage()  a flat binary already in kernel memory, mapped
+//                             read/write at PROCESS_IMAGE_BASE. Starts in "/".
+//
+// Security clearance: every process has a mask of SYS_SEC_* bits (see the
+// "Security clearance" section of syscall/syscall.h). The syscall layer
+// checks it on every call. The plain CreateProcess* functions give
+// PROCESS_SECURITY_DEFAULT; the *WithSecurity variants take the mask, which
+// is in place before the main thread can run. Afterwards it changes only
+// through ProcessSetSecurity() (kernel, unchecked) or SYS_SEC_SET (needs
+// SYS_SEC_ADMIN).
 
 #define PROCESS_MAX                64     // Must be <= 256 (8-bit slot field)
 #define PROCESS_NAME_MAX           16
@@ -66,6 +72,18 @@
 #define PROCESS_HEAP_MAX          (64u * 1024u * 1024u)
 
 typedef int32_t ProcessId;
+
+// Security mask: SYS_SEC_* bits
+typedef uint32_t ProcessSecurity;
+
+// What CreateProcess / CreateProcessIn / CreateProcessFromImage grant: files,
+// the console and graphics in a window. Not direct screen access, not admin.
+#ifndef PROCESS_SECURITY_DEFAULT
+#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_GFX_SCREEN)
+#endif
+
+// Every clearance, administration included (a trusted shell or launcher)
+#define PROCESS_SECURITY_ALL      SYS_SEC_VALID
 
 #define PROCESS_INVALID_ID          0     // Reserved: "the kernel" / no process
 
@@ -100,6 +118,7 @@ typedef struct {
     uint32_t data_size;         // File bytes in other segments (flat: 0)
     uint32_t bss_size;          // Zero-filled bytes
     uint32_t heap_size;         // Bytes between the heap start and the break
+    ProcessSecurity security;   // SYS_SEC_* mask
 } ProcessInfo;
 
 // A flat binary to run. It is copied to PROCESS_IMAGE_BASE and must be built
@@ -133,6 +152,14 @@ ProcessId CreateProcess(const char* image_path, ThreadPriority priority);
 // error: the process starts in "/" and COM1 says why.
 ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriority priority);
 
+// The same two loaders with an explicit security mask (SYS_SEC_* bits; bits
+// outside SYS_SEC_VALID are PROCESS_ERR_INVALID_ARG). Only the kernel decides
+// who gets SYS_SEC_ADMIN: there is no syscall that creates a process.
+ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, ThreadPriority priority,
+                                    ProcessSecurity security);
+ProcessId CreateProcessFromImageWithSecurity(const char* name, const ProcessImage* image,
+                                             ThreadPriority priority, ProcessSecurity security);
+
 // Close the process's open files, then kill every thread of the process and
 // free its address space. Thread context with interrupts on: closing files
 // takes the VFS lock and may wait (up to SYS_FILES_EXIT_WAIT_MS) for one of
@@ -143,6 +170,17 @@ int DestroyProcess(ProcessId pid);
 
 // Fill *info for a live process. Returns false if pid is not valid.
 bool ProcessGetInfo(ProcessId pid, ProcessInfo* info);
+
+// Read a running process's security mask. False if pid is not running.
+bool ProcessGetSecurity(ProcessId pid, ProcessSecurity* security);
+
+// Replace a running process's security mask. Kernel side: NO permission
+// check (SYS_SEC_SET does that before calling here). The new mask applies
+// from the process's next syscall. Logged on COM1. Stores the old mask in
+// *previous when previous is not NULL. Returns PROCESS_OK,
+// PROCESS_ERR_INVALID_ARG (bits outside SYS_SEC_VALID) or
+// PROCESS_ERR_NOT_FOUND (pid not running).
+int ProcessSetSecurity(ProcessId pid, ProcessSecurity security, ProcessSecurity* previous);
 
 // Number of live (creating or running) processes
 uint32_t process_get_count(void);
@@ -156,6 +194,10 @@ const char* process_error_string(int code);
 
 // PROCESS_INVALID_ID for a kernel thread
 ProcessId process_current_id(void);
+
+// Security mask of the calling thread's process. SYS_SEC_NONE for a kernel
+// thread or a process that is being destroyed.
+ProcessSecurity process_current_security(void);
 
 // Address space of the calling thread's process, NULL for a kernel thread
 struct AddressSpace* process_current_space(void);

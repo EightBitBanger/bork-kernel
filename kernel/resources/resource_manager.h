@@ -23,7 +23,6 @@
 #define RESOURCE_MAGIC              "RSRC"
 #define RESOURCE_FORMAT_VERSION     1
 
-// Values are written to disk: never renumber, only append
 typedef enum {
     RESOURCE_TYPE_NONE   = 0,   // Invalid / "any type" when loading
     RESOURCE_TYPE_SPRITE = 1,   // classes/image.h

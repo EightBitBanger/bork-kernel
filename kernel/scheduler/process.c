@@ -1,5 +1,3 @@
-
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -58,6 +56,7 @@ typedef struct {
     ProcessId pid;
 
     ThreadPriority priority;
+    ProcessSecurity security;   // SYS_SEC_* mask, checked by every syscall
     char name[PROCESS_NAME_MAX];
     char image_path[PROCESS_PATH_MAX];
 
@@ -244,7 +243,7 @@ static void process_copy_name(ProcessId pid, char name[PROCESS_NAME_MAX]) {
 static void process_log_prefix(ProcessId pid) {
     char name[PROCESS_NAME_MAX];
     process_copy_name(pid, name);
-
+    
     serial_puts("[process] ");
     serial_puts(name[0] ? name : "?");
     serial_puts(" (pid ");
@@ -328,8 +327,11 @@ static int process_load_elf(Process* p, void* ctx) {
 // then add the heap, the stack, the file table (working directory `cwd`)
 // and the main thread.
 static ProcessId process_build(const char* name, const char* path, const char* cwd,
-                               ThreadPriority priority, ProcessLoadFn load, void* ctx) {
+                               ThreadPriority priority, ProcessSecurity security,
+                               ProcessLoadFn load, void* ctx) {
     if (priority < PRIORITY_IDLE || priority > PRIORITY_REALTIME)
+        return PROCESS_ERR_INVALID_ARG;
+    if ((security & ~SYS_SEC_VALID) != 0)
         return PROCESS_ERR_INVALID_ARG;
     if ((read_cr0() & CR0_PG) == 0)
         return PROCESS_ERR_NO_PAGING;
@@ -343,6 +345,7 @@ static ProcessId process_build(const char* name, const char* path, const char* c
     bool files_ready = false;
     uint32_t irq;
     p->priority = priority;
+    p->security = security;         // Before the main thread exists: its first syscall is checked
     copy_string(p->name, (name && name[0]) ? name : "process", PROCESS_NAME_MAX);
     copy_string(p->image_path, path, PROCESS_PATH_MAX);
 
@@ -408,6 +411,8 @@ static ProcessId process_build(const char* name, const char* path, const char* c
     process_log_prefix(p->pid);
     serial_puts("started, entry ");
     serial_put_hex(p->entry);
+    serial_puts(", security ");
+    serial_put_hex(security);
     serial_puts("\n");
     return p->pid;
 
@@ -426,6 +431,11 @@ fail:
 // Public API
 
 ProcessId CreateProcessFromImage(const char* name, const ProcessImage* image, ThreadPriority priority) {
+    return CreateProcessFromImageWithSecurity(name, image, priority, PROCESS_SECURITY_DEFAULT);
+}
+
+ProcessId CreateProcessFromImageWithSecurity(const char* name, const ProcessImage* image,
+                                             ThreadPriority priority, ProcessSecurity security) {
     if (image == NULL || image->data == NULL || image->size == 0)
         return PROCESS_ERR_INVALID_ARG;
 
@@ -436,15 +446,22 @@ ProcessId CreateProcessFromImage(const char* name, const ProcessImage* image, Th
         return PROCESS_ERR_INVALID_ARG;
 
     // No file to be next to: start at the top
-    return process_build(name, "<memory>", "/", priority, process_load_flat, (void*)image);
+    return process_build(name, "<memory>", "/", priority, security, process_load_flat, (void*)image);
 }
 
 ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriority priority) {
+    return CreateProcessWithSecurity(image_path, cwd, priority, PROCESS_SECURITY_DEFAULT);
+}
+
+ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, ThreadPriority priority,
+                                    ProcessSecurity security) {
     if (image_path == NULL || image_path[0] != '/')
         return PROCESS_ERR_INVALID_ARG;
     if (strnlen(image_path, PROCESS_PATH_MAX) >= PROCESS_PATH_MAX)
         return PROCESS_ERR_INVALID_ARG;
     if (priority < PRIORITY_IDLE || priority > PRIORITY_REALTIME)
+        return PROCESS_ERR_INVALID_ARG;
+    if ((security & ~SYS_SEC_VALID) != 0)
         return PROCESS_ERR_INVALID_ARG;
 
     // Only regular files marked executable may run. The DWM checks this too,
@@ -475,7 +492,7 @@ ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriorit
     const char* name = strrchr(image_path, '/');
     name = (name != NULL) ? name + 1 : image_path;
 
-    ProcessId pid = process_build(name, image_path, cwd, priority, process_load_elf, &source);
+    ProcessId pid = process_build(name, image_path, cwd, priority, security, process_load_elf, &source);
 
     vfs_close(file);
     return pid;
@@ -558,9 +575,56 @@ bool ProcessGetInfo(ProcessId pid, ProcessInfo* info) {
     info->data_size = p->data_bytes;
     info->bss_size = p->bss_bytes;
     info->heap_size = p->heap.size;
+    info->security = p->security;
 
     irq_restore(irq);
     return true;
+}
+
+bool ProcessGetSecurity(ProcessId pid, ProcessSecurity* security) {
+    if (security == NULL)
+        return false;
+
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    bool found = p != NULL && p->state == PROCESS_STATE_RUNNING;
+    if (found)
+        *security = p->security;
+    irq_restore(irq);
+    return found;
+}
+
+int ProcessSetSecurity(ProcessId pid, ProcessSecurity security, ProcessSecurity* previous) {
+    if ((security & ~SYS_SEC_VALID) != 0)
+        return PROCESS_ERR_INVALID_ARG;
+
+    // One word, written with interrupts off: a syscall of the target reads
+    // either the old mask or the new one, never a mix
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    if (p == NULL || p->state != PROCESS_STATE_RUNNING) {
+        irq_restore(irq);
+        return PROCESS_ERR_NOT_FOUND;
+    }
+    ProcessSecurity old = p->security;
+    p->security = security;
+    irq_restore(irq);
+
+    if (previous != NULL)
+        *previous = old;
+
+    // Audit trail: every change, and who made it (0 = the kernel itself)
+    if (old != security) {
+        process_log_prefix(pid);
+        serial_puts("security ");
+        serial_put_hex(old);
+        serial_puts(" -> ");
+        serial_put_hex(security);
+        serial_puts(" by pid ");
+        serial_put_dec((uint32_t)process_current_id());
+        serial_puts("\n");
+    }
+    return PROCESS_OK;
 }
 
 uint32_t process_get_count(void) {
@@ -573,14 +637,14 @@ const char* process_error_string(int code) {
         case PROCESS_OK:                 return "ok";
         case PROCESS_ERR_INVALID_ARG:    return "Invalid program path";
         case PROCESS_ERR_NO_SLOTS:       return "Too many programs running";
-        case PROCESS_ERR_NO_MEMORY:      return "Not enough memory to start it";
+        case PROCESS_ERR_NO_MEMORY:      return "Not enough memory";
         case PROCESS_ERR_NO_PAGING:      return "Paging is not enabled";
         case PROCESS_ERR_LOAD_FAILED:    return "The program could not be read";
         case PROCESS_ERR_NOT_FOUND:      return "The program was not found";
-        case PROCESS_ERR_THREAD:         return "Its main thread could not start";
+        case PROCESS_ERR_THREAD:         return "Thread main unable to start";
         case PROCESS_ERR_NOT_EXECUTABLE: return "The file is not marked executable";
         case PROCESS_ERR_BAD_IMAGE:      return "Not a valid ELF executable";
-        case PROCESS_ERR_UNSUPPORTED:    return "Unsupported executable (see COM1)";
+        case PROCESS_ERR_UNSUPPORTED:    return "Unsupported executable";
         default:                         return "Unknown error";
     }
 }
@@ -592,6 +656,18 @@ const char* process_error_string(int code) {
 ProcessId process_current_id(void) {
     ThreadBlock* self = current_thread;
     return self ? (ProcessId)self->process_id : PROCESS_INVALID_ID;
+}
+
+ProcessSecurity process_current_security(void) {
+    ProcessId pid = process_current_id();
+    if (pid == PROCESS_INVALID_ID)
+        return SYS_SEC_NONE;
+
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    ProcessSecurity security = (p != NULL && p->state == PROCESS_STATE_RUNNING) ? p->security : SYS_SEC_NONE;
+    irq_restore(irq);
+    return security;
 }
 
 // The returned pointer stays valid while the caller runs: the only way the
@@ -796,4 +872,3 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
     // Not in the process table (should not happen): end just this thread
     kthread_exit();
 }
-

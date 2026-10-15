@@ -115,8 +115,8 @@ WindowHandle notepad_create_instance(const char* title, const char* path) {
     memset(&wclass, 0x00, sizeof(WindowClass));
     wclass.x = 250;
     wclass.y = 180;
-    wclass.width  = 400;
-    wclass.height = 300;
+    wclass.width  = 660;
+    wclass.height = 440;
     wclass.max_width  = 0;
     wclass.max_height = 0;
     

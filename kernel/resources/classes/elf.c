@@ -41,7 +41,7 @@ bool elf_probe(const void* data, uint32_t size) {
 
 static ElfResult check_header(const Elf32_Ehdr* h, uint32_t file_size, const char** why) {
     if (!ident_ok(h)) {
-        *why = "not an ELF file (bad magic)";
+        *why = "not an ELF file";
         return ELF_ERR_NOT_ELF;
     }
     if (h->e_ident[EI_CLASS] != ELFCLASS32) {

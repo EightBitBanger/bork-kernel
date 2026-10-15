@@ -1,11 +1,10 @@
 #ifndef _KERNEL_GFX_H_
 #define _KERNEL_GFX_H_
 
-// Unified 2D graphics interface
+// 2D graphical effects interface
 //
-// Everything that puts pixels somewhere (the boot console, the DWM
-// compositor, window procedures, dialogs, programs) goes through the same
-// three objects:
+// The GFX subsystem handles pixel related drawing and other 
+// related graphical device functions.
 //
 //   GfxSurface   a block of 32 bpp ARGB pixels: width, height, stride.
 //                The back buffer, every window's frame buffer and every
@@ -13,13 +12,13 @@
 //                (gfx_surface_create) or wraps memory someone else owns
 //                (gfx_surface_wrap).
 //
-//   GfxContext   where and how to draw (the GDI "device context"): a target
-//                surface, a clip rectangle, an origin (translation), a blend
-//                mode and a font. Contexts are plain structs, usually on the
-//                stack, and each owner keeps its own, so the console, the
-//                compositor and a window procedure can never trample each
-//                other's clip or target the way the old global draw_* state
-//                could. gfx_save / gfx_restore push and pop the state.
+//   GfxContext   where and how to draw a target surface, a clip rectangle,
+//                an origin (translation), a blend mode and a font. Contexts 
+//                are plain structs, usually on the stack, and each owner 
+//                keeps its own, so the console, the compositor and a window 
+//                procedure can never trample each other's clip or target the 
+//                way the old global draw_* state could. gfx_save / gfx_restore 
+//                push and pop the state.
 //
 //   GfxFont      a fixed-width bitmap font (the built-in char ROM by default)
 //
@@ -254,7 +253,7 @@ bool gfx_restore(GfxContext* ctx);
 // Drawing
 //
 
-void gfx_clear(GfxContext* ctx, gfx_color_t color);     // Whole clip, always COPY
+void gfx_clear(GfxContext* ctx, gfx_color_t color);
 
 void gfx_set_pixel(GfxContext* ctx, int32_t x, int32_t y, gfx_color_t color);
 gfx_color_t gfx_get_pixel(const GfxContext* ctx, int32_t x, int32_t y);  // 0 outside
