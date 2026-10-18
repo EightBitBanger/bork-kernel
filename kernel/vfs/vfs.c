@@ -86,8 +86,11 @@ static uint32_t do_directory_get_item_count(const char* path) {
     if (address == KNODE_NULL || address == FS_NULL) 
         return 0;
     struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, address))
+    if (ctx && fs_check_directory_valid(ctx, address)) {
+        if (!vfs_fs_node_allowed(ctx, address))
+            return 0;   // Listing needs the directory's clearance
         return fs_directory_get_reference_count(ctx, address);
+    }
     if (!vfs_knode_has_children(address))
         return 0;
     return knode_get_reference_count(address);
@@ -104,6 +107,8 @@ static bool do_directory_get_item(const char* path, unsigned int index, char* na
         return false;
     struct FSDeviceContext* ctx = vfs_device_get_context(path);
     if (ctx && fs_check_directory_valid(ctx, address)) {
+        if (!vfs_fs_node_allowed(ctx, address))
+            return false;
         // The name comes straight from the directory entry
         return fs_directory_get_entry(ctx, address, index, NULL, name_out, name_size, NULL);
     } else {
@@ -159,5 +164,6 @@ bool vfs_directory_get_item(const char* path, unsigned int index, char* name_out
     vfs_unlock();
     return result;
 }
+
 
 

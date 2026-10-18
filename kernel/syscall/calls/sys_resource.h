@@ -6,7 +6,7 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
-#include <kernel/syscall/calls/sys_files.h>
+#include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/syscall/calls/sys_gfx.h>
 #include <kernel/resources/resource_manager.h>
@@ -91,6 +91,8 @@ static int32_t sys_res_load(const SyscallArgs* args) {
         return SYS_ENOENT;
     if (st.type != VFS_TYPE_FILE)
         return SYS_EISDIR;
+    if (!vfs_check_access(path))
+        return SYS_EACCES;
 
     ResourceType type = RESOURCE_TYPE_NONE;
     if (!resource_peek_type(path, &type) || type != RESOURCE_TYPE_SPRITE)
@@ -194,3 +196,5 @@ static int32_t sys_res_info(const SyscallArgs* args) {
 }
 
 #endif
+
+

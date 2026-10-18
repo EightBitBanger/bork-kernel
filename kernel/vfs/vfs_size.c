@@ -1,4 +1,4 @@
-// Total size of a file or a directory tree (used by the Properties window).
+// Total size of a file or a directory tree (file properties, disk usage).
 //
 // The walk runs on node addresses, not paths, so no item is resolved by
 // name. The VFS lock is held for the whole walk, so the totals describe one
@@ -143,3 +143,4 @@ bool vfs_directory_get_size(const char* path, VfsDirectorySize* out) {
     vfs_unlock();
     return result;
 }
+

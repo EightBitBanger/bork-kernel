@@ -24,6 +24,8 @@ static bool do_set_permissions(const char* path, uint8_t perm) {
     
     struct FSDeviceContext* ctx = vfs_device_get_context(path);
     if (ctx && (fs_check_directory_valid(ctx, address) || fs_file_check(ctx, address))) {
+        if (!vfs_fs_node_allowed(ctx, address))
+            return false;
         uint8_t permissions = 0;
         if (perm & VFS_PERMISSION_EXECUTE)  permissions |= FS_PERMISSION_EXECUTE;
         if (perm & VFS_PERMISSION_READ)     permissions |= FS_PERMISSION_READ;
@@ -89,3 +91,4 @@ bool vfs_get_permissions(const char* path, uint8_t* perm) {
     vfs_unlock();
     return result;
 }
+

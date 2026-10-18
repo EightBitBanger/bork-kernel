@@ -1,5 +1,11 @@
+#include <stdint.h>
+#include <stdbool.h>
 
-// Copy files and directory trees (used by clipboard paste).
+#include <kernel/malloc.h>
+#include <kernel/vfs/vfs.h>
+#include <kernel/util/string.h>
+
+// Copy files and directory trees
 //
 // Built on the public vfs_* calls, so every step takes the VFS lock on its
 // own. The lock is deliberately NOT held across the whole copy: a large tree
@@ -9,13 +15,6 @@
 // already puts a VFS_PATH_MAX path scratch on the stack, so the per-level
 // path and name buffers of the recursive directory copy live on the heap
 // and the depth is capped.
-
-#include <stdint.h>
-#include <stdbool.h>
-
-#include <kernel/malloc.h>
-#include <kernel/vfs/vfs.h>
-#include <kernel/util/string.h>
 
 #define VFS_COPY_CHUNK       4096
 #define VFS_COPY_MAX_DEPTH   8
@@ -44,6 +43,16 @@ static bool copy_join(char* out, size_t size, const char* dir, const char* name)
     return true;
 }
 
+// The copy is at least as protected as the original and as its new directory
+static void copy_security(const char* src, const char* dest) {
+    uint32_t from = 0, to = 0;
+    if (!vfs_get_security(src, &from) || from == VFS_SECURITY_NONE)
+        return;
+    vfs_get_security(dest, &to);
+    if ((to | from) != to)
+        vfs_set_security(dest, to | from);
+}
+
 static bool copy_file(const char* src, const char* dest) {
     File in = vfs_open(src, VFS_OPEN_READ);
     if (in == VFS_INVALID_FILE) return false;
@@ -51,8 +60,7 @@ static bool copy_file(const char* src, const char* dest) {
     uint32_t size = vfs_get_size(in);
 
     // Create the destination, then size it BEFORE writing: writes do not
-    // reliably extend a file past the space it already owns (same pattern
-    // as dwm_desktop_layout_save and notepad_save)
+    // reliably extend a file past the space it already owns
     File out = vfs_open(dest, VFS_OPEN_CREATE | VFS_OPEN_READ | VFS_OPEN_WRITE);
     if (out == VFS_INVALID_FILE) {
         vfs_close(in);
@@ -101,6 +109,7 @@ static bool copy_file(const char* src, const char* dest) {
         uint8_t perm = 0;
         if (vfs_get_permissions(src, &perm))
             vfs_set_permissions(dest, perm);
+        copy_security(src, dest);
     }
 
     return ok;
@@ -148,6 +157,7 @@ static bool copy_directory(const char* src, const char* dest, uint32_t depth) {
         uint8_t perm = 0;
         if (vfs_get_permissions(src, &perm))
             vfs_set_permissions(dest, perm);
+        copy_security(src, dest);
     }
 
     return ok;
@@ -156,6 +166,11 @@ static bool copy_directory(const char* src, const char* dest, uint32_t depth) {
 static bool copy_any(const char* src, const char* dest, uint32_t depth) {
     // Never descend into another device mounted somewhere inside the tree
     if (vfs_directory_check_mounted(src))
+        return false;
+    
+    // Needs the source's clearance (a directory the caller may not list
+    // would otherwise come out as an empty copy)
+    if (!vfs_check_access(src))
         return false;
     
     if (vfs_directory_check(src))
@@ -170,11 +185,11 @@ bool vfs_copy(const char* src, const char* dest) {
     if (!vfs_exists(src) || vfs_exists(dest))
         return false;
 
-    // A whole storage device is not something to duplicate into a folder
+    // A whole storage device is not something to duplicate into a directory
     if (vfs_directory_check_mounted(src))
         return false;
 
-    // Copying a folder into itself would never finish
+    // Copying a directory into itself would never finish
     if (copy_path_is_within(dest, src))
         return false;
 
@@ -187,4 +202,5 @@ bool vfs_copy(const char* src, const char* dest) {
 
     return ok;
 }
+
 

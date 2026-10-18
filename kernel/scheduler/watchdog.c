@@ -777,7 +777,7 @@ void wd_nmi_handler(const struct WdNmiFrame* f) {
     if (kernel_panicking) return;   // Leave the first panic screen alone
 
     if (!(rtc & RTC_C_PF)) {
-        // Not ours and not a chipset error: keep the old behaviour
+        // Not ours and not a chipset error
         kernel_crashout(0, f->eip, PT_CPU_EXCEPTION, "NMI");
     }
 
@@ -794,7 +794,7 @@ void wd_nmi_handler(const struct WdNmiFrame* f) {
 
     // The scheduler has not run for WD_NMI_STRIKES periods
     out_reset();
-    out_s("HARD LOCKUP: the scheduler has not run for about ");
+    out_s("The scheduler has not run for about ");
     out_dec(WD_NMI_STRIKES * RTC_NMI_MS);
     out_s(" ms.\n");
     if (f->eflags & 0x200)
@@ -832,8 +832,8 @@ static void wd_check_nmi_armed(uint64_t now) {
     wd_nmi_verified = true;
     if (wd_serial_ok) {
         out_reset();
-        out_s(wd_nmi_count > 0 ? "[watchdog] hard-lockup NMI active (RTC via IOAPIC)\n"
-                               : "[watchdog] no NMI arrived: hard-lockup detection is NOT active\n");
+        out_s(wd_nmi_count > 0 ? "[watchdog] NMI active (RTC via IOAPIC)\n"
+                               : "[watchdog] NMI not active\n");
     }
 }
 

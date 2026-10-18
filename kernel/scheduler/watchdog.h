@@ -53,7 +53,7 @@ void wd_unwatch(ThreadBlock* thread);
 // Called by a watched thread once per loop iteration / unit of work
 void wd_pet(void);
 
-// Old name (the DWM used to be the only watched thread)
+// Old name, kept for existing callers
 static inline void wd_heartbeat(void) { wd_pet(); }
 
 // ---- Names and locks ----
@@ -91,3 +91,4 @@ void wd_note_deadlock(const mutex_t* wanted, uint32_t caller);
 bool wd_nmi_init(void);
 
 #endif
+

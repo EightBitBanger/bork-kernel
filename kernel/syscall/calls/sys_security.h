@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_SECURITY_H_
 #define _KERNEL_SYS_SECURITY_H_
 
@@ -74,3 +73,4 @@ static int32_t sys_sec_set(const SyscallArgs* args) {
 _Static_assert((SYS_SEC_VALID & 0x80000000u) == 0, "a mask must never look like an error result");
 
 #endif
+

@@ -50,6 +50,8 @@ static bool do_file_certify(const char* path, uint32_t certificate) {
     uint32_t address;
     if (!resolve_device_file(path, &ctx, &address))
         return false;
+    if (!vfs_fs_node_allowed(ctx, address))
+        return false;
     // fs_file_set_certificate rejects 0 and 0xFFFFFFFF
     return fs_file_set_certificate(ctx, address, certificate);
 }
@@ -71,3 +73,4 @@ bool vfs_file_certify(const char* path, uint32_t certificate) {
     vfs_unlock();
     return result;
 }
+

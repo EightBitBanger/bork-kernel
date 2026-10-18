@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYSCALL_H_
 #define _KERNEL_SYSCALL_H_
 
@@ -77,7 +76,10 @@
 #define SYS_RES_LOAD   44   // (path)                   0
 #define SYS_RES_GET    45   // (name)                   resource handle (>= 1)
 #define SYS_RES_INFO   46   // (handle, SysResInfo*)    0
-#define SYS_COUNT      47
+#define SYS_GETHOME    47   // (buf, size)              home path length (system device root)
+#define SYS_TIME       48   // (uint64_t* ms)           0, milliseconds since boot
+#define SYS_INPUT_WARP 49   // (handle, x, y, SysInputEvent* scratch)  0, pointer moved
+#define SYS_COUNT      50
 
 #define SYS_OK               0
 #define SYS_ENOSYS          -1  // Unknown syscall number
@@ -122,10 +124,9 @@
 //                        (copy needs both file bits)
 //   SYS_SEC_CONSOLE      print, and write to descriptors 1 and 2
 //   SYS_SEC_GFX          graphics surfaces: info, create, destroy, submit,
-//                        write, read, and presenting into the program's own
-//                        window through the window manager
-//   SYS_SEC_GFX_SCREEN   present straight into the display (when no window
-//                        manager takes the surface). Needs SYS_SEC_GFX too.
+//                        write, read
+//   SYS_SEC_GFX_SCREEN   present a surface onto the display. Needs
+//                        SYS_SEC_GFX too.
 //   SYS_SEC_IPC          pipes, ports and shared memory: pipe, port_create,
 //                        connect, accept, send, recv, shm_create, shm_map,
 //                        shm_unmap, and ipc_wait on those handles
@@ -135,8 +136,15 @@
 //                        process (itself included) and SYS_SEC_GET on other
 //                        processes; create ports named "sys.*"
 //
-// Always allowed: exit, yield, sleep, getpid, sbrk, close, seek, getcwd,
+// Always allowed: exit, yield, sleep, getpid, sbrk, close, seek, getcwd, gethome, time,
 // ipc_close, ipc_info and SYS_SEC_GET on the caller itself.
+//
+// Files: every file and directory on a storage device carries a mask of
+// these same bits, the clearance it requires. A process may open, list,
+// change or remove it only when its own mask holds every bit of the file's
+// (SYS_EACCES otherwise). Files marked with SYS_SEC_ADMIN are administrator
+// files: a user program (SYS_SEC_ADMIN clear) cannot touch them. stat still
+// works on them. New files and directories inherit their directory's mask.
 //
 // The bits are independent: SYS_SEC_ADMIN does not imply the others, but an
 // administrative process can grant itself whatever it needs. An admin that
@@ -150,13 +158,13 @@
 
 #define SYS_SEC_FILE_READ   0x00000001u
 #define SYS_SEC_FILE_WRITE  0x00000002u
+#define SYS_SEC_FILE_RW     (SYS_SEC_FILE_READ | SYS_SEC_FILE_WRITE)
 #define SYS_SEC_CONSOLE     0x00000004u
 #define SYS_SEC_GFX         0x00000008u
 #define SYS_SEC_GFX_SCREEN  0x00000010u
 #define SYS_SEC_IPC         0x00000020u
 #define SYS_SEC_INPUT       0x00000040u
 #define SYS_SEC_ADMIN       0x00000100u
-#define SYS_SEC_FILE_RW     (SYS_SEC_FILE_READ | SYS_SEC_FILE_WRITE)
 
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | \
@@ -341,7 +349,7 @@ typedef struct {
 //         SYS_EMFILE, and the message stays queued too.
 // Nothing blocks: wait for a handle to become ready with SYS_IPC_WAIT.
 //
-// PORT: a named rendezvous ("dwm", "audio.mixer"). Names are 1 ..
+// PORT: a named rendezvous ("shell", "audio.mixer"). Names are 1 ..
 // SYS_IPC_NAME_MAX - 1 characters of [A-Za-z0-9._-], unique system-wide
 // (SYS_EEXIST); names starting "sys." need SYS_SEC_ADMIN. SYS_IPC_CONNECT
 // makes a new pipe, queues one end on the port (up to SYS_IPC_BACKLOG,
@@ -428,9 +436,8 @@ typedef struct {
 // Input: keyboard and mouse
 //
 // SYS_INPUT_OPEN takes the keyboard and mouse for this process: from then
-// on every key press and mouse change goes to it instead of the window
-// manager, which stops drawing until the handle is closed (or the process
-// ends) and then repaints the whole screen. One owner at a time: a second
+// on every key press and mouse change goes to it instead of the kernel
+// console, until the handle is closed (or the process ends). One owner at a time: a second
 // SYS_INPUT_OPEN is SYS_EBUSY. The first event read is always a mouse event
 // with the current position and buttons.
 //
@@ -487,9 +494,8 @@ typedef struct {
 //
 // SYS_RES_LOAD reads a resource file (the kernel's RSRC format, see
 // resources/resource_manager.h) into this process and registers it under
-// its NAME: the file's own name, the last part of the path, exactly as the
-// window manager names the images in sys/images ("/x/images/icon_folder"
-// is "icon_folder"). SYS_RES_GET turns a name into a handle, 1 ..
+// its NAME: the file's own name, the last part of the path
+// ("/x/images/icon_folder" is "icon_folder"). SYS_RES_GET turns a name into a handle, 1 ..
 // SYS_RES_MAX, which SYS_GFX_CMD_RESOURCE draws from and SYS_RES_INFO
 // describes. Names and handles are private to the process; everything it
 // loaded is freed when it exits.
@@ -503,8 +509,8 @@ typedef struct {
 //
 // Supported: sprites (SYS_RES_TYPE_SPRITE), decoded to 0xAARRGGBB pixels.
 // Sprites mark see-through pixels with opaque black, SYS_GFX_SPRITE_KEY;
-// the window manager draws them keyed on it and alpha blended, and so do
-// the libc's gfx_draw_resource* (KEYED | ALPHA, key SYS_GFX_SPRITE_KEY).
+// draw them keyed on it and alpha blended, as the libc's
+// gfx_draw_resource* does (KEYED | ALPHA, key SYS_GFX_SPRITE_KEY).
 //
 // SYS_GFX_CMD_RESOURCE takes the same arguments as SYS_GFX_CMD_BLIT, with
 // a resource handle as the source, plus SYS_GFX_F_ALPHA.
@@ -550,4 +556,7 @@ bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, cons
 void syscall_process_exit(uint32_t process_id);
 
 #endif
+
+
+
 

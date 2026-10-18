@@ -3,7 +3,7 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
-#include <kernel/syscall/calls/sys_files.h>
+#include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/scheduler/process.h>
@@ -40,6 +40,8 @@ static int32_t sys_readdir_locked(SysProcessFiles* t, const SyscallArgs* args) {
         result = SYS_ENOENT;
     else if (!vfs_directory_check(path))
         result = SYS_ENOTDIR;
+    else if (!vfs_check_access(path))
+        result = SYS_EACCES;
     else if (index >= vfs_directory_get_item_count(path))
         result = 0;
     else if (!vfs_directory_get_item(path, index, name, sizeof(name)) || name[0] == '\0')
@@ -78,6 +80,8 @@ static int32_t sys_chdir_locked(SysProcessFiles* t, const SyscallArgs* args) {
         result = SYS_ENOENT;
     else if (!vfs_directory_check(path))
         result = SYS_ENOTDIR;
+    else if (!vfs_check_access(path))
+        result = SYS_EACCES;    // Could not list or open anything in there
     else
         result = SYS_OK;
     vfs_unlock();
@@ -109,3 +113,5 @@ static int32_t sys_getcwd(const SyscallArgs* args) {
 }
 
 #endif
+
+

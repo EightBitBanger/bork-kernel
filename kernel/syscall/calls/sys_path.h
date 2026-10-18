@@ -3,7 +3,7 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
-#include <kernel/syscall/calls/sys_files.h>
+#include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/scheduler/process.h>
@@ -53,6 +53,8 @@ static int32_t sys_mkdir_locked(SysProcessFiles* t, const SyscallArgs* args) {
         result = SYS_EEXIST;
     else if (!sys_parent_is_directory(path))
         result = SYS_ENOENT;
+    else if (!vfs_check_parent_access(path))
+        result = SYS_EACCES;
     else if (!vfs_mkdir(path))
         result = SYS_EACCES;    // Permissions, bad name, or the device is full
     else
@@ -83,6 +85,8 @@ static int32_t sys_remove_locked(SysProcessFiles* t, const SyscallArgs* args) {
         result = SYS_ENOENT;
     else if (vfs_directory_check_mounted(path))
         result = SYS_EBUSY;
+    else if (!vfs_check_access(path) || !vfs_check_parent_access(path))
+        result = SYS_EACCES;
     else if (sys_files_path_open(t, path))
         result = SYS_EBUSY;
     else if (vfs_directory_check(path) && vfs_directory_get_item_count(path) != 0)
@@ -126,6 +130,8 @@ static int32_t sys_rename_locked(SysProcessFiles* t, const SyscallArgs* args) {
         result = SYS_ENOENT;
     else if (vfs_directory_check_mounted(path))
         result = SYS_EBUSY;     // Mounts are named after their device
+    else if (!vfs_check_access(path) || !vfs_check_parent_access(path))
+        result = SYS_EACCES;
     else if (strcmp(renamed, path) == 0)
         result = SYS_OK;
     else if (vfs_exists(renamed))
@@ -160,7 +166,7 @@ static int32_t sys_truncate_locked(SysProcessFiles* t, const SyscallArgs* args) 
         result = SYS_ENOENT;
     else if (st.type != VFS_TYPE_FILE)
         result = SYS_EISDIR;
-    else if (!(st.permissions & VFS_PERMISSION_WRITE))
+    else if (!(st.permissions & VFS_PERMISSION_WRITE) || !vfs_check_access(path))
         result = SYS_EACCES;
     else if (!vfs_truncate(path, args->arg2))
         result = SYS_ENOSPC;    // No space, or not a file on a storage device
@@ -194,12 +200,16 @@ static int32_t sys_copy_locked(SysProcessFiles* t, const SyscallArgs* args) {
         return SYS_ENOENT;
     if (vfs_directory_check_mounted(src))
         return SYS_EBUSY;
+    if (!vfs_check_access(src))
+        return SYS_EACCES;
     if (sys_path_within(dest, src))
         return SYS_EINVAL;      // Into itself
     if (vfs_exists(dest))
         return SYS_EEXIST;
     if (!sys_parent_is_directory(dest))
         return SYS_ENOENT;
+    if (!vfs_check_parent_access(dest))
+        return SYS_EACCES;
 
     // On failure vfs_copy removes whatever it made at dest
     return vfs_copy(src, dest) ? SYS_OK : SYS_EIO;
@@ -210,3 +220,5 @@ static int32_t sys_copy(const SyscallArgs* args) {
 }
 
 #endif
+
+

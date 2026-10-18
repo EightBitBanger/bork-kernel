@@ -1,10 +1,8 @@
-
 #include <stdio.h>
 #include <stdbool.h>
 #include <kernel/malloc.h>
 #include <kernel/util/string.h>
 
-#include <kernel/dwm/dwm.h>
 #include <kernel/util/list.h>
 #include <kernel/device/kevent.h>
 #include <kernel/events.h>
@@ -23,9 +21,7 @@ static mutex_t event_mutex = {
 enum EventAction {
     ACTION_NONE,
     ACTION_EXPLORER,
-    ACTION_NOTEPAD,
-    ACTION_DWM_REFRESH,
-    ACTION_FAULT
+    ACTION_NOTEPAD
 };
 
 void kernel_event_init(void) {
@@ -109,7 +105,6 @@ bool kernel_event_remove(const char* name) {
 void kernel_event_update(void) {
     enum EventAction action = ACTION_NONE;
     char args_buffer[KEVENT_ARG_LENGTH_MAX] = {0};
-    char name_buffer[KEVENT_NAME_LENGTH_MAX] = {0};
 
     mutex_lock(&event_mutex);
 
@@ -137,28 +132,6 @@ void kernel_event_update(void) {
             break; // Stop scanning after finding an execution task
         }
 
-        // Refresh DWM
-        if (event->flags & KEVENT_DWM_REFRESH) {
-            event->flags &= ~KEVENT_DWM_REFRESH;
-            action = ACTION_DWM_REFRESH;
-            event->flags |= KEVENT_DEAD;
-            break;
-        }
-
-        // A user process crashed (sent by process_user_fault)
-        if (event->flags & KEVENT_FAULT) {
-            event->flags &= ~KEVENT_FAULT;
-
-            strncpy(name_buffer, event->name, KEVENT_NAME_LENGTH_MAX);
-            name_buffer[KEVENT_NAME_LENGTH_MAX - 1] = '\0';
-            strncpy(args_buffer, event->args, KEVENT_ARG_LENGTH_MAX);
-            args_buffer[KEVENT_ARG_LENGTH_MAX - 1] = '\0';
-
-            action = ACTION_FAULT;
-            event->flags |= KEVENT_DEAD;
-            break;
-        }
-
         // Unknown or unhandled event
         event->flags |= KEVENT_DEAD;
         current = next_node;
@@ -167,20 +140,11 @@ void kernel_event_update(void) {
     mutex_unlock(&event_mutex);
 
     if (action == ACTION_EXPLORER) {
-        explorer_main(args_buffer);
+        
+        
     } else if (action == ACTION_NOTEPAD) {
-        notepad_main(args_buffer);
-    } else if (action == ACTION_DWM_REFRESH) {
-        dwm_post_message(dwm_window_get_focus(), DWM_EVENT_REFRESH, 0, 0);
-    } else if (action == ACTION_FAULT) {
-        char title[64];
-        //strncpy(title, name_buffer[0] ? name_buffer : "process", sizeof(title) - 1);
-        //title[sizeof(title) - 1] = '\0';
-        strncat(title, "Received signal SIGSEGV", sizeof(title) - strlen(title) - 1);
-
-        // Copies the strings and creates the notification on the DWM thread,
-        // so the kernel thread never waits on the DWM lock
-        dwm_notify_post_ex(DWM_NOTIFY_ERROR, title, args_buffer, DWM_NOTIFY_STICKY);
+        
+        
     }
 
     mutex_lock(&event_mutex);
@@ -200,3 +164,4 @@ void kernel_event_update(void) {
 
     mutex_unlock(&event_mutex);
 }
+

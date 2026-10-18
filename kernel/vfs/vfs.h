@@ -116,7 +116,7 @@ typedef enum {
 } VfsFormatResult;
 
 // Called with 1..100 during a full wipe. Runs with the VFS lock held: it
-// may print, but must not touch the VFS, the DWM or kernel_lock.
+// may print, but must not touch the VFS or kernel_lock.
 typedef void (*vfs_format_progress_fn)(uint32_t percent);
 
 struct FSDeviceContext;
@@ -203,6 +203,60 @@ bool vfs_directory_check_mounted(const char* path);
 bool vfs_file_get_certificate(const char* path, uint32_t* certificate);
 bool vfs_file_certify(const char* path, uint32_t certificate);
 
+// Security clearance
+//
+// Every object on a mounted storage device carries a 32-bit security mask
+// (FSBlockHeader.security): the clearance bits a caller must hold to open,
+// list, change or remove it. The bits are the scheduler's SYS_SEC_* bits,
+// so a process's ProcessSecurity mask is its clearance. VFS_SECURITY_ADMIN
+// (== SYS_SEC_ADMIN, checked in syscall.c) marks administrator files; a
+// user program (SYS_SEC_ADMIN clear) cannot touch them. 0 = anyone.
+//
+// The caller's clearance comes from the source set with
+// vfs_set_clearance_source() (syscall_init installs
+// process_current_clearance). Kernel threads, and everything before a
+// source is set, have VFS_CLEARANCE_ALL, so kernel code is never refused.
+//
+// What is checked (object mask = the object's own, parent = its directory):
+//   open, read, write, truncate, set permissions, certify    object
+//   list a directory (item count / item)                     object
+//   create a file or directory                               parent
+//   rename                                                   object + parent
+//   remove                                                   parent + object + everything below it
+// stat, exists and get_permissions are always allowed, so a refused call
+// can say "permission denied" instead of "not found". Kernel nodes (/, /dev,
+// /mnt, ...) have no mask. New objects inherit their parent's mask.
+//
+// The mask is re-checked on every read and write, so raising a file's mask
+// also stops handles that are already open.
+
+#define VFS_SECURITY_NONE          0x00000000u
+#define VFS_SECURITY_ADMIN         0x00000100u  // == SYS_SEC_ADMIN
+#define VFS_CLEARANCE_ALL          0xFFFFFFFFu
+
+typedef uint32_t (*vfs_clearance_fn)(void);
+
+// Where the VFS asks for the calling thread's clearance. NULL: everyone has
+// VFS_CLEARANCE_ALL. Called with the VFS lock held: it must not use the VFS.
+void vfs_set_clearance_source(vfs_clearance_fn source);
+
+// The calling thread's clearance
+uint32_t vfs_caller_clearance(void);
+
+// The object's mask. False if `path` is not an object on a mounted device.
+bool vfs_get_security(const char* path, uint32_t* security);
+
+// Replace the object's mask. The caller's clearance must cover both the old
+// mask and the new one (nobody can grant or strip a bit they do not hold).
+// Only affects that object; contents keep their own masks.
+bool vfs_set_security(const char* path, uint32_t security);
+
+// True unless the object at `path` (or, for the parent form, the directory
+// holding it) exists and requires clearance the caller lacks. Used by the
+// syscalls to report SYS_EACCES; every VFS operation also checks by itself.
+bool vfs_check_access(const char* path);
+bool vfs_check_parent_access(const char* path);
+
 // Directory
 //
 // name_out receives the item's name, NUL-terminated. name_size is its
@@ -212,4 +266,6 @@ uint32_t vfs_directory_get_item_count(const char* path);
 bool vfs_directory_get_item(const char* path, unsigned int index, char* name_out, size_t name_size);
 
 #endif
+
+
 

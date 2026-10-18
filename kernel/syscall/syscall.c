@@ -1,4 +1,3 @@
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -6,6 +5,7 @@
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/scheduler/process.h>
 #include <kernel/arch/x86/drivers/serial.h>
 #include <kernel/vfs/vfs.h>
 
@@ -33,6 +33,9 @@
 
 // Resources: load by path, look up by name, draw with the gfx calls
 #include <kernel/syscall/calls/sys_resource.h>  // res_load res_get res_info
+#include <kernel/syscall/calls/sys_home.h>      // gethome
+#include <kernel/syscall/calls/sys_time.h>      // time
+#include <kernel/syscall/calls/sys_input.h>     // input_warp
 
 typedef struct {
     const char* name;       // For traces and reports
@@ -49,8 +52,8 @@ typedef struct {
 // Indexed by syscall number, so a missing row is a compile error.
 //
 // `requires` is what every call of that number needs. A 0 here does not
-// always mean "free": open (flags), write (console or file) and gfx_present
-// (direct to the screen) add requirements that depend on their arguments.
+// always mean "free": open (flags) and write (console or file) add
+// requirements that depend on their arguments.
 static const SyscallEntry syscall_table[] = {
     [SYS_EXIT]        = { "exit",        sys_exit,        0 },
     [SYS_PRINT]       = { "print",       sys_print,       SYS_SEC_CONSOLE },
@@ -79,7 +82,7 @@ static const SyscallEntry syscall_table[] = {
     [SYS_GFX_SUBMIT]  = { "gfx_submit",  sys_gfx_submit,  GFX },
     [SYS_GFX_WRITE]   = { "gfx_write",   sys_gfx_write,   GFX },
     [SYS_GFX_READ]    = { "gfx_read",    sys_gfx_read,    GFX },
-    [SYS_GFX_PRESENT] = { "gfx_present", sys_gfx_present, GFX },    // + GFX_SCREEN to bypass the WM
+    [SYS_GFX_PRESENT] = { "gfx_present", sys_gfx_present, GFX | SYS_SEC_GFX_SCREEN },
     [SYS_SEC_GET]     = { "sec_get",     sys_sec_get,     0 },      // ADMIN for other processes
     [SYS_SEC_SET]     = { "sec_set",     sys_sec_set,     SYS_SEC_ADMIN },
     [SYS_IPC_CLOSE]   = { "ipc_close",   sys_ipc_close,   0 },      // Always: lets a process let go
@@ -99,6 +102,9 @@ static const SyscallEntry syscall_table[] = {
     [SYS_RES_LOAD]    = { "res_load",    sys_res_load,    R | GFX },
     [SYS_RES_GET]     = { "res_get",     sys_res_get,     GFX },
     [SYS_RES_INFO]    = { "res_info",    sys_res_info,    GFX },
+    [SYS_GETHOME]     = { "gethome",     sys_gethome,     0 },      // Always, like getcwd
+    [SYS_TIME]        = { "time",        sys_time,        0 },
+    [SYS_INPUT_WARP]  = { "input_warp",  sys_input_warp,  INP },    // + the caller's input handle
 };
 
 #undef R
@@ -127,6 +133,10 @@ _Static_assert(SYS_GFX_PIE_MAX == GFX_PIE_MAX_SLICES, "SYS_GFX_PIE_MAX must equa
 _Static_assert(SYS_RES_TYPE_SPRITE == RESOURCE_TYPE_SPRITE, "SYS_RES_TYPE_* must match ResourceType");
 _Static_assert(sizeof(SysResInfo) == 16, "SysResInfo is part of the user ABI");
 
+// File security masks hold SYS_SEC_* bits: a process's mask is its clearance
+_Static_assert(VFS_SECURITY_ADMIN == SYS_SEC_ADMIN, "VFS_SECURITY_ADMIN must equal SYS_SEC_ADMIN");
+_Static_assert((SYS_SEC_VALID & ~VFS_CLEARANCE_ALL) == 0, "every SYS_SEC_* bit must fit a file mask");
+
 // What isr_syscall.asm leaves on the kernel stack: segment registers, the
 // pushad block, then the ring 3 -> 0 frame the CPU pushed. The handler's
 // result goes back through the eax slot, which popad loads.
@@ -143,6 +153,10 @@ extern ThreadBlock* current_thread;
 void syscall_init(void) {
     serial_init();
     sys_print_init();
+
+    // From here on, file access by a process thread is checked against its
+    // security mask; kernel threads keep full clearance
+    vfs_set_clearance_source(process_current_clearance);
 }
 
 bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd) {
@@ -188,4 +202,7 @@ void syscall_dispatch(struct SyscallFrame* frame) {
 
     frame->eax = (uint32_t)syscall_table[number].handler(&args);
 }
+
+
+
 

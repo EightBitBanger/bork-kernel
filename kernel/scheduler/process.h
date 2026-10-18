@@ -1,3 +1,4 @@
+
 #ifndef _KERNEL_PROCESS_H_
 #define _KERNEL_PROCESS_H_
 
@@ -77,9 +78,9 @@ typedef int32_t ProcessId;
 typedef uint32_t ProcessSecurity;
 
 // What CreateProcess / CreateProcessIn / CreateProcessFromImage grant: files,
-// the console and graphics in a window. Not direct screen access, not admin.
+// the console, graphics (including the screen), IPC and input. Not admin.
 #ifndef PROCESS_SECURITY_DEFAULT
-#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_GFX_SCREEN)
+#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC)
 #endif
 
 // Every clearance, administration included (a trusted shell or launcher)
@@ -141,7 +142,7 @@ ProcessId CreateProcessFromImage(const char* name, const ProcessImage* image, Th
 // starts in the directory holding it ("/mnt/ata0p1/bin/hello" starts in
 // "/mnt/ata0p1/bin"). Same as CreateProcessIn(image_path, NULL, priority).
 // Reads the file through the VFS, so: thread context only, and never while
-// holding the DWM lock for long (the DWM launches from a worker thread).
+// holding a lock other threads wait on for long.
 // Returns a ProcessId (> 0) or a PROCESS_ERR_* code; the reason a load was
 // refused is also written to COM1.
 ProcessId CreateProcess(const char* image_path, ThreadPriority priority);
@@ -199,6 +200,14 @@ ProcessId process_current_id(void);
 // thread or a process that is being destroyed.
 ProcessSecurity process_current_security(void);
 
+// File-system clearance of the calling thread (the VFS's clearance source,
+// installed by syscall_init): VFS_CLEARANCE_ALL (every bit) for a kernel
+// thread, otherwise the process's security mask (SYS_SEC_NONE while it is
+// being destroyed). A file whose basefs `security` mask has bits this lacks
+// is refused, so a process without SYS_SEC_ADMIN cannot touch files marked
+// VFS_SECURITY_ADMIN.
+uint32_t process_current_clearance(void);
+
 // Address space of the calling thread's process, NULL for a kernel thread
 struct AddressSpace* process_current_space(void);
 
@@ -222,3 +231,6 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
                         uint32_t cs, uint32_t address);
 
 #endif
+
+
+

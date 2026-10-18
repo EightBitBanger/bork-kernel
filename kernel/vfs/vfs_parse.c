@@ -319,6 +319,10 @@ bool vfs_parse_path(const char* path, uint16_t flags, uint32_t* out_knode, uint3
                     if (!(dir_perm & FS_PERMISSION_WRITE))
                         return false;
 
+                    // ...and needs the directory's security clearance
+                    if (!vfs_fs_node_allowed(current_ctx, current_fs_node))
+                        return false;
+
                     uint8_t default_perms = FS_PERMISSION_READ | FS_PERMISSION_WRITE;
                     uint32_t new_file_address = fs_file_create(current_ctx, token, default_perms, 0, current_fs_node);
                     if (new_file_address == FS_NULL) {
@@ -339,4 +343,5 @@ bool vfs_parse_path(const char* path, uint16_t flags, uint32_t* out_knode, uint3
     if (out_ctx) *out_ctx = current_ctx;
     return true;
 }
+
 

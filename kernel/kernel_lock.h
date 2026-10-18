@@ -5,18 +5,13 @@
 //
 // Replaces the old kernel_big_lock. It only guards the kernel event system
 // (kernel_event_send / kernel_event_update and whatever kernel_event_update
-// touches). It does NOT guard the DWM: the DWM has its own lock (dwm_lock)
-// and its own thread, see dwm/dwm_thread.c.
+// touches), and serializes direct presents to the display (SYS_GFX_PRESENT).
 //
 // Lock order (always take left to right, never the reverse):
 //
-//     kernel_lock  ->  dwm_lock  ->  filecopy lock  ->  VFS lock
-//                                ->  clipboard lock
+//     kernel_lock  ->  VFS lock  ->  driver locks
 //
-// In particular the DWM thread never takes kernel_lock while it holds
-// dwm_lock. DWM code that wants to send a kernel event queues it with
-// dwm_kernel_event_send(); the DWM thread delivers the queue after it has
-// released dwm_lock at the end of each frame.
+// Per-process syscall tables (files, gfx) are taken before kernel_lock.
 
 #include <stdbool.h>
 #include <kernel/mutex.h>
@@ -32,3 +27,4 @@ bool kernel_lock_held(void);
 mutex_t* kernel_lock_mutex(void);
 
 #endif
+

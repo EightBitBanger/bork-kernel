@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_GFX_H_
 #define _KERNEL_SYS_GFX_H_
 
@@ -9,7 +8,6 @@
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
 #include <kernel/syscall/calls/sys_gfx_core.h>
-#include <kernel/syscall/calls/sys_security.h>
 #include <kernel/gfx/gfx.h>
 #include <kernel/gfx/gfx_display.h>
 #include <kernel/arch/x86/virtual/vmm.h>
@@ -60,19 +58,6 @@ typedef struct SysGfxProcess {
 
 static SysGfxProcess* sys_gfx_list = NULL;
 static uint32_t       sys_gfx_total = 0;      // Interrupts off to touch
-
-//
-// Optional compositor hook
-//
-// When the window manager defines this, SYS_GFX_PRESENT hands it the
-// surface instead of copying to the screen itself, so it can show a
-// program's surface in that program's window (and keep it there across
-// repaints). Return true when handled. It runs with the process's gfx
-// table locked, in the calling thread: it must copy what it needs before
-// returning and must not make graphics calls itself.
-//
-extern bool dwm_present_user_surface(uint32_t process_id, const GfxSurface* surface,
-                                     const GfxRect* src, int32_t x, int32_t y) __attribute__((weak));
 
 //
 // Tables
@@ -445,9 +430,8 @@ static int32_t sys_gfx_read(const SyscallArgs* args) {
 //
 // gfx_present(handle, SysGfxRect* src or 0, x, y)
 //
-// Needs SYS_SEC_GFX (the table checks it). Handed to the window manager
-// when it takes the surface; otherwise drawn straight onto the display,
-// which also needs SYS_SEC_GFX_SCREEN (SYS_EPERM without it).
+// Needs SYS_SEC_GFX and SYS_SEC_GFX_SCREEN (the table checks both): the
+// surface is drawn straight onto the display, over whatever is there.
 //
 
 static int32_t sys_gfx_present_locked(SysGfxProcess* t, const SyscallArgs* args) {
@@ -475,14 +459,6 @@ static int32_t sys_gfx_present_locked(SysGfxProcess* t, const SyscallArgs* args)
         y += src.y - r.y;
     }
 
-    if (dwm_present_user_surface && dwm_present_user_surface(t->process_id, &s->surface, &src, x, y))
-        return SYS_OK;
-
-    // Nobody composited it: this would draw straight onto the display, over
-    // every other window. That takes its own clearance.
-    if (!sys_security_allows(SYS_SEC_GFX_SCREEN))
-        return SYS_EPERM;
-
     if (!gfx_display_ready())
         return SYS_EIO;
 
@@ -509,4 +485,6 @@ static int32_t sys_gfx_present(const SyscallArgs* args) {
 }
 
 #endif
+
+
 

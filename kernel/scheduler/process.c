@@ -13,7 +13,6 @@
 
 #include <kernel/vfs/vfs.h>
 #include <kernel/syscall/syscall.h>
-#include <kernel/events.h>
 
 #include <kernel/util/list.h>
 #include <kernel/util/string.h>
@@ -464,8 +463,8 @@ ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, Thr
     if ((security & ~SYS_SEC_VALID) != 0)
         return PROCESS_ERR_INVALID_ARG;
 
-    // Only regular files marked executable may run. The DWM checks this too,
-    // but every caller goes through here.
+    // Only regular files marked executable may run. Every launcher goes
+    // through here, so this is the one place it is enforced.
     if (!vfs_exists(image_path))
         return PROCESS_ERR_NOT_FOUND;
 
@@ -488,7 +487,7 @@ ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, Thr
 
     ElfSource source = { file, vfs_get_size(file) };
 
-    // Named after the file ("/mnt/ata0p1/bin/hello" -> "hello")
+    // Strip path from filename
     const char* name = strrchr(image_path, '/');
     name = (name != NULL) ? name + 1 : image_path;
 
@@ -670,6 +669,12 @@ ProcessSecurity process_current_security(void) {
     return security;
 }
 
+uint32_t process_current_clearance(void) {
+    if (process_current_id() == PROCESS_INVALID_ID)
+        return VFS_CLEARANCE_ALL;   // The kernel itself is never refused
+    return (uint32_t)process_current_security();
+}
+
 // The returned pointer stays valid while the caller runs: the only way the
 // space is freed is DestroyProcess(), which also kills the caller, and a
 // killed thread is never scheduled again.
@@ -775,59 +780,6 @@ static const char* fault_name(uint32_t vector) {
     }
 }
 
-// Fault report text without depending on snprintf's format support
-typedef struct {
-    char*    buf;
-    uint32_t cap;
-    uint32_t len;
-} FaultText;
-
-static void fault_text_puts(FaultText* t, const char* s) {
-    while (*s && t->len + 1 < t->cap)
-        t->buf[t->len++] = *s++;
-    t->buf[t->len] = '\0';
-}
-
-static void fault_text_hex(FaultText* t, uint32_t v) {
-    char h[11];
-    h[0] = '0';
-    h[1] = 'x';
-    for (int i = 0; i < 8; i++)
-        h[2 + i] = "0123456789abcdef"[(v >> (28 - 4 * i)) & 0xF];
-    h[10] = '\0';
-    fault_text_puts(t, h);
-}
-
-// Tell the kernel thread (and through it the DWM) that pid crashed, so the
-// desktop can show an error notification. Thread context, interrupts on, no
-// locks held: called from process_user_fault before the process is destroyed
-// (its name is gone afterwards).
-static void process_report_fault(ProcessId pid, uint32_t vector, uint32_t error_code,
-                                 uint32_t eip, uint32_t address) {
-    char name[PROCESS_NAME_MAX];
-    process_copy_name(pid, name);
-
-    char text[128];
-    FaultText t = { text, sizeof(text), 0 };
-    text[0] = '\0';
-
-    fault_text_puts(&t, fault_name(vector));
-    fault_text_puts(&t, " at ");
-    fault_text_hex(&t, eip);
-    if (vector == 14) {
-        fault_text_puts(&t, ", address ");
-        fault_text_hex(&t, address);
-        fault_text_puts(&t, (error_code & 1) ? " (protection, " : " (not present, ");
-        fault_text_puts(&t, (error_code & 2) ? "write)" : "read)");
-    } else if (vector == 13 && error_code != 0) {
-        fault_text_puts(&t, ", selector ");
-        fault_text_hex(&t, error_code);
-    }
-
-    if (kernel_event_send(KEVENT_FAULT, name[0] ? name : "process", text))
-        event_signal(&kernel_wakeup_event);
-}
-
 void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
                         uint32_t cs, uint32_t address) {
     // Kernel faults go to the panic screen. A double fault or machine check
@@ -863,12 +815,10 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
     // the process's files takes mutexes and may sleep.
     __asm__ volatile("sti" : : : "memory");
 
-    // Desktop notification (via the kernel event system)
-    if (pid != PROCESS_INVALID_ID)
-        process_report_fault(pid, vector, error_code, eip, address);
-
     process_exit_current((int32_t)(128 + vector));
 
     // Not in the process table (should not happen): end just this thread
     kthread_exit();
 }
+
+

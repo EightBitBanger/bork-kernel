@@ -26,7 +26,7 @@
 // other thread runs for the length of each sector transfer.
 //
 // Lock order: kernel_big_lock (if held) -> VFS lock -> driver locks.
-// Never call into the DWM or anything that takes kernel_big_lock while
+// Never call into anything that takes kernel_big_lock while
 // holding the VFS lock, and never take it from interrupt context.
 //
 
@@ -79,6 +79,18 @@ OpenFileDescriptor* vfs_file_find_open(File id);
 
 bool vfs_directory_check_mounted(const char* path);
 
+// Security clearance (vfs_security.c). True when the caller may use it.
+//   vfs_fs_node_allowed   one object on `ctx` (no object there: true)
+//   vfs_remove_allowed    the object and, for a directory, everything below
+//   vfs_path_allowed      the object at `path` (kernel nodes: true)
+//   vfs_parent_allowed    the directory holding `path`
+bool vfs_fs_node_allowed(struct FSDeviceContext* ctx, uint32_t address);
+bool vfs_remove_allowed(struct FSDeviceContext* ctx, uint32_t address);
+bool vfs_path_allowed(const char* path);
+bool vfs_parent_allowed(const char* path);
+
 #endif
+
+
 
 

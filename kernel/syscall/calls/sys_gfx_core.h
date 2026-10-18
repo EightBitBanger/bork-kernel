@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_SYS_GFX_CORE_H_
 #define _KERNEL_SYS_GFX_CORE_H_
 
@@ -8,7 +7,7 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/gfx/gfx.h>
-#include <kernel/dwm/rendering/sprite.h>
+#include <kernel/resources/classes/sprite.h>
 #include <kernel/malloc.h>
 #include <kernel/util/string.h>
 
@@ -490,4 +489,6 @@ static int32_t sys_gfx_execute(SysGfxSurface* s, const uint32_t* cmds, uint32_t 
 }
 
 #endif
+
+
 

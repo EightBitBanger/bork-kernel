@@ -12,8 +12,9 @@ typedef struct {
 
 // Add up everything below `path`. A file gives just its own size. The VFS
 // lock is held for the whole walk, so on a very large tree this stalls
-// other VFS users (and the DWM, when called from a window) until it ends.
+// other VFS users until it ends.
 // Returns false when the path does not exist. See vfs_size.c.
 bool vfs_directory_get_size(const char* path, VfsDirectorySize* out);
 
 #endif
+

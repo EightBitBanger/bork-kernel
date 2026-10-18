@@ -76,6 +76,9 @@ static File do_open(const char* path, uint16_t flags) {
         if (!fs_file_check(ctx, current_fs_node)) {
             return VFS_INVALID_FILE;
         }
+        if (!vfs_fs_node_allowed(ctx, current_fs_node)) {
+            return VFS_INVALID_FILE;    // Needs clearance the caller lacks
+        }
     } else {
         uint8_t k_flags = kmalloc_get_flags(current_knode);
         if (k_flags & KMALLOC_FLAG_DIRECTORY) {
@@ -143,6 +146,8 @@ static int32_t do_read(File file, void* buffer, uint32_t size) {
         fs_file_get_permissions(desc->ctx, desc->address, &parent_perm);
         if (!(parent_perm & FS_PERMISSION_READ)) 
             return -1;
+        if (!vfs_fs_node_allowed(desc->ctx, desc->address))
+            return -1;
         return fs_file_read(&desc->handle, buffer, size);
     } else {
         uint8_t parent_perm = 0;
@@ -170,6 +175,8 @@ static int32_t do_write(File file, const void* buffer, uint32_t size) {
         uint8_t parent_perm = 0;
         fs_file_get_permissions(desc->ctx, desc->address, &parent_perm);
         if (!(parent_perm & FS_PERMISSION_WRITE)) 
+            return -1;
+        if (!vfs_fs_node_allowed(desc->ctx, desc->address))
             return -1;
         return fs_file_write(&desc->handle, buffer, size);
     } else {
@@ -250,6 +257,8 @@ static bool do_mkdir(const char* path) {
         if (!(parent_perm & FS_PERMISSION_READ) || 
             !(parent_perm & FS_PERMISSION_WRITE)) 
             return false;
+        if (!vfs_fs_node_allowed(ctx, parent))
+            return false;
 
         // Names are unique within a directory (files and directories alike).
         // The VFS lock makes this check-then-create atomic.
@@ -305,6 +314,9 @@ static bool do_remove(const char* path) {
         if (!(item_perm & FS_PERMISSION_WRITE) || 
             !(parent_perm & FS_PERMISSION_READ) || 
             !(parent_perm & FS_PERMISSION_WRITE)) 
+            return false;
+        // Clearance for the directory, the object and all it contains
+        if (!vfs_fs_node_allowed(ctx, parent) || !vfs_remove_allowed(ctx, address))
             return false;
         // Never free something an open handle still points into
         if (vfs_fs_node_in_use(ctx, address))
@@ -362,6 +374,8 @@ static bool do_rename(const char* path, const char* name) {
         fs_file_get_permissions(ctx, address, &item_perm);
         if (!(item_perm & FS_PERMISSION_WRITE))
             return false;
+        if (!vfs_fs_node_allowed(ctx, address) || !vfs_fs_node_allowed(ctx, parent_address))
+            return false;
         // The name lives in the parent's entry. The rename refuses a name
         // another entry already has (the VFS lock makes that atomic).
         return fs_directory_rename_entry(ctx, parent_address, address, name) == FS_DIR_OK;
@@ -404,8 +418,11 @@ static bool do_truncate(const char* path, uint32_t new_size) {
     struct FSDeviceContext* ctx = vfs_device_get_context(path);
     // fs_file_resize refuses directories and reports allocation failure
     // (the file is left unchanged in that case), so pass its result on
-    if (ctx)
+    if (ctx) {
+        if (!vfs_fs_node_allowed(ctx, address))
+            return false;
         return fs_file_resize(ctx, address, new_size);
+    }
     return false;
 }
 
@@ -569,5 +586,6 @@ uint32_t vfs_get_size(File file) {
     vfs_unlock();
     return result;
 }
+
 
 

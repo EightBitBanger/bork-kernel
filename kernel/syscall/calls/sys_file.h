@@ -3,7 +3,7 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
-#include <kernel/syscall/calls/sys_files.h>
+#include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/syscall/calls/sys_print.h>
 #include <kernel/syscall/calls/sys_security.h>
@@ -45,11 +45,15 @@ static int32_t sys_open_path(char* path, uint32_t flags, File* out) {
             return SYS_EACCES;
         if ((flags & SYS_O_WRITE) && !(perm & VFS_PERMISSION_WRITE))
             return SYS_EACCES;
+        if (!vfs_check_access(path))
+            return SYS_EACCES;      // Needs clearance this process lacks
     } else {
         if (!(flags & SYS_O_CREATE))
             return SYS_ENOENT;
         if (!sys_parent_is_directory(path))
             return SYS_ENOENT;
+        if (!vfs_check_parent_access(path))
+            return SYS_EACCES;
         vfs_flags |= VFS_OPEN_CREATE;
     }
 
@@ -392,3 +396,5 @@ static int32_t sys_fstat(const SyscallArgs* args) {
 }
 
 #endif
+
+
