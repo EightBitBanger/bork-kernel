@@ -45,7 +45,7 @@ int32_t ipc_sys_input_read(const IpcCaller* c, uint32_t handle, uint32_t user_ev
 void ipc_process_exit(uint32_t pid);
 
 // True while a process holds the keyboard and mouse (SYS_INPUT_OPEN). The
-// DWM stops reading input and drawing while this is set.
+// kernel console stops reading input while this is set.
 bool ipc_input_grabbed(void);
 
 // Keyboard / mouse IRQ: new input queued. Wakes waiters while grabbed.
@@ -54,3 +54,4 @@ void ipc_input_irq(void);
 #define IPC_EXIT_WAIT_MS    1000
 
 #endif
+

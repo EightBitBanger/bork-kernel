@@ -124,7 +124,7 @@ static bool       ipc_reaping   = false;
 static uint32_t   ipc_queued    = 0;        // Message bytes queued system-wide
 static uint32_t   ipc_shm_bytes = 0;        // Bytes in all shared blocks
 static IpcInput*  ipc_input_owner = NULL;
-static volatile bool ipc_grab   = false;    // Read by IRQs and the DWM without the lock
+static volatile bool ipc_grab   = false;    // Read by IRQs and the console without the lock
 
 //
 // Reference counting
@@ -864,7 +864,7 @@ int32_t ipc_sys_input_open(const IpcCaller* c) {
     input->obj.refs     = 1;
     input->sync_pending = true;
 
-    // Whatever was queued for the window manager is stale now
+    // Whatever was queued for the kernel console is stale now
     ipc_plat_input_flush();
     ipc_input_owner = input;
     ipc_grab = true;
@@ -962,3 +962,4 @@ void ipc_process_exit(uint32_t pid) {
         free(t);
     }
 }
+

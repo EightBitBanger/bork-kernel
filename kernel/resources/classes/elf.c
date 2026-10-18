@@ -163,9 +163,9 @@ ElfResult elf_load(AddressSpace* space, File file, uint32_t file_size,
 
         switch (p->p_type) {
             case PT_INTERP:
-                FAIL(ELF_ERR_UNSUPPORTED, "needs a dynamic linker (PT_INTERP): link with -static");
+                FAIL(ELF_ERR_UNSUPPORTED, "requires dynamic linker (PT_INTERP): link with -static");
             case PT_DYNAMIC:
-                FAIL(ELF_ERR_UNSUPPORTED, "needs dynamic relocation (PT_DYNAMIC): link with -static -no-pie");
+                FAIL(ELF_ERR_UNSUPPORTED, "requires dynamic relocation (PT_DYNAMIC): link with -static -no-pie");
             case PT_TLS:
                 FAIL(ELF_ERR_UNSUPPORTED, "uses thread-local storage (PT_TLS)");
             case PT_LOAD:

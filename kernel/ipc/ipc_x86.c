@@ -229,13 +229,8 @@ void ipc_plat_input_flush(void) {
     while (input_key_pop(&key)) {}
 }
 
-// Defined by the DWM (dwm_thread.c): repaint everything once it gets the
-// screen back. Weak so the kernel links without a DWM.
-extern void dwm_input_released(void) __attribute__((weak));
-
 void ipc_plat_input_grab_changed(bool grabbed) {
-    if (!grabbed && dwm_input_released)
-        dwm_input_released();
-    // Taking the grab needs nothing: the DWM thread checks
-    // ipc_input_grabbed() every frame
+    // Nothing to do: the kernel console checks ipc_input_grabbed() before
+    // it reads input, and takes it back as soon as the grab is let go
+    (void)grabbed;
 }

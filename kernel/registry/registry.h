@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_REGISTRY_H_
 #define _KERNEL_REGISTRY_H_
 
@@ -70,11 +69,10 @@ bool registry_hive_save_all(void);
 // Convenience helpers (registry_util.c)
 //
 // The registry has no lock of its own. Today only the boot thread (load)
-// and the DWM thread (menus, shutdown save) touch it; anything else that
-// starts using it needs a lock first.
+// touches it; anything else that starts using it needs a lock first.
 //
 
-// Walk a '/'-separated path below `root` ("software/dwm/menus"). Every
+// Walk a '/'-separated path below `root` ("software/shell/menus"). Every
 // segment must be shorter than REGISTRY_MAX_NAME_LEN. With `create`, missing
 // keys are made with `permissions`; without it, NULL means "not there".
 struct RegistryKey* registry_open_key(struct RegistryKey* root, const char* path,
@@ -95,3 +93,4 @@ bool registry_set_string(struct RegistryKey* parent, const char* name, uint16_t 
 bool registry_get_string(struct RegistryKey* parent, const char* name, char* out, size_t size);
 
 #endif
+

@@ -7,7 +7,7 @@
 // related graphical device functions.
 //
 //   GfxSurface   a block of 32 bpp ARGB pixels: width, height, stride.
-//                The back buffer, every window's frame buffer and every
+//                The back buffer, every process surface and every
 //                image are surfaces. A surface either owns its pixels
 //                (gfx_surface_create) or wraps memory someone else owns
 //                (gfx_surface_wrap).
@@ -15,7 +15,7 @@
 //   GfxContext   where and how to draw a target surface, a clip rectangle,
 //                an origin (translation), a blend mode and a font. Contexts 
 //                are plain structs, usually on the stack, and each owner 
-//                keeps its own, so the console, the compositor and a window 
+//                keeps its own, so the console, the panic screen and a drawing 
 //                procedure can never trample each other's clip or target the 
 //                way the old global draw_* state could. gfx_save / gfx_restore 
 //                push and pop the state.
@@ -312,3 +312,4 @@ void gfx_draw_pixels(GfxContext* ctx, const uint32_t* pixels, int32_t width, int
                      int32_t x, int32_t y, gfx_color_t key, bool keyed);
 
 #endif
+
