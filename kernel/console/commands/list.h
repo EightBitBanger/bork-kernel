@@ -6,7 +6,6 @@
 #include <kernel/console/console.h>
 #include <kernel/console/commands/path_util.h>
 
-// ls [dir]   list a directory (the working directory by default)
 int console_cmd_lsdir(int arg_count, char** args) {
     char path[VFS_PATH_MAX];
     if (!command_resolve_directory_arg(arg_count, args, path, sizeof(path)))
@@ -16,6 +15,7 @@ int console_cmd_lsdir(int arg_count, char** args) {
         print(msg_dir_invalid);
         return 1;
     }
+    print("\n");
     return 0;
 }
 

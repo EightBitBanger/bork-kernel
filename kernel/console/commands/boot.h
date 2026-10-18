@@ -17,7 +17,7 @@
 
 #include <kernel/resources/resource_manager.h>
 
-#include <kernel/console/commands/boot_dropper.h>
+//#include <kernel/console/commands/boot_dropper.h>
 
 #ifdef ADD_IMAGE_LIB
 #include <kernel/dwm/dwm.h>   // dwm_builtin_images, dwm_get_image_directory
@@ -223,7 +223,7 @@ static bool boot_export_programs(const char* root) {
     char bin_dir[128];
     if (!boot_path(bin_dir, sizeof(bin_dir), root, "/bin/test"))
         return false;
-    return dropper_all(bin_dir);
+    //return dropper_all(bin_dir);
 }
 
 // The original "boot images": images into the current home device

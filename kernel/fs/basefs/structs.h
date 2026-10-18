@@ -1,4 +1,3 @@
-
 #ifndef BASE_FILE_STRUCTS_H
 #define BASE_FILE_STRUCTS_H
 
@@ -6,22 +5,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-
-// ===========================================================================
-// basefs on-disk format, version 2
-//
-// Changes from version 1:
-//   - Names live in the directory, not in the file. A directory's payload is
-//     a run of variable-length FSDirEntry records (name, type, address).
-//     Headers no longer carry a name at all.
-//   - Every header has a parent back-pointer and timestamps.
-//   - A file's first data bytes are stored inline, right after its header,
-//     in the same allocation. Small files need a single allocation; larger
-//     ones spill into an FSFileExtent chain exactly as before.
-//
-// Version 1 images are not readable: fs_device_open must reject any
-// partition whose `version` is not FS_FORMAT_VERSION.
-// ===========================================================================
 
 // The block device a filesystem lives on. basefs never looks inside it; it
 // only passes it to block_read / block_write / block_flush (block/block.h).
@@ -111,7 +94,20 @@ struct __attribute__((packed)) FSBlockHeader {
     // address. Kept in sync by create, move and directory delete.
     uint32_t parent;
     
+    // Security clearance this object requires: a mask of the scheduler's
+    // SYS_SEC_* bits (VFS_SECURITY_* in vfs.h). A caller must hold every bit
+    // set here to open, list, change or remove the object; 0 means any
+    // process. VFS_SECURITY_ADMIN (== SYS_SEC_ADMIN) marks an administrator
+    // file that user programs (no SYS_SEC_ADMIN) cannot touch. New objects
+    // inherit their parent directory's mask. basefs only stores it: the VFS
+    // enforces it (vfs_security.c).
     uint32_t security;
+    
+    // Security token assigned on file creation. Used to track trusted files/programs.
+    // When an uncertified program is run the user should be prompted to certify the 
+    // program before continuing. This is meant to prevent programs from other 
+    // systems from running until the user explicitly allows it. 
+    // Once certified the program will run normally on future runs.
     uint32_t certificate;
     
     // Seconds since the Unix epoch, 0 = unknown (no clock at the time)
@@ -242,3 +238,4 @@ _Static_assert(((sizeof(struct FSAllocHeader) + sizeof(struct FSDirectoryExtent)
 _Static_assert(FS_NAME_MAX <= 255, "FS_NAME_MAX must fit in FSDirEntry.name_len");
 
 #endif
+

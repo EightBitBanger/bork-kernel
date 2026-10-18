@@ -225,7 +225,8 @@ int console_cmd_format(int arg_count, char** args) {
 
     display_cursor_set_position(0);
     print(msg_final_progress);
-
+    
+    print("\n");
     return 0;
 }
 

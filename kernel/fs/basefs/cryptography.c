@@ -1,4 +1,3 @@
-
 #include <kernel/fs/fs.h>
 #include <kernel/util/string.h>
 
@@ -33,6 +32,14 @@ bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint32_t address, ui
     return true;
 }
 
+bool fs_file_get_security(struct FSDeviceContext* ctx, uint32_t address, uint32_t* security) {
+    if (!ctx || address == FS_NULL || security == NULL) return false;
+    struct FSBlockHeader header;
+    fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
+    *security = header.security;
+    return true;
+}
+
 bool fs_file_set_security_flag(struct FSDeviceContext* ctx, uint32_t address, uint32_t security) {
     if (!ctx || address == FS_NULL) return false;
     struct FSBlockHeader header;
@@ -41,4 +48,5 @@ bool fs_file_set_security_flag(struct FSDeviceContext* ctx, uint32_t address, ui
     fs_mem_write(ctx, address, &header, sizeof(struct FSBlockHeader));
     return true;
 }
+
 

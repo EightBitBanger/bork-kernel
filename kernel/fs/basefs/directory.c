@@ -1,4 +1,3 @@
-
 #include <kernel/fs/fs.h>
 #include <kernel/fs/basefs/directory.h>
 
@@ -403,6 +402,11 @@ uint32_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint
     directory.block.attributes  = FS_ATTRIBUTE_DIRECTORY;
     directory.block.permissions = permissions;
     directory.block.parent      = parent_directory;
+    // Inherit the parent's security clearance (the root starts at 0)
+    if (parent_directory != FS_NULL) {
+        uint32_t security = directory.block.security;
+        fs_file_get_security(ctx, parent_directory, &security);
+    }
     directory.block.created     = fs_time_now();
     directory.block.modified    = directory.block.created;
     directory.extent.next       = FS_NULL;
@@ -820,3 +824,4 @@ bool fs_directory_delete_recursive(struct FSDeviceContext* ctx, uint32_t address
 
     return false;
 }
+

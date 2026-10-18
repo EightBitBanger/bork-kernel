@@ -7,14 +7,9 @@
 #include <kernel/vfs/vfs.h>
 #include <kernel/util/string.h>
 
+#include <kernel/boot_cabinate.h>
 #include <kernel/console/commands/boot_cabinate.h>
-#define INPUT_ELF_SIZE       ((uint32_t)sizeof(input_demo))
-#define GFX_DEMO_ELF_SIZE    ((uint32_t)sizeof(gfx_demo))
-#define SPRITE_DEMO_ELF_SIZE ((uint32_t)sizeof(sprite_demo))
 
-// Write `size` bytes of `bytes` to `path` (absolute, on a mounted device,
-// e.g. "/mnt/ata0p1/usr/desktop/hello") and mark it executable. Overwrites an
-// existing file. Thread context only (VFS). Returns true on success.
 static inline bool drop_elf_bytes(const char* path, const uint8_t* bytes, uint32_t size) {
     // Create it if missing, then size it before writing: writes don't
     // reliably extend a file (same sequence as dwm_desktop_layout_save)
@@ -40,8 +35,6 @@ static inline bool drop_elf_bytes(const char* path, const uint8_t* bytes, uint32
     return vfs_set_permissions(path, VFS_PERMISSION_READ | VFS_PERMISSION_WRITE | VFS_PERMISSION_EXECUTE);
 }
 
-// Join `dir` and `name` into `out` (capacity `cap`), inserting a '/' unless
-// `dir` already ends in one. Returns false if it would not fit.
 static inline bool drop_join_path(char* out, uint32_t cap, const char* dir, const char* name) {
     uint32_t dlen = (uint32_t)strlen(dir);
     uint32_t nlen = (uint32_t)strlen(name);
@@ -58,21 +51,15 @@ static inline bool drop_join_path(char* out, uint32_t cap, const char* dir, cons
     return true;
 }
 
-// Drop both test programs into directory `dir` (absolute, on a mounted
-// device, e.g. "/mnt/ata0p1/usr/desktop") as "hello" and "crash". Thread
-// context only (VFS). Returns true only if both were written.
 static inline bool dropper_all(const char* dir) {
     char path[256];
     bool ok = true;
     
-    if (!drop_join_path(path, sizeof(path), dir, "input_demo")) return false;
-    ok = drop_elf_bytes(path, input_demo, INPUT_ELF_SIZE) && ok;
+    if (!drop_join_path(path, sizeof(path), dir, "dwm")) return false;
+    ok = drop_elf_bytes(path, dwm, dwm_len) && ok;
     
-    if (!drop_join_path(path, sizeof(path), dir, "gfx_demo")) return false;
-    ok = drop_elf_bytes(path, gfx_demo, GFX_DEMO_ELF_SIZE) && ok;
-    
-    if (!drop_join_path(path, sizeof(path), dir, "sprite_demo")) return false;
-    ok = drop_elf_bytes(path, sprite_demo, SPRITE_DEMO_ELF_SIZE) && ok;
+    if (!drop_join_path(path, sizeof(path), dir, "explorer")) return false;
+    ok = drop_elf_bytes(path, explorer, explorer_len) && ok;
     
     return ok;
 }

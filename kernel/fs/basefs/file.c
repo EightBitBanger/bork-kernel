@@ -1,11 +1,9 @@
-
 #include <kernel/fs/fs.h>
 #include <kernel/fs/basefs/file.h>
 #include <kernel/fs/config.h>
 
 #include <kernel/util/string.h>
 
-// ---------------------------------------------------------------------------
 // Layout (see FSFileHeader in structs.h)
 //
 //   header allocation:  [FSAllocHeader][FSFileHeader][inline data][slack]
@@ -14,7 +12,6 @@
 // The inline data is "part 0" of the file and the extents follow it in
 // order. Only the last part ever grows, so once a file has extents its
 // inline part keeps its size until a truncate removes the extents.
-// ---------------------------------------------------------------------------
 
 static inline uint32_t fs_file_part_header_size(uint32_t part, uint32_t file_address) {
     return (part == file_address) ? (uint32_t)sizeof(struct FSFileHeader) : (uint32_t)sizeof(struct FSFileExtent);
@@ -112,6 +109,12 @@ uint32_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t p
     file.block.attributes  = 0;
     file.block.permissions = permissions;
     file.block.parent      = parent_directory;
+    // Inherit the directory's security clearance (0 when unlinked)
+    if (parent_directory != FS_NULL) {
+        uint32_t security = file.block.security;
+        fs_file_get_security(ctx, parent_directory, &security);
+    }
+    
     file.block.created     = fs_time_now();
     file.block.modified    = file.block.created;
     file.total_logical_size = 0;
@@ -764,3 +767,4 @@ uint32_t fs_file_get_address(const FileHandle* file) {
         return FS_NULL;
     return file->address;
 }
+

@@ -1,4 +1,3 @@
-
 #include <kernel/kernel.h>
 
 #include <kernel/console/console_const.h>
@@ -167,23 +166,25 @@ void console_process_command(char* keyboard_str) {
     char program[VFS_PATH_MAX];
     kernel_get_working_directory(cwd, sizeof(cwd));
     
-    int result = -1;
+    int result = CONSOLE_CMD_NOT_FOUND;
     if (vfs_path_normalize(cwd, command, program, sizeof(program))) {
         args[0] = program;
         result = console_command_run(CONSOLE_CMD_EXECUTE, args);
     }
     
-    // Then each PATH entry. A name with a '/' in it is a path, never
-    // searched for. Relative PATH entries are skipped: what they named
-    // would change with the working directory.
-    if (result != 0 && strchr(command, '/') == NULL) {
+    // Then each PATH entry, until one has the program. A name with a '/'
+    // in it is a path, never searched for. Relative PATH entries are
+    // skipped: what they named would change with the working directory.
+    // A program that was found but failed to start (or exited with an
+    // error) stops the search: its message is already printed.
+    if (result == CONSOLE_CMD_NOT_FOUND && strchr(command, '/') == NULL) {
         struct LocalPaths paths;
         kernel_get_local_paths(&paths);
         
         cstr_tok_t path_tok;
         cstr_tok_init(&path_tok, paths.path, ";");
         
-        for (char* dir = cstr_tok_next(&path_tok); dir != NULL && result != 0; dir = cstr_tok_next(&path_tok)) {
+        for (char* dir = cstr_tok_next(&path_tok); dir != NULL && result == CONSOLE_CMD_NOT_FOUND; dir = cstr_tok_next(&path_tok)) {
             if (dir[0] != '/')
                 continue;
             if (!vfs_path_normalize(dir, command, program, sizeof(program)))
@@ -194,7 +195,7 @@ void console_process_command(char* keyboard_str) {
     }
     
     args[0] = command;
-    if (result != 0)
+    if (result == CONSOLE_CMD_NOT_FOUND)
         print(msg_bad_command);
     
     print("\n");
@@ -288,3 +289,5 @@ bool console_list_directory(const char* path) {
     }
     return true;
 }
+
+

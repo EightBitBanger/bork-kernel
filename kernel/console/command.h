@@ -22,6 +22,13 @@
 
 typedef int (*ConsoleCommandFn)(int arg_count, char** args);
 
+// CONSOLE_CMD_EXECUTE's result when there is no program at that path: the
+// console moves on to the next PATH entry. Every other result means the
+// program was found (it ran, or the reason it could not was printed), so
+// the search stops there. Also what console_command_run() returns for an
+// unknown id.
+#define CONSOLE_CMD_NOT_FOUND   (-1)
+
 typedef enum {
     CONSOLE_CMD_EXECUTE,    // Run a program by path (internal, no name)
     CONSOLE_CMD_HELP,
@@ -62,7 +69,11 @@ const ConsoleCommand* console_command_get(uint32_t index);
 // Run a command directly. args is a NULL-terminated list of at most 16
 // words, with the same meaning as for the console (for CONSOLE_CMD_EXECUTE,
 // args[0] is the program path). Counting stops at the first NULL or empty
-// word. Returns the command's result, or -1 for an unknown id.
+// word. Returns the command's result, or CONSOLE_CMD_NOT_FOUND for an
+// unknown id.
+//
+// CONSOLE_CMD_EXECUTE starts the program as a process and blocks until it
+// ends (Ctrl+C kills it), so call it from the console thread only.
 int console_command_run(ConsoleCommandId id, char** args);
 
 #endif
