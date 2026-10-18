@@ -1,4 +1,3 @@
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -36,8 +35,19 @@
 //
 // Drawing goes through the console's OWN GfxContext on the display back
 // surface, with its own font (the char ROM with a 9 pixel line), so nothing
-// the DWM does to its contexts (clip, origin, target) can reach it.
+// any other drawing code does to its contexts (clip, origin, target) can reach it.
 //
+// Text is drawn at CONSOLE_TEXT_SCALE, the same magnification the panic
+// screen uses (PANIC_SCALE in panic/panic_error.c), so both read the same.
+// Every size the console reports (glyph width/height, columns, rows) is in
+// scaled pixels; nothing outside this file needs to know about the scale.
+//
+
+// Same as PANIC_SCALE
+#define CONSOLE_TEXT_SCALE   2
+
+// Unscaled cell height: 8 glyph rows plus one blank row between lines
+#define CONSOLE_LINE_HEIGHT  9
 
 // Kept global: other code reads the cursor directly
 uint16_t cursor_position;   // Column
@@ -51,8 +61,9 @@ uint32_t display_height;
 uint32_t console_width;     // Columns
 uint32_t console_height;    // Rows
 
-uint8_t console_glyph_width  = 6;
-uint8_t console_glyph_height = 9;
+// Size of one character cell on screen, in pixels (scale applied)
+uint8_t console_glyph_width  = 6 * CONSOLE_TEXT_SCALE;
+uint8_t console_glyph_height = CONSOLE_LINE_HEIGHT * CONSOLE_TEXT_SCALE;
 
 #define CONSOLE_FOREGROUND   0xFFCACACAu
 #define CONSOLE_BACKGROUND   0xFF040404u
@@ -110,6 +121,7 @@ static void display_present(void) {
         for (uint32_t col = 0; col < console_width; col++) {
             if (text[col] == shown[col])
                 continue;
+            // The context's text scale fills the whole gw x gh cell
             gfx_draw_char_opaque(&console_gc, (int32_t)col * gw, (int32_t)row * gh, text[col],
                                  CONSOLE_FOREGROUND, CONSOLE_BACKGROUND);
             shown[col] = text[col];
@@ -135,12 +147,17 @@ void display_init(void) {
     display_width  = (uint32_t)gfx_display_width();
     display_height = (uint32_t)gfx_display_height();
 
+    // Unscaled font metrics; the context applies the scale when drawing
     console_font = *gfx_font_default();
-    console_font.line_height = console_glyph_height;    // One blank pixel row between lines
-    console_glyph_width = console_font.advance;
+    console_font.line_height = CONSOLE_LINE_HEIGHT;     // One blank pixel row between lines
 
     gfx_context_init(&console_gc, gfx_display_back());
     gfx_set_font(&console_gc, &console_font);
+    gfx_set_text_scale(&console_gc, CONSOLE_TEXT_SCALE);
+
+    // On-screen cell size, as the context will draw it
+    console_glyph_width  = (uint8_t)gfx_context_char_width(&console_gc);
+    console_glyph_height = (uint8_t)gfx_context_line_height(&console_gc);
 
     // Columns across, rows down
     console_width  = display_width  / console_glyph_width;
@@ -187,6 +204,7 @@ uint16_t display_get_height(void) {
     return (uint16_t)display_height;
 }
 
+// On-screen cell size in pixels (text scale included)
 uint8_t display_get_glyph_width(void) {
     return console_glyph_width;
 }

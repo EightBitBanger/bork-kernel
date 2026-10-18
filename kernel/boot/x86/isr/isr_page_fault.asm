@@ -15,6 +15,7 @@ isr_page_fault:
     mov ax, 0x10           ; Kernel data segments (DS may be the user's 0x23)
     mov ds, ax
     mov es, ax
+    cld                    ; Ring 3 can leave DF set; C needs it clear
 
     ; Callee-saved registers, so they survive the first C call
     mov ebx, [esp + 32]    ; Error code
@@ -49,3 +50,4 @@ isr_page_fault:
 .hang:
     hlt
     jmp .hang
+

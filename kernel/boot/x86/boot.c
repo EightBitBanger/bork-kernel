@@ -40,7 +40,6 @@
 #include <kernel/vfs/vfs.h>
 #include <kernel/resources/resource_manager.h>
 #include <kernel/registry/registry.h>
-#include <kernel/dwm/dwm.h>
 #include <kernel/panic/panic_error.h>
 #include <kernel/scheduler/scheduler.h>
 #include <kernel/scheduler/watchdog.h>
@@ -48,7 +47,13 @@
 #include <kernel/mutex.h>
 #include <kernel/kernel_lock.h>
 #include <kernel/arch/x86/irq.h>
+#include <kernel/console/mouse.h>
 #include <kernel/boot/x86/boot_image.h>
+
+// System file dropper
+
+#include <kernel/console/commands/boot_dropper.h>
+
 
 #define BOOT_DELAY_MS          800
 #define KERNEL_EVENT_POLL_MS   10
@@ -212,9 +217,14 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     kb_init();
     kb_map_init(virtual_key_map, sizeof(virtual_key_map));
     
-    mouse_initiate();
-    mouse_set_cursor_speed(14, 14);
-    mouse_set_cursor_acceleration(2);
+    // Interrupts are already on, and the keyboard IRQ reads port 0x60 too,
+    // so it could swallow the mouse's ACK bytes and leave mouse_read()
+    // waiting. Configure the mouse with them held off.
+    {
+        uint32_t flags = irq_save();
+        mouse_initiate();
+        irq_restore(flags);
+    }
     
     // Prepare the console and fire up the kernel
     console_init(keyboard_string, prompt_string, sizeof(keyboard_string), sizeof(prompt_string));
@@ -224,33 +234,31 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     print("kernel v0.1.0\n");
     gfx_display_present_all();
     
-    
     //
     // Command console / boot options
+    const uint8_t escape_key_console = VK_F7;
     
-    {
-        bool activate_console = false;
+    uint64_t old_ms = timer_get_ms();
+    bool activate_console = false;
+    while ((timer_get_ms() - old_ms) <= BOOT_DELAY_MS) {
         
-        uint64_t old_ms = timer_get_ms();
-        while ((timer_get_ms() - old_ms) <= BOOT_DELAY_MS) {
+        if (kb_vkey_check(escape_key_console)) {
+            activate_console = true;
             
-            // Check keyboard data ready
-            if (kb_get_current_char() == 'c') {
-                activate_console = true;
-                
-                // Scan PCI bus for available hardware
-                // before entering the console
-                pci_init();
-                
-                kb_flush();
-                
-                console_prompt_print();
-                gfx_display_present_all();
-                break;
-            }
+            pci_init();
+            
+            print("\n");
+            console_prompt_print();
+            
+            gfx_display_present_all();
+            break;
         }
+    }
+    
+    // Run the dedicated console mode if activated
+    if (activate_console) {
+        kb_flush();
         
-        // Run the dedicated console mode if activated
         while (activate_console) {
             ps2_route_console();
         }
@@ -259,122 +267,47 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     // Scan PCI bus for available hardware
     pci_init();
     
-    // Get primary knode directories
-    
-    const char path_mnt[] = "/mnt";
-    const char path_sys[] = "/sys";
-    const char root_dev[] = "dev";
-    const char root_mnt[] = "mnt";
-    
-    uint32_t root_node = knode_get_root();
-    uint32_t dev_directory = knode_find_by_name(root_node, root_dev);
-    uint32_t mnt_directory = knode_find_by_name(root_node, root_mnt);
-    
-    // Courtesy delay for boot output
-    uint64_t old_ms = timer_get_ms();
-    while ((timer_get_ms() - old_ms) <= BOOT_DELAY_MS);
-    
-    // Blank the screen in preparation for pure graphics mode
-    {
-        GfxContext gc;
-        gfx_context_init(&gc, gfx_display_back());
-        gfx_clear(&gc, GFX_COLOR_BLACK);
-        gfx_display_present_all();
-    }
-    
     //
     // Load the registry
     
+    const char path_sys[] = "/sys";
     struct LocalPaths paths;
     kernel_get_local_paths(&paths);
-    
     {
-        char sys_path[128];
-        strncpy(sys_path, paths.home, 128);
-        strncat(sys_path, path_sys, 128);
+        char sys_path[128]; // Fixed definition from original snippet
+        strncpy(sys_path, paths.home, sizeof(sys_path) - 1);
+        sys_path[sizeof(sys_path) - 1] = '\0'; // Ensure null-termination
         
+        // Correctly calculate remaining space to prevent overflow
+        size_t remaining = sizeof(sys_path) - strlen(sys_path) - 1;
+        strncat(sys_path, path_sys, remaining);
+        
+        // Load registry hives
         registry_hive_initiate(sys_path);
+        
+        // Drop system files that do not exist
+        dropper_all(sys_path);
+        
+        char window_path[128];
+        strncpy(window_path, sys_path, 128);
+        strncat(window_path, "/explorer", 128);
+        
+        // Launch the dwm with executive level permissions
+        strncat(sys_path, "/dwm", sizeof(sys_path));
+        char* args[] = { sys_path, NULL };
+        console_cmd_execute(1, args, SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
+                                     SYS_SEC_CONSOLE | SYS_SEC_GFX | 
+                                     SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_GFX_SCREEN, 0);
+        
+        thread_sleep(1000);
+        
+        char* window_args[] = { window_path, NULL };
+        console_cmd_execute(1, window_args, SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
+                                            SYS_SEC_CONSOLE | SYS_SEC_GFX | 
+                                            SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_GFX_SCREEN, 0);
+        
+        
     }
-    
-    //
-    // Initiate the DWM graphical environment and associated resources
-    
-    dwm_initiate();
-    
-    //
-    // Load desktop icons
-    
-    uint16_t sep = 90;
-    uint16_t posx = 30;
-    uint16_t posy = 30;
-    
-    // Mounted device icons
-    uint32_t number_of_mounts = knode_get_reference_count(mnt_directory);
-    for (unsigned int i=0; i < number_of_mounts; i++) {
-        uint32_t address = knode_get_reference(mnt_directory, i);
-        
-        char name[16];
-        knode_get_name(address, name);
-        
-        char path[128];
-        strncpy(path, path_mnt, 128);
-        strncat(path, "/", 128);
-        strncat(path, name, 128);
-        
-        dwm_create_mount(posx, posy, name, path);
-        posx += sep;
-    }
-    
-    // File / folder icons
-    
-    uint32_t item_count = vfs_directory_get_item_count(path_mnt);
-    for (unsigned int i=0; i < item_count; i++) {
-        
-        // Check user directory
-        char user_path[128];
-        memset(user_path, '\0', sizeof(user_path));
-        strncpy(user_path, path_mnt, 128);
-        
-        char device_name[128];
-        if (!vfs_directory_get_item(path_mnt, i, device_name, sizeof(device_name))) 
-            continue;
-        
-        strncat(user_path, "/", 128);
-        strncat(user_path, device_name, 128);
-        strncat(user_path, "/usr/desktop", 128);
-        
-        // Find the desktop directory under user
-        if (!vfs_directory_check(user_path)) 
-            continue;
-        
-        // Load desktop icons
-        uint32_t desktop_item_count = vfs_directory_get_item_count(user_path);
-        for (unsigned int d=0; d < desktop_item_count; d++) {
-            char desktop_item_path[128];
-            char desktop_item_name[128];
-            if (!vfs_directory_get_item(user_path, d, desktop_item_name, sizeof(desktop_item_name))) 
-                continue;
-            
-            memcpy(desktop_item_path, user_path, 128);
-            strncat(desktop_item_path, "/", 128);
-            strncat(desktop_item_path, desktop_item_name, 128);
-            
-            // Folder
-            if (vfs_directory_check(desktop_item_path)) {
-                dwm_create_folder(posx, posy, desktop_item_name, desktop_item_path);
-                posx += sep;
-            }
-            
-            // File
-            else {
-                dwm_create_file(posx, posy, desktop_item_name, desktop_item_path);
-                posx += sep;
-            }
-        }
-    }
-    
-    // Restore saved icon positions from <home>/usr/icons (if present)
-    dwm_desktop_layout_load();
     
     //
     // TODOs
@@ -383,9 +316,6 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     
     // TODO key combination binding
     
-    // Fire up the DWM thread
-    dwm_start(PRIORITY_HIGH);
-    
     uint32_t irq_flags = irq_save();
     
     ThreadBlock* kernel_thread = thread_create(thread_kernel_main, PRIORITY_HIGH);
@@ -393,27 +323,14 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     
     irq_restore(irq_flags);
     
-    //char nameCrash[] = "/mnt/ahci0p1/bin/test/crash";
-    //char nameHello[] = "/mnt/ahci0p1/bin/test/hello";
+    print("\n");
+    console_prompt_print();
     
-    while(1) {
-        
-        /*
-        // Scheduler thrash / hammer burst test
-        dwm_launch_program(nameCrash);
-        
-        for (unsigned int i=0; i < 32; i++) 
-            dwm_launch_program(nameHello);
-        
-        dwm_launch_program(nameCrash);
-        
-        for (unsigned int i=0; i < 32; i++) 
-            dwm_launch_program(nameHello);
-        
-        dwm_launch_program(nameCrash);
-        */
-        
-        thread_sleep(100);
+    gfx_display_present_all();
+    kb_flush();
+    
+    while (1) {
+        ps2_route_console();
     }
 }
 

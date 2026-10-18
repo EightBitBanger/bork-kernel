@@ -1,4 +1,3 @@
-
 #include <ctype.h>
 #include <stdint.h>
 #include <kernel/arch/x86/io.h>
@@ -32,7 +31,7 @@ int32_t mouse_y = 0;
 
 static MouseEvent mouse_queue[MOUSE_QUEUE_SIZE];
 static volatile uint32_t mouse_queue_head = 0; // Written by the IRQ
-static volatile uint32_t mouse_queue_tail = 0; // Read by the DWM
+static volatile uint32_t mouse_queue_tail = 0; // Read by the input consumers
 
 Point mouse_get_position(void) {
     return (Point){mouse_x, mouse_y};
@@ -63,12 +62,25 @@ void mouse_set_cursor_acceleration(int32_t acceleration) {
     acceleration_max = acceleration;
 }
 
-void mouse_wait(uint8_t type) {
-    if (type == 0) {
-        while ((inb(0x64) & 1) == 0); // Wait for data to be readable
-    } else {
-        while ((inb(0x64) & 2) != 0); // Wait for buffer to clear for writing
+// Bounded, so a machine with no PS/2 mouse (or a controller that never
+// answers) doesn't hang boot here. Runs with interrupts off, so this counts
+// status reads rather than asking the timer. Returns false on timeout.
+#define MOUSE_WAIT_SPINS  100000u
+
+static bool mouse_wait_ready(uint8_t type) {
+    for (uint32_t i = 0; i < MOUSE_WAIT_SPINS; i++) {
+        uint8_t status = inb(0x64);
+        if (type == 0) {
+            if (status & 1) return true;        // Data to read
+        } else {
+            if (!(status & 2)) return true;     // Room to write
+        }
     }
+    return false;
+}
+
+void mouse_wait(uint8_t type) {
+    (void)mouse_wait_ready(type);
 }
 
 void mouse_write(uint8_t write) {
@@ -79,7 +91,8 @@ void mouse_write(uint8_t write) {
 }
 
 uint8_t mouse_read(void) {
-    mouse_wait(0);
+    if (!mouse_wait_ready(0))
+        return 0;           // Nothing came: callers only use this to drop ACKs
     return inb(0x60);
 }
 
@@ -94,9 +107,10 @@ void mouse_initiate(void) {
     mouse_wait(0);
     status = inb(0x60);
     
-    status |=  (1 << 0); // Bit 0 (Keyboard Interrupt / IRQ 1)
-    status |=  (1 << 1); // Bit 1 (Mouse Interrupt / IRQ 12)
-    status |=  (1 << 5); // Ensure bit 5 is set
+    status |=  (1 << 0); // Bit 0: first port (keyboard) interrupt, IRQ 1
+    status |=  (1 << 1); // Bit 1: second port (mouse) interrupt, IRQ 12
+    status &= ~(1 << 5); // Bit 5: second port clock DISABLE. Must be clear,
+                         // or the controller blocks every mouse byte
     
     // Write the modified Configuration Byte back
     mouse_wait(1);
@@ -116,12 +130,15 @@ void mouse_initiate(void) {
     while (inb(0x64) & 1) {
         inb(0x60);
     }
+    
+    // Start the packet state machine on a byte boundary
+    mouse_cycle = 0;
 }
 
 void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middle) {
     uint32_t next_head = (mouse_queue_head + 1) % MOUSE_QUEUE_SIZE;
 
-    // Queue full. The producer (this IRQ) must never write tail: the DWM
+    // Queue full. The producer (this IRQ) must never write tail: a consumer
     // thread may be halfway through copying that slot in mouse_dequeue_event(),
     // and moving tail under it loses or tears an event. Instead, fold the new
     // state into the newest queued event so position and buttons stay current.
@@ -155,7 +172,7 @@ bool mouse_dequeue_event(MouseEvent* out_event) {
     // Check and copy with the IRQ masked: when the queue is full the producer
     // coalesces into the newest slot, which is the tail slot when only one is
     // queued. The check is inside too, because there can be two consumer
-    // threads (the DWM and a process holding the input grab).
+    // threads (the kernel console and a process holding the input grab).
     uint32_t flags = irq_save();
     if (mouse_queue_head == mouse_queue_tail) {
         irq_restore(flags);
@@ -235,4 +252,6 @@ void mouse_event_handler(void) {
         mouse_enqueue_event(mouse_x, mouse_y, mouse_left_clicked, mouse_right_clicked, mouse_middle_clicked);
     }
 }
+
+
 

@@ -30,6 +30,7 @@ scheduler_context:
     mov es, ax
     mov fs, ax
     mov gs, ax
+    cld                        ; Ring 3 can leave DF set; C needs it clear (iret restores it)
     
     mov eax, [current_thread]
     test eax, eax
@@ -62,3 +63,4 @@ scheduler_context:
     pop ds
     popad
     iret
+

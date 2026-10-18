@@ -15,6 +15,16 @@ global isr_dummy_slave
 %macro DUMMY_STUB 2
 %1:
     pusha                  ; Save standard general-purpose registers
+    push ds                ; User code may have left any selector here,
+    push es                ; including null: reload the kernel's before C
+    push fs
+    push gs
+    mov ax, 0x10           ; EAX was saved by pusha
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    cld                    ; Ring 3 can leave DF set; C needs it clear (iret restores it)
     
     ; 16-byte aligned FXSAVE area; ESP stays 16-byte aligned for the C call
     mov ebp, esp
@@ -28,6 +38,10 @@ global isr_dummy_slave
     fxrstor [esp]
     
     mov esp, ebp
+    pop gs
+    pop fs
+    pop es
+    pop ds
     popa                   ; Restore general-purpose registers
     iret                   ; Return to the interrupted code
 %endmacro
@@ -35,3 +49,4 @@ global isr_dummy_slave
 DUMMY_STUB isr_dummy,        c_dummy_handler
 DUMMY_STUB isr_dummy_master, c_dummy_master_handler
 DUMMY_STUB isr_dummy_slave,  c_dummy_slave_handler
+

@@ -1,4 +1,3 @@
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <kernel/arch/x86/io.h>
@@ -6,8 +5,8 @@
 #include <kernel/arch/x86/drivers/ps2.h>
 #include <kernel/panic/panic_error.h>
 
-#include <kernel/dwm/dwm.h>
 #include <kernel/console/keyboard.h>
+#include <kernel/console/mouse.h>
 #include <kernel/scheduler/scheduler.h>
 #include <kernel/arch/x86/irq.h>
 #include <kernel/ipc/ipc.h>
@@ -143,7 +142,7 @@ void isr_callback_fault_handler(uint32_t error_code, uint32_t faulting_address, 
 // Single producer (keyboard IRQ). The IRQ only writes head, consumers only
 // write tail; the compiler barriers keep the slot write ordered before the
 // index publish. When full, new keys are dropped (the consumers own tail).
-// There can be more than one consumer thread (the DWM, and a process that
+// There can be more than one consumer thread (the kernel console, and a process that
 // holds the input grab through SYS_INPUT_READ), so a pop runs with
 // interrupts off: two threads never take the same key.
 
@@ -190,8 +189,8 @@ void keyboard_handler_c(void) {
     if (ps2_check_keyboard()) {
         uint16_t last_key_pressed = kb_getc();
 
-        // Don't call into the DWM from interrupt context: it is not
-        // reentrant and may be mid-update. Queue the key and wake the DWM.
+        // Don't call into consumers from interrupt context: they are not
+        // reentrant and may be mid-update. Queue the key and wake them.
         if (last_key_pressed != 0)
             input_key_push(last_key_pressed);
     }
@@ -203,10 +202,16 @@ void keyboard_handler_c(void) {
 }
 
 void mouse_handler_c(void) {
+    // IRQ 12: one byte from the mouse is waiting in port 0x60. It must be
+    // read here, or the controller holds every byte after it and the
+    // pointer never moves. mouse_event_handler() assembles the 3-byte
+    // packet and queues a MouseEvent once one is complete.
     mouse_event_handler();
-    event_signal(&input_event);
-    ipc_input_irq();
 
+    event_signal(&input_event);
+    ipc_input_irq();        // A process holding the input grab may be waiting
     slave_interrupt_end();
 }
+
+
 

@@ -68,6 +68,7 @@ exception_common:
     mov ax, 0x10           ; Kernel data segments (DS may be the user's 0x23)
     mov ds, ax
     mov es, ax
+    cld                    ; Ring 3 can leave DF set; C needs it clear
 
     ; Callee-saved registers, so they survive the first C call
     mov edi, [esp + 0]     ; vector
@@ -108,3 +109,4 @@ isr_exception_table:
     dd isr_exc %+ i
 %assign i i+1
 %endrep
+

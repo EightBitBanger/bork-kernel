@@ -10,8 +10,18 @@ global isr_nmi
 ; blocks further NMIs until the iret.
 isr_nmi:
     pusha                  ; Frame for the C handler: pusha block + EIP/CS/EFLAGS
+    push ds                ; User code may have left any selector here,
+    push es                ; including null: reload the kernel's before C
+    push fs
+    push gs
+    mov ax, 0x10           ; EAX was saved by pusha
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    cld                    ; Ring 3 can leave DF set; C needs it clear (iret restores it)
 
-    mov ebp, esp           ; Frame pointer (EBP saved by pusha, callee-saved in C)
+    lea ebp, [esp + 16]    ; Frame pointer: the pusha block, above the 4 selectors
     sub esp, 512
     and esp, 0xFFFFFFF0
     fxsave [esp]
@@ -22,6 +32,11 @@ isr_nmi:
     add esp, 16
 
     fxrstor [esp]
-    mov esp, ebp
+    lea esp, [ebp - 16]    ; Back to the saved selectors
+    pop gs
+    pop fs
+    pop es
+    pop ds
     popa
     iret
+

@@ -14,6 +14,7 @@ isr_general_fault:
     mov ax, 0x10           ; Kernel data segments (DS may be the user's 0x23)
     mov ds, ax
     mov es, ax
+    cld                    ; Ring 3 can leave DF set; C needs it clear
 
     mov ebx, [esp + 32]    ; Error code (selector)
     mov esi, [esp + 36]    ; Faulting EIP (CR2 is meaningless for #GP)
@@ -44,3 +45,4 @@ isr_general_fault:
 .hang:
     hlt
     jmp .hang
+

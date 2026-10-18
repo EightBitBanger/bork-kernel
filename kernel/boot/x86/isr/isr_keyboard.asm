@@ -3,6 +3,16 @@ extern keyboard_handler_c
 
 isr_keyboard:
     pusha                  ; Save all general-purpose registers
+    push ds                ; User code may have left any selector here,
+    push es                ; including null: reload the kernel's before C
+    push fs
+    push gs
+    mov ax, 0x10           ; EAX was saved by pusha
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    cld                    ; Ring 3 can leave DF set; C needs it clear (iret restores it)
     
     ; Carve out a 512-byte FXSAVE area and align it to 16 bytes. Aligning ESP
     ; itself also satisfies the i386 SysV ABI, which requires ESP % 16 == 0 at
@@ -18,5 +28,10 @@ isr_keyboard:
     fxrstor [esp]          ; Restore the entire FPU/MMX/SSE/XMM state
     
     mov esp, ebp           ; Drop the FXSAVE area and alignment padding
+    pop gs
+    pop fs
+    pop es
+    pop ds
     popa                   ; Restore registers
     iret
+

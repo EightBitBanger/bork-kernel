@@ -26,6 +26,7 @@ isr_syscall:
     mov es, ax
     mov fs, ax
     mov gs, ax
+    cld                        ; Ring 3 can leave DF set; C needs it clear (iret restores it)
 
     mov ebx, esp               ; Frame pointer (EBX is callee-saved in C)
     sub esp, 512
@@ -46,3 +47,4 @@ isr_syscall:
     pop ds
     popad
     iret
+

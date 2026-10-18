@@ -5,12 +5,11 @@
 //
 // These are the old global-state draw_* calls, now implemented on top of
 // <kernel/gfx/gfx.h>. They draw through one BOUND GfxContext: by default an
-// internal context targeting the display back buffer. The DWM binds a
-// window's paint context while that window's procedure handles REDRAW, so
-// old window procedures that call draw_* still land in their own window.
+// internal context targeting the display back buffer. Code that renders
+// into its own surface can bind that surface's context (draw_bind_context)
+// so older draw_* callers land there instead.
 //
-// New code should use a GfxContext directly (dwm_window_paint_context()
-// inside a window procedure, or its own context on its own surface).
+// New code should use a GfxContext directly, on its own surface.
 //
 // Each call keeps its historical blending behavior regardless of the
 // bound context's blend mode: *_blend and the gradients alpha-blend,
@@ -84,3 +83,4 @@ void draw_pie_chart(int center_x, int center_y, int radius, const uint32_t* slic
 void draw_pie_chart_isometric(int center_x, int center_y, int radius, int depth, const uint32_t* slices, const uint32_t* colors, size_t count);
 
 #endif
+
