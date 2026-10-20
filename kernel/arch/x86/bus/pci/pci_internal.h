@@ -11,36 +11,47 @@
 
 #define PCI_MAX_BRIDGE_DEPTH    16
 
-// Hardware detection
+// Matches any subclass / prog_if in a class driver entry
+#define PCI_ANY                 0xFFFF
+
+// State shared by everything one pci_init() run finds.
 //
-// fs_paths is owned by pci_init(): it is read once before the scan, updated
-// in place by every storage device found (including ones behind bridges),
-// and written back once after the whole tree is scanned.
+// fs_paths is read once before the scan, updated in place by every storage
+// device found (including ones behind bridges), and written back once after
+// the whole tree is scanned.
+struct PCIScanContext {
+    void* mnt_dir;
+    struct LocalPaths* fs_paths;
+};
+
+// A driver for one kind of function. probe() runs during the scan, before
+// the device's property nodes are written.
+struct PCIClassDriver {
+    uint8_t  class_code;
+    uint16_t subclass;      // PCI_ANY or an exact value
+    uint16_t prog_if;       // PCI_ANY or an exact value
+    void (*probe)(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
+};
+
+// Bus scan (pci_scan.c)
 
 void pci_scan_reset(void);
-void pci_scan_bus(uint8_t bus_number, uint32_t pci_directory, uint32_t mnt_directory, struct LocalPaths* fs_paths, uint8_t depth);
+void pci_scan_bus(uint8_t bus_number, void* pci_directory, struct PCIScanContext* ctx, uint8_t depth);
 
-// handle device classes
+// Run the class driver for a function, if one matches (pci.c)
+void pci_probe_driver(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
 
-void pci_handle_storage_device(uint8_t bus, uint8_t dev, uint8_t func, uint8_t subclass, uint8_t prog_if, uint32_t mnt_dir, struct LocalPaths* fs_paths);
+// Storage controllers (pci_storage.c)
 
-// IO
+void pci_storage_probe_ide(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
+void pci_storage_probe_ahci(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
 
-uint32_t pci_config_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset);
-void pci_config_write(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset, uint32_t value);
+// Properties (pci_prop.c)
 
-uint16_t pci_read_command(uint8_t bus, uint8_t dev, uint8_t func);
-void pci_write_command(uint8_t bus, uint8_t dev, uint8_t func, uint16_t command);
-void pci_enable_command_bits(uint8_t bus, uint8_t dev, uint8_t func, uint16_t bits);
+void* pci_create_property_node(void* parent_knode, const char* name, const char* value);
+void pci_export_vfs_properties(void* type_knode, const struct PCIDeviceInfo* dev_info);
 
-uint16_t pci_get_io_bar(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_index);
-
-// Properties
-
-uint32_t pci_create_property_node(uint32_t parent_knode, const char* name, const char* value);
-void pci_export_vfs_properties(uint32_t type_knode, const struct PCIDeviceInfo* dev_info);
-
-// String formatting
+// String formatting (pci_strings.c)
 
 const char* pci_get_class_name(uint8_t class_code);
 void format_device_string(char* buf, uint8_t dev, uint8_t func);

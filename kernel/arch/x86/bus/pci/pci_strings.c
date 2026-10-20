@@ -1,4 +1,20 @@
+#include <kernel/arch/x86/bus/pci/pci.h>
+#include <kernel/arch/x86/bus/pci/pci_internal.h>
+
 #include <kernel/util/string.h>
+
+const char* pci_get_class_name(uint8_t class_code) {
+    switch (class_code) {
+        case PCI_CLASS_LEGACY:     return "legacy";
+        case PCI_CLASS_STORAGE:    return "storage";
+        case PCI_CLASS_NETWORK:    return "network";
+        case PCI_CLASS_DISPLAY:    return "display";
+        case PCI_CLASS_MULTIMEDIA: return "multimedia";
+        case PCI_CLASS_BRIDGE:     return "bridge";
+        case PCI_CLASS_SERIAL_BUS: return "serialusb";
+        default:                   return "unknown";
+    }
+}
 
 void format_device_string(char* buf, uint8_t dev, uint8_t func) {
     buf[0] = '0' + (dev / 10);
@@ -9,16 +25,10 @@ void format_device_string(char* buf, uint8_t dev, uint8_t func) {
     buf[5] = '\0';
 }
 
+// "bus<n>", n = 0..255
 void format_bus_string(char* buf, uint8_t bus) {
     buf[0] = 'b'; buf[1] = 'u'; buf[2] = 's';
-    if (bus < 10) {
-        buf[3] = '0' + bus;
-        buf[4] = '\0';
-    } else {
-        buf[3] = '0' + (bus / 10);
-        buf[4] = '0' + (bus % 10);
-        buf[5] = '\0';
-    }
+    format_dec8_string(&buf[3], bus);
 }
 
 void format_hex32_string(char* buf, uint32_t val) {

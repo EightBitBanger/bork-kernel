@@ -7,7 +7,7 @@
 // Kept for code that still reads the boot info through it
 struct MultibootInfo* vinfo = NULL;
 
-// Console text colors (draw_set_glyph_scheme). Only read by old code.
+// Console text colors (draw_set_glyph_scheme)
 uint32_t foreground_color  = 0xFF555555;
 uint32_t background_color  = 0xFF555555;
 uint32_t transparent_color = 0xFF555555;

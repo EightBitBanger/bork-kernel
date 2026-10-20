@@ -50,11 +50,6 @@
 #include <kernel/console/mouse.h>
 #include <kernel/boot/x86/boot_image.h>
 
-// System file dropper
-
-#include <kernel/console/commands/boot_dropper.h>
-
-
 #define BOOT_DELAY_MS          800
 #define KERNEL_EVENT_POLL_MS   10
 
@@ -78,26 +73,13 @@ static void thread_kernel_main(void) {
     }
 }
 
-static inline uint32_t align_page_up(uint32_t value) {
-    return (value + 0xFFFU) & ~0xFFFU;
-}
+// Align a page up to the nearest page boundary
+static inline uint32_t align_page_up(uint32_t value);
 
 // True if [start, start + size) lies inside one usable region of the BIOS
 // memory map. Physical addresses; works with paging off.
-static bool boot_memory_usable(struct MultibootInfo* mbi, uint32_t start, uint32_t size) {
-    if (!(mbi->flags & MULTIBOOT_INFO_MEM_MAP))
-        return false;
-    uint64_t end = (uint64_t)start + size;
-    uint32_t addr = mbi->mmap_addr;
-    uint32_t last = mbi->mmap_addr + mbi->mmap_length;
-    while (addr < last) {
-        struct MultibootMmapEntry* e = (struct MultibootMmapEntry*)addr;
-        if (e->type == MULTIBOOT_MEMORY_AVAILABLE && e->addr <= start && e->addr + e->len >= end)
-            return true;
-        addr += e->size + sizeof(e->size);
-    }
-    return false;
-}
+static bool boot_memory_usable(struct MultibootInfo* mbi, uint32_t start, uint32_t size);
+
 
 void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC)
@@ -247,6 +229,11 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
             
             pci_init();
             
+            // Set the console path to the home disk
+            struct LocalPaths paths;
+            kernel_get_local_paths(&paths);
+            kernel_set_working_directory(paths.home);
+            
             print("\n");
             console_prompt_print();
             
@@ -267,46 +254,38 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     // Scan PCI bus for available hardware
     pci_init();
     
+    // Set the console path to the home disk
+    struct LocalPaths paths;
+    kernel_get_local_paths(&paths);
+    kernel_set_working_directory(paths.home);
+    
     //
     // Load the registry
     
     const char path_sys[] = "/sys";
-    struct LocalPaths paths;
-    kernel_get_local_paths(&paths);
     {
-        char sys_path[128]; // Fixed definition from original snippet
+        char sys_path[128];
         strncpy(sys_path, paths.home, sizeof(sys_path) - 1);
         sys_path[sizeof(sys_path) - 1] = '\0'; // Ensure null-termination
         
-        // Correctly calculate remaining space to prevent overflow
+        // Remaining space, so the append cannot overflow
         size_t remaining = sizeof(sys_path) - strlen(sys_path) - 1;
         strncat(sys_path, path_sys, remaining);
         
         // Load registry hives
         registry_hive_initiate(sys_path);
         
-        // Drop system files that do not exist
-        dropper_all(sys_path);
-        
-        char window_path[128];
-        strncpy(window_path, sys_path, 128);
-        strncat(window_path, "/explorer", 128);
-        
-        // Launch the dwm with executive level permissions
+        // Launch the dwm with executive level permissions (admin + file)
         strncat(sys_path, "/dwm", sizeof(sys_path));
         char* args[] = { sys_path, NULL };
-        console_cmd_execute(1, args, SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
-                                     SYS_SEC_CONSOLE | SYS_SEC_GFX | 
-                                     SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_GFX_SCREEN, 0);
         
-        thread_sleep(1000);
+        uint32_t proc_sec = SYS_SEC_FILE_RW | SYS_SEC_ADMIN | SYS_SEC_CONSOLE | 
+                            SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | 
+                            SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_EXEC;
         
-        char* window_args[] = { window_path, NULL };
-        console_cmd_execute(1, window_args, SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
-                                            SYS_SEC_CONSOLE | SYS_SEC_GFX | 
-                                            SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_GFX_SCREEN, 0);
-        
-        
+        // Ctrl+C belongs to the desktop's programs (Copy), so it must not
+        // kill the dwm the way it kills a program typed at the prompt
+        console_cmd_execute(1, args, proc_sec, CONSOLE_THREAD_BLOCK | CONSOLE_THREAD_NO_BREAK);
     }
     
     //
@@ -334,3 +313,25 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     }
 }
 
+//
+// Auxiliary
+//
+
+static bool boot_memory_usable(struct MultibootInfo* mbi, uint32_t start, uint32_t size) {
+    if (!(mbi->flags & MULTIBOOT_INFO_MEM_MAP))
+        return false;
+    uint64_t end = (uint64_t)start + size;
+    uint32_t addr = mbi->mmap_addr;
+    uint32_t last = mbi->mmap_addr + mbi->mmap_length;
+    while (addr < last) {
+        struct MultibootMmapEntry* e = (struct MultibootMmapEntry*)addr;
+        if (e->type == MULTIBOOT_MEMORY_AVAILABLE && e->addr <= start && e->addr + e->len >= end)
+            return true;
+        addr += e->size + sizeof(e->size);
+    }
+    return false;
+}
+
+static inline uint32_t align_page_up(uint32_t value) {
+    return (value + 0xFFFU) & ~0xFFFU;
+}

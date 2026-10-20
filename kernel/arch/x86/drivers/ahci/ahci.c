@@ -19,8 +19,8 @@
 #define AHCI_TFD_BSY          0x80
 #define AHCI_PxIS_TFES        (1U << 30)
 
-// Per-port DMA structures. Previously these were single globals that were
-// overwritten by every port (and every controller) that got initialized.
+// Per-port DMA structures, one set per port so ports and controllers never
+// share a command list or table.
 struct AhciPortState {
     struct AHCI_Port_Registers* port;
     uint8_t*  cmd_list;          // Virtual address of the 1 KB command list
@@ -182,8 +182,8 @@ struct AHCI_Port_Registers* ahci_get_port(int port_num) {
 
 // Bring a port back after a task-file error or a timeout. On TFES the HBA
 // halts the command engine with PxCI still set; without this every later
-// command found another "free" slot, reused the single shared command table
-// while the old slot was still pending, and timed out (5M spins each).
+// command would find another "free" slot, reuse the shared command table
+// while the stuck slot is still pending, and time out.
 #define AHCI_PxCMD_CLO        (1U << 3)
 
 static void ahci_recover_port(struct AHCI_Port_Registers* port) {

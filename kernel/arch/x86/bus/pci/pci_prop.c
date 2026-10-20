@@ -1,28 +1,22 @@
-#include <kernel/arch/x86/io.h>
 #include <kernel/arch/x86/heap.h>
 #include <kernel/arch/x86/bus/pci/pci.h>
 #include <kernel/arch/x86/bus/pci/pci_internal.h>
-#include <kernel/arch/x86/virtual/vmm.h>
-#include <kernel/arch/x86/drivers/ahci/ahci.h>
-#include <kernel/arch/x86/drivers/ata/ata.h>
 
 #include <kernel/kernel.h>
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
-#include <kernel/console/print.h>
 #include <kernel/util/string.h>
 
-uint32_t pci_create_property_node(uint32_t parent_knode, const char* name, const char* value) {
-    uint32_t prop_dir = create_knode(name, parent_knode);
-    uint32_t device_val = create_device(value);
+void* pci_create_property_node(void* parent_knode, const char* name, const char* value) {
+    void* prop_dir = create_knode(name, parent_knode);
+    struct Device* device_val = create_device(value);
     knode_add_reference(prop_dir, device_val);
     knode_set_permissions(prop_dir, KMALLOC_PERMISSION_READ);
     knode_set_permissions(device_val, KMALLOC_PERMISSION_READ);
     return prop_dir;
 }
 
-void pci_export_vfs_properties(uint32_t type_knode, const struct PCIDeviceInfo* dev_info) {
+void pci_export_vfs_properties(void* type_knode, const struct PCIDeviceInfo* dev_info) {
     char buf[16];
     
     // BAR (physical address of the first memory BAR; BARs are mapped on demand)
@@ -56,6 +50,11 @@ void pci_export_vfs_properties(uint32_t type_knode, const struct PCIDeviceInfo* 
     memset(buf, 0, sizeof(buf));
     format_dec8_string(buf, dev_info->subclass);
     pci_create_property_node(type_knode, "subclass", buf);
+    
+    // Programming interface (tells UHCI / EHCI / xHCI apart, for one)
+    memset(buf, 0, sizeof(buf));
+    format_dec8_string(buf, dev_info->prog_if);
+    pci_create_property_node(type_knode, "progif", buf);
     
     // Sub-vendor & Sub-device ID
     if (dev_info->sub_vendor_id != 0x0000 && dev_info->sub_vendor_id != 0xFFFF) {

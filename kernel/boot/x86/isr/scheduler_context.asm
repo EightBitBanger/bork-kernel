@@ -16,8 +16,7 @@ align 4
 ;
 ; FPU/SSE state is saved here, BEFORE any C code runs, into the outgoing
 ; thread's fpu_state, and the incoming thread's is restored right before the
-; switch. (thread_handler_c used to do this at its very end, after code that
-; may itself use XMM registers.)
+; switch. thread_handler_c may itself use XMM registers, so it cannot do this.
 scheduler_context:
     pushad
     push ds

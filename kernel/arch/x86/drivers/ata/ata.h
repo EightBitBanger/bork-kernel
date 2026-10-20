@@ -56,8 +56,8 @@ bool ata_dev_write_bytes(struct AtaDevice* dev, uint32_t address, const uint8_t*
 //
 // Register a detected disk as a generic block device ("ata0", "ata1", ...).
 // This is the only way the rest of the kernel should reach a disk; there is
-// deliberately no "current drive" API any more, because one is how a format
-// of ata1 ended up writing to ata0. Returns the existing device if this disk
+// deliberately no "current drive" API, since shared state like that lets an
+// operation on one disk land on another. Returns the existing device if this disk
 // is already registered, NULL if registration failed.
 
 struct BlockDevice;

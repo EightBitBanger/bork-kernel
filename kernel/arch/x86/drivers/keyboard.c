@@ -1,4 +1,5 @@
 
+
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,10 +16,6 @@
 static volatile char current_character  = 0x00;
 static volatile char last_character     = 0x00;
 static volatile uint8_t isr_key_ready   = 0;
-
-extern char* keyboard_string;
-extern uint8_t keyboard_length;
-extern uint8_t keyboard_length_max;
 
 // Modifier state, left and right keys tracked separately so releasing one
 // while the other is still held doesn't clear the modifier
@@ -81,55 +78,10 @@ void kb_clear_input_state(void) {
     isr_key_ready = 0;
 }
 
-// Console line editor: one decoded key at a time
+// Console line editor: one decoded key at a time. The editing itself
+// (cursor movement, insert, F3, ...) lives in console/console.c.
 void kb_console_key(uint16_t key) {
-    // Extended keys (arrows, Home, ...) arrive as scancode << 8; the console
-    // has no use for them yet
-    if (key == 0 || key > 0xFF)
-        return;
-    
-    char ch = (char)key;
-    
-    // Backspace. The input buffer always loses the character, even when
-    // its cell has scrolled off the top and can no longer be erased (it used
-    // to keep it, so the buffer and the screen disagreed).
-    if (ch == 0x01) {
-        if (keyboard_length == 0) return;
-        
-        keyboard_length--;
-        keyboard_string[keyboard_length] = '\0';
-        
-        // print_backspace() also handles the character in the last column,
-        // where the cursor has not advanced past it
-        print_backspace();
-        return;
-    }
-    
-    // Enter
-    if (ch == 0x02) {
-        print("\n");
-        if (keyboard_length > 0) {
-            console_process_command(keyboard_string);
-            if (display_cursor_get_position() != 0) print("\n");
-        }
-        keyboard_length = 0;
-        keyboard_string[0] = '\0';
-        console_prompt_print();
-        return;
-    }
-    
-    // Print printable characters
-    if (ch < 0x20 || ch == 0x7f) 
-        return;
-    
-    if (keyboard_length < keyboard_length_max - 1) { 
-        keyboard_string[keyboard_length] = ch;
-        keyboard_length++;
-        keyboard_string[keyboard_length] = '\0';
-        
-        char input[2] = {ch, '\0'};
-        print(input);
-    }
+    console_input_key(key);
 }
 
 // Legacy entry point: handles whatever key the IRQ decoded last
@@ -147,12 +99,11 @@ void kb_event_handler(void) {
 
 // Multi-byte sequences are decoded one byte per IRQ. An E0 (extended) or
 // E1 (Pause) prefix is remembered here until the next byte comes in its own
-// IRQ, instead of being waited for. Waiting used to spin up to 20,000
-// status reads with interrupts off: free in QEMU, which has the next byte
-// ready at once, but on hardware the second byte comes about 1 ms later
-// (a real PS/2 keyboard) or only after this IRQ returns (a USB keyboard
-// behind the BIOS's PS/2 emulation, where every status read also traps into
-// SMM). There each arrow key froze the machine and then got lost.
+// IRQ, instead of being waited for. QEMU has the next byte ready at once,
+// but on hardware it comes about 1 ms later (a real PS/2 keyboard) or only
+// after this IRQ returns (a USB keyboard behind the BIOS's PS/2 emulation,
+// where every status read also traps into SMM), so spinning for it here
+// would stall the machine and lose the key.
 static volatile bool    kb_e0_pending = false;
 static volatile uint8_t kb_e1_skip    = 0;
 
@@ -200,8 +151,8 @@ uint16_t kb_getc(void) {
     
     // Fake shifts (E0 2A / E0 AA / E0 36 / E0 B6) wrap the gray navigation
     // keys when NumLock is on. Holding Shift and pressing an arrow sends a
-    // fake Shift *release* first, which used to clear the real Shift state
-    // right before the arrow was processed. They are not real key events.
+    // fake Shift *release* first, which would clear the real Shift state
+    // right before the arrow is processed. They are not real key events.
     if (is_extended && (scancode == 0x2A || scancode == 0x36))
         return 0;
     
@@ -237,15 +188,27 @@ uint16_t kb_getc(void) {
         return 0;
     }
     
+    // Function keys, and the keypad's navigation keys (there is no NumLock
+    // handling, so the keypad always navigates): same codes as the gray keys
+    switch (scancode) {
+        case 0x3B: case 0x3C: case 0x3D: case 0x3E: case 0x3F:   // F1 - F5
+        case 0x40: case 0x41: case 0x42: case 0x43: case 0x44:   // F6 - F10
+        case 0x57: case 0x58:                                    // F11, F12
+        case 0x47: case 0x48: case 0x49:                         // Home, Up, PgUp
+        case 0x4B: case 0x4D:                                    // Left, Right
+        case 0x4F: case 0x50: case 0x51:                         // End, Down, PgDn
+        case 0x53:                                               // Delete
+            current_character = 0x00;
+            return (uint16_t)(scancode << 8);
+    }
+    
     if (scancode < sizeof(scancode_to_ascii_set1)) {
         current_character = kb_shift_down() ? scancode_to_ascii_shifted_set1[scancode]
                                             : scancode_to_ascii_set1[scancode];
     } else {
-        // Keypad / function keys: no character (previously returned a stale one)
+        // Keypad / function keys: no character
         current_character = 0x00;
     }
     
     return (uint16_t)(uint8_t)current_character;
 }
-
-

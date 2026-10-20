@@ -1,3 +1,4 @@
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,6 +10,7 @@
 #include <kernel/malloc.h>
 
 #include <kernel/util/string.h>
+#include <kernel/util/timer.h>
 
 //
 // Text console on the display back buffer
@@ -53,7 +55,7 @@
 uint16_t cursor_position;   // Column
 uint16_t cursor_line;       // Row
 
-// Screen size in pixels (kept global for older code)
+// Screen size in pixels (global: other code reads it directly)
 uint32_t display_width;
 uint32_t display_height;
 
@@ -77,6 +79,20 @@ static uint8_t* row_dirty    = NULL;
 static uint32_t ring_top     = 0;
 static uint32_t update_depth = 0;
 static bool     repaint_all  = true;
+
+// Blinking cursor: an underline bar in the bottom of the cursor cell (the
+// blank pixel row between lines, plus the lowest glyph row)
+#define CONSOLE_CURSOR_BLINK_MS  530
+#define CONSOLE_CURSOR_HEIGHT    (2 * CONSOLE_TEXT_SCALE)
+
+static bool     cursor_enabled    = false;
+static bool     cursor_blink_on   = true;
+static uint64_t cursor_blink_ms   = 0;
+
+// Where the bar is drawn right now, so it can be erased when it moves
+static bool     cursor_drawn      = false;
+static uint16_t cursor_drawn_col  = 0;
+static uint16_t cursor_drawn_line = 0;
 
 static inline uint8_t* ring_row(uint32_t row) {
     return &text_cells[((ring_top + row) % console_height) * console_width];
@@ -105,6 +121,7 @@ static void display_present(void) {
         // whatever was drawn here before the console owned the screen
         gfx_clear(&console_gc, CONSOLE_BACKGROUND);
         memset(shown_cells, ' ', (size_t)console_width * console_height);
+        cursor_drawn = false;   // Wiped with everything else
         mark_all_rows_dirty();
         repaint_all = false;
     }
@@ -131,6 +148,36 @@ static void display_present(void) {
 
         if (!full && first >= 0)
             gfx_display_present_rect(first * gw, (int32_t)row * gh, (last - first + 1) * gw, gh);
+    }
+
+    // Cursor, drawn over the cell text. shown_cells only tracks characters,
+    // so the cell under an old cursor is redrawn from the text to erase it.
+    bool want = cursor_enabled && cursor_blink_on &&
+                cursor_position < console_width && cursor_line < console_height;
+    bool moved = cursor_drawn_col != cursor_position || cursor_drawn_line != cursor_line;
+
+    if (cursor_drawn && (!want || moved)) {
+        uint8_t ch = ring_row(cursor_drawn_line)[cursor_drawn_col];
+        int32_t x = (int32_t)cursor_drawn_col * gw;
+        int32_t y = (int32_t)cursor_drawn_line * gh;
+        gfx_draw_char_opaque(&console_gc, x, y, ch, CONSOLE_FOREGROUND, CONSOLE_BACKGROUND);
+        shown_cells[cursor_drawn_line * console_width + cursor_drawn_col] = ch;
+        if (!full)
+            gfx_display_present_rect(x, y, gw, gh);
+        cursor_drawn = false;
+    }
+
+    if (want) {
+        // Redrawn every present: a glyph drawn into its cell above wipes it
+        int32_t x = (int32_t)cursor_position * gw;
+        int32_t y = (int32_t)cursor_line * gh;
+        gfx_fill_rect(&console_gc, x, y + gh - CONSOLE_CURSOR_HEIGHT, gw, CONSOLE_CURSOR_HEIGHT,
+                      CONSOLE_FOREGROUND);
+        if (!full)
+            gfx_display_present_rect(x, y, gw, gh);
+        cursor_drawn      = true;
+        cursor_drawn_col  = cursor_position;
+        cursor_drawn_line = cursor_line;
     }
 
     if (full)
@@ -187,6 +234,7 @@ void display_init(void) {
     ring_top     = 0;
     update_depth = 0;
     repaint_all  = true;
+    cursor_drawn = false;
     mark_all_rows_dirty();
 }
 
@@ -290,6 +338,32 @@ uint16_t display_cursor_get_position(void) {
 
 uint16_t display_cursor_get_line(void) {
     return cursor_line;
+}
+
+void display_cursor_blink_reset(void) {
+    cursor_blink_on = true;
+    cursor_blink_ms = timer_get_ms();
+}
+
+void display_cursor_enable(bool enable) {
+    if (cursor_enabled == enable)
+        return;
+    cursor_enabled = enable;
+    display_cursor_blink_reset();
+    present_if_idle();
+}
+
+void display_cursor_blink_tick(void) {
+    if (!cursor_enabled)
+        return;
+
+    uint64_t now = timer_get_ms();
+    if (now - cursor_blink_ms < CONSOLE_CURSOR_BLINK_MS)
+        return;
+
+    cursor_blink_ms = now;
+    cursor_blink_on = !cursor_blink_on;
+    present_if_idle();
 }
 
 void console_set_blink_rate(uint8_t rate) {

@@ -1,17 +1,17 @@
 #ifndef DRAWING_2D_H
 #define DRAWING_2D_H
 
-// Legacy drawing API (compatibility layer)
+// Global-state drawing API (compatibility layer)
 //
-// These are the old global-state draw_* calls, now implemented on top of
-// <kernel/gfx/gfx.h>. They draw through one BOUND GfxContext: by default an
-// internal context targeting the display back buffer. Code that renders
-// into its own surface can bind that surface's context (draw_bind_context)
-// so older draw_* callers land there instead.
+// The draw_* calls, implemented on top of <kernel/gfx/gfx.h>. They draw
+// through one BOUND GfxContext: by default an internal context targeting
+// the display back buffer. Code that renders into its own surface can bind
+// that surface's context (draw_bind_context) so draw_* callers land there
+// instead.
 //
 // New code should use a GfxContext directly, on its own surface.
 //
-// Each call keeps its historical blending behavior regardless of the
+// Each call keeps a fixed blending behavior regardless of the
 // bound context's blend mode: *_blend and the gradients alpha-blend,
 // everything else stores colors as given.
 
@@ -22,8 +22,6 @@
 #include <kernel/gfx/gfx.h>
 #include <kernel/gfx/gfx_display.h>
 #include <kernel/boot/x86/multiboot_info.h>
-
-#define COLOR(val) (uint16_t)((val) & 0xFFFF), (uint16_t)((val) >> 16)
 
 struct ClippingPlane {
     int32_t min_x;
@@ -45,15 +43,14 @@ void draw_pixel(int x, int y, uint32_t color);
 
 void draw_set_glyph_scheme(uint32_t foreground, uint32_t background, uint32_t transparent);
 
-// Clip is in target (device) coordinates, as it always was
+// Clip is in target (device) coordinates
 void draw_set_clip_rect(int32_t x, int32_t y, int32_t w, int32_t h);
 void draw_set_origin(int32_t x, int32_t y);
 
 void draw_set_buffer_default(void);
 void draw_set_buffer(uint32_t* target_buffer, uint32_t width, uint32_t height);
 
-// Deprecated boot-time setup; kmain now calls gfx_display_init() directly.
-// Kept so older callers still bring the display up.
+// Deprecated boot-time setup; kmain calls gfx_display_init() directly.
 void draw_set_info(uint32_t mbi);
 void draw_set_frame_front_buffer(uint32_t buffer_ptr);
 void draw_set_frame_back_buffer(uint32_t buffer_ptr);

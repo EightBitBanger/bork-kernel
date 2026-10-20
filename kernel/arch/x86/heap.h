@@ -6,17 +6,17 @@
 //
 // Every memory block comes from malloc() with a small header in front 
 // that carries the attributes the knode/device layer relies 
-// on (flags, type, permissions, size). Addresses are handed 
-// out as uint32_t and KMALLOC_NULL still means "none"
+// on (flags, type, permissions, size). Blocks are handed out as
+// plain pointers and NULL means "none"
 //
 //   [ malloc block ............................................ ]
 //   [ KMallocHeader (32 bytes) ][ payload (size bytes, zeroed)  ]
-//                               ^ address returned by kmalloc()
+//                               ^ pointer returned by kmalloc()
 //
-// kmalloc_is_valid() accepts any uint32_t: it only reports true for an
-// address kmalloc() returned and kfree() has not released yet. Raw malloc()
+// kmalloc_is_valid() accepts any pointer: it only reports true for one
+// kmalloc() returned and kfree() has not released yet. Raw malloc()
 // pointers stored in knodes (mount windows, device contexts) are reported as
-// invalid because they never fell inside the old heap.
+// invalid because they carry no valid header.
 //
 
 #include <stddef.h>
@@ -24,8 +24,6 @@
 #include <stdbool.h>
 
 #include <kernel/malloc.h>
-
-#define KMALLOC_NULL         0xFFFFFFFFUL
 
 #define KMALLOC_FLAG_DIRTY       0x01
 #define KMALLOC_FLAG_MOUNT       0x02
@@ -43,8 +41,8 @@
 #define KMALLOC_TYPE_RAW               0x08
 #define KMALLOC_TYPE_PROCBLOCK         0x10
 
-// size stays the first field: code that reads the header directly
-// (destroy_buffer used to) keeps working.
+// size stays the first field, for code that reads the header directly.
+// 32 bytes on x86; wider pointers make it 48, still a multiple of 16.
 struct __attribute__((aligned(16))) KMallocHeader {
     uint32_t size;          // Payload size requested by the caller
     uint8_t  flags;
@@ -52,43 +50,34 @@ struct __attribute__((aligned(16))) KMallocHeader {
     uint8_t  perm;
     uint8_t  reserved0;
     uint32_t magic;         // KMALLOC_MAGIC while live, 0 once freed
-    uint32_t check;         // payload address ^ KMALLOC_CHECK_KEY
-    uint32_t prev;          // Header address of the previous live block (0 = none)
-    uint32_t next;          // Header address of the next live block (0 = none)
+    uintptr_t check;        // payload address ^ KMALLOC_CHECK_KEY
+    struct KMallocHeader* prev;     // Previous live block (NULL = none)
+    struct KMallocHeader* next;     // Next live block (NULL = none)
     uint32_t reserved1[2];
 };
 
-uint32_t kmalloc(uint32_t size);
-void kfree(uint32_t address);
+void* kmalloc(size_t size);
+void kfree(void* address);
 
-// Walk every live block in allocation order. Pass KMALLOC_NULL to start;
-// returns KMALLOC_NULL after the last one.
-uint32_t kmalloc_next(uint32_t previous_address);
+// Walk every live block in allocation order. Pass NULL to start;
+// returns NULL after the last one.
+void* kmalloc_next(const void* previous_address);
 
-void kmem_write(uint32_t destination, const void* source, uint32_t size);
-void kmem_read(void* destination, uint32_t source, uint32_t size);
-void kmemset(uint32_t destination, unsigned char value, uint32_t size);
+uint8_t kmalloc_get_flags(const void* address);
+void    kmalloc_set_flags(void* address, uint8_t flags);
 
-uint8_t kmalloc_get_flags(uint32_t address);
-void    kmalloc_set_flags(uint32_t address, uint8_t flags);
+uint8_t kmalloc_get_type(const void* address);
+void    kmalloc_set_type(void* address, uint8_t type);
 
-uint8_t kmalloc_get_type(uint32_t address);
-void    kmalloc_set_type(uint32_t address, uint8_t type);
+uint8_t kmalloc_get_permissions(const void* address);
+void    kmalloc_set_permissions(void* address, uint8_t type);
 
-uint8_t kmalloc_get_permissions(uint32_t address);
-void    kmalloc_set_permissions(uint32_t address, uint8_t type);
+uint32_t kmalloc_get_size(const void* address);
 
-uint32_t kmalloc_get_size(uint32_t address);
+bool kmalloc_is_valid(const void* address);
 
-bool kmalloc_is_valid(uint32_t address);
-
-// Live block count and payload bytes (replaces heap_get_total_memory etc.)
+// Live block count and payload bytes
 uint32_t kmalloc_get_block_count(void);
 uint32_t kmalloc_get_bytes_in_use(void);
-
-#define kmemcpy(arg1, source, sz) _Generic((arg1), \
-    uint32_t : kmem_write, \
-    default  : kmem_read \
-)((arg1), (source), (sz))
 
 #endif

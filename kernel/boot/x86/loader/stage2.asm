@@ -1,28 +1,5 @@
 ; =============================================================================
-; stage2.asm - second stage loader
-;
-; Loaded by stage 1 to 0000:8000 with the BIOS boot drive in DL. It replaces
-; what GRUB did for this kernel: everything kmain() reads from the Multiboot
-; info structure is gathered here, then the kernel is entered in exactly the
-; machine state the Multiboot 1 spec promises.
-;
-;   1. Enable the A20 line
-;   2. Collect the memory map (E820, falling back to E801 / 88h) and the
-;      mem_lower / mem_upper counts                          -> flags bit 0, 6
-;   3. Read the boot area (LBA 0 through the end of the kernel file) into a
-;      staging area at 16 MB, and find the kernel's Multiboot header in the
-;      first 8 KB of the kernel file. The boot area itself is passed on as
-;      Multiboot module 0 ("bootarea"), so a running kernel can install
-;      itself onto another disk                              -> flags bit 3
-;   4. Place the kernel: every ELF PT_LOAD segment at its physical address
-;      (or the a.out-kludge fields, if header flag bit 16 is set)
-;   5. Pick and set a VBE linear framebuffer mode matching the header's
-;      requested width / height / depth (1600x900x32 for this kernel), and
-;      fill in the framebuffer fields                        -> flags bit 11, 12
-;   6. Enter 32-bit protected mode: EAX = 0x2BADB002, EBX = &multiboot_info,
-;      flat CS/DS/ES/FS/GS/SS, paging off, interrupts off, A20 on
-;
-; Built with:  nasm -f bin -DKERNEL_LBA=<lba> -DKERNEL_SECTORS=<n> stage2.asm
+; stage2.asm - second stage loader (Silent on success)
 ; =============================================================================
 
 [bits 16]
@@ -108,9 +85,6 @@ stage2_entry:
     cld
 
     mov     [boot_drive], dl
-
-    mov     si, msg_banner
-    call    print
 
     ; Clear the info structure and the memory map
     mov     di, MBI
@@ -211,7 +185,6 @@ fatal:
 ; A20
 ; -----------------------------------------------------------------------------
 
-; CF clear if A20 is enabled. Compares 0000:0500 with FFFF:0510 (1 MB higher).
 check_a20:
     pusha
     push    ds
@@ -287,11 +260,12 @@ enable_a20:
     jnc     .done
 
     mov     si, msg_a20
+    jmp     .fail
+.fail:
     jmp     fatal
 .done:
     ret
 
-; Some chipsets take a moment to switch; poll for a while
 a20_settle:
     mov     cx, 0xFFFF
 .poll:
@@ -302,7 +276,6 @@ a20_settle:
 .ok:
     ret
 
-; Timeouts keep machines without an 8042 (USB-only legacy) from hanging here
 kbc_wait_write:
     push    cx
     mov     cx, 0xFFFF
@@ -331,13 +304,10 @@ kbc_wait_read:
 ; Memory detection -> mem_lower, mem_upper, mmap
 ; -----------------------------------------------------------------------------
 detect_memory:
-    ; Conventional memory (KB below 640 KB)
     int     0x12
     movzx   eax, ax
     mov     [MBI + MBI_MEM_LOWER], eax
 
-    ; E820. Each Multiboot entry is [size=20][base:8][length:8][type:4]; the
-    ; BIOS writes the 20 bytes after the size field directly.
     mov     word [mmap_count], 0
     xor     ebx, ebx
     mov     di, MMAP
@@ -349,12 +319,12 @@ detect_memory:
     mov     ecx, 20
     int     0x15
     pop     di
-    jc      .e820_done              ; Unsupported, or past the last entry
+    jc      .e820_done
     cmp     eax, 0x534D4150
     jne     .e820_done
     cmp     ecx, 20
     jb      .e820_skip
-    mov     eax, [di + 12]          ; Ignore zero-length entries
+    mov     eax, [di + 12]
     or      eax, [di + 16]
     jz      .e820_skip
 
@@ -370,19 +340,18 @@ detect_memory:
     cmp     word [mmap_count], 0
     je      .no_e820
 
-    ; mem_upper: the usable run that contains 1 MB, in KB above 1 MB
     mov     cx, [mmap_count]
     mov     si, MMAP
 .upper_scan:
-    cmp     dword [si + 20], 1      ; Available RAM
+    cmp     dword [si + 20], 1
     jne     .upper_next
-    cmp     dword [si + 8], 0       ; base < 4 GB
+    cmp     dword [si + 8], 0
     jne     .upper_next
-    mov     eax, [si + 4]           ; base
+    mov     eax, [si + 4]
     cmp     eax, 0x100000
     ja      .upper_next
     mov     edx, eax
-    add     edx, [si + 12]          ; base + length
+    add     edx, [si + 12]
     jc      .upper_cap
     cmp     dword [si + 16], 0
     je      .upper_have
@@ -399,12 +368,10 @@ detect_memory:
     add     si, 24
     loop    .upper_scan
 
-    ; E820 worked but no run starts at or below 1 MB: get the count from E801
     call    upper_from_bios
     jmp     .mmap_publish
 
 .no_e820:
-    ; No E820: build a two-entry map from INT 12h and E801 / 88h
     call    upper_from_bios
     mov     di, MMAP
     mov     dword [di + 0], 20
@@ -433,22 +400,21 @@ detect_memory:
     mov     dword [MBI + MBI_MMAP_ADDR], MMAP
     ret
 
-; mem_upper from INT 15h E801 (or 88h on very old machines)
 upper_from_bios:
     xor     cx, cx
     xor     dx, dx
     mov     ax, 0xE801
     int     0x15
     jc      .e88
-    test    cx, cx                  ; Some BIOSes only fill AX/BX
+    test    cx, cx
     jnz     .have
     test    dx, dx
     jnz     .have
     mov     cx, ax
     mov     dx, bx
 .have:
-    movzx   eax, cx                 ; KB between 1 MB and 16 MB
-    movzx   edx, dx                 ; 64 KB blocks above 16 MB
+    movzx   eax, cx
+    movzx   edx, dx
     shl     edx, 6
     add     eax, edx
     mov     [MBI + MBI_MEM_UPPER], eax
@@ -464,11 +430,10 @@ upper_from_bios:
     mov     si, msg_memory
     jmp     fatal
 
-; The kernel file is staged at 16 MB; make sure there is RAM there
 check_staging_fits:
     mov     eax, [MBI + MBI_MEM_UPPER]
     shl     eax, 10
-    add     eax, 0x100000           ; End of usable memory above 1 MB
+    add     eax, 0x100000
     cmp     eax, STAGING + BOOT_AREA_BYTES
     jae     .ok
     mov     si, msg_low_memory
@@ -480,11 +445,6 @@ check_staging_fits:
 ; Read the kernel file into the staging area
 ; -----------------------------------------------------------------------------
 load_kernel_file:
-    mov     si, msg_loading
-    call    print
-
-    ; The whole boot area, not just the kernel: the kernel gets it as a
-    ; Multiboot module, which is what "boot install" writes to a new disk
     mov     dword [read_lba], 0
     mov     dword [read_left], KERNEL_LBA + KERNEL_SECTORS
     mov     dword [read_dest], STAGING
@@ -516,7 +476,7 @@ load_kernel_file:
     jnc     .read_ok
 
     push    ax
-    xor     ah, ah                  ; Reset and retry
+    xor     ah, ah
     mov     dl, [boot_drive]
     int     0x13
     pop     ax
@@ -534,7 +494,7 @@ load_kernel_file:
     jmp     fatal
 
 .read_ok:
-    cmp     dword [chunk_lba], KERNEL_LBA   ; First chunk of the kernel file
+    cmp     dword [chunk_lba], KERNEL_LBA
     jne     .copy
     call    find_multiboot_header
 
@@ -551,16 +511,10 @@ load_kernel_file:
     add     [read_lba], eax
     sub     [read_left], eax
 
-    mov     si, msg_dot
-    call    print
     jmp     .chunk
 .done:
-    mov     si, msg_newline
-    call    print
     ret
 
-; Scan the first chunk (in the bounce buffer) for the Multiboot header and
-; record what it asks for: video mode and whether to use the a.out kludge.
 find_multiboot_header:
     push    es
     mov     ax, BOUNCE_SEG
@@ -584,17 +538,17 @@ find_multiboot_header:
 .found:
     movzx   eax, di
     mov     [mb_header_offset], eax
-    mov     eax, [es:di + 4]        ; Header flags
+    mov     eax, [es:di + 4]
 
-    test    eax, (1 << 16)          ; a.out kludge: use the address fields
+    test    eax, (1 << 16)
     jz      .no_aout
     mov     byte [use_aout], 1
 .no_aout:
-    test    eax, (1 << 2)           ; Video mode requested
+    test    eax, (1 << 2)
     jz      .done
-    cmp     dword [es:di + 32], 0   ; mode_type 0 = linear graphics
+    cmp     dword [es:di + 32], 0
     jne     .done
-    mov     eax, [es:di + 36]       ; 0 in any field = no preference
+    mov     eax, [es:di + 36]
     test    eax, eax
     jz      .no_w
     mov     [req_width], ax
@@ -617,7 +571,7 @@ find_multiboot_header:
 ; -----------------------------------------------------------------------------
 set_video_mode:
     mov     di, VBE_CTRL
-    mov     dword [di], 'VBE2'      ; "VBE2": ask for the VBE 2.0+ block
+    mov     dword [di], 'VBE2'
     mov     ax, 0x4F00
     int     0x10
     cmp     ax, 0x004F
@@ -627,7 +581,7 @@ set_video_mode:
 
     mov     ax, [VBE_CTRL + 0x04]
     mov     [vbe_version], ax
-    mov     ax, [VBE_CTRL + 0x0E]   ; VideoModePtr (offset, segment)
+    mov     ax, [VBE_CTRL + 0x0E]
     mov     [mode_list_off], ax
     mov     ax, [VBE_CTRL + 0x10]
     mov     [mode_list_seg], ax
@@ -656,7 +610,7 @@ set_video_mode:
     and     ax, VMI_ATTR_NEEDED
     cmp     ax, VMI_ATTR_NEEDED
     jne     .mode_next
-    cmp     byte [VBE_MODE + VMI_MODEL], 6 ; Direct color
+    cmp     byte [VBE_MODE + VMI_MODEL], 6
     jne     .mode_next
     mov     al, [VBE_MODE + VMI_BPP]
     cmp     al, [req_bpp]
@@ -664,8 +618,6 @@ set_video_mode:
     cmp     dword [VBE_MODE + VMI_PHYS_BASE], 0
     je      .mode_next
 
-    ; Score: exact match beats everything, then the largest mode that fits
-    ; inside the request, then anything at all (larger than requested)
     mov     ax, [VBE_MODE + VMI_WIDTH]
     mov     bx, [VBE_MODE + VMI_HEIGHT]
     cmp     ax, [req_width]
@@ -683,7 +635,7 @@ set_video_mode:
     movzx   ebx, bx
     imul    eax, ebx
     mov     edx, eax
-    add     edx, 1                  ; Keep above the "too big" score
+    add     edx, 1
     jmp     .score
 .too_big:
     mov     edx, 1
@@ -702,7 +654,6 @@ set_video_mode:
     jmp     fatal
 
 .have_mode:
-    ; Fetch the chosen mode's info again (the buffer holds the last one tried)
     mov     ax, 0x4F01
     mov     cx, [best_mode]
     mov     di, VBE_MODE
@@ -712,12 +663,11 @@ set_video_mode:
 
     mov     ax, 0x4F02
     mov     bx, [best_mode]
-    or      bx, 0x4000              ; Linear framebuffer
+    or      bx, 0x4000
     int     0x10
     cmp     ax, 0x004F
     jne     .set_failed
 
-    ; Framebuffer fields
     mov     eax, [VBE_MODE + VMI_PHYS_BASE]
     mov     [MBI + MBI_FB_ADDR], eax
     mov     dword [MBI + MBI_FB_ADDR + 4], 0
@@ -740,23 +690,21 @@ set_video_mode:
     mov     [MBI + MBI_FB_HEIGHT], eax
     mov     al, [VBE_MODE + VMI_BPP]
     mov     [MBI + MBI_FB_BPP], al
-    mov     byte [MBI + MBI_FB_TYPE], 1     ; Direct RGB
+    mov     byte [MBI + MBI_FB_TYPE], 1
 
-    ; VBE stores (size, position) pairs; Multiboot wants (position, size)
     mov     al, [si + 0]
-    mov     [MBI + MBI_FB_COLOR + 1], al    ; red size
+    mov     [MBI + MBI_FB_COLOR + 1], al
     mov     al, [si + 1]
-    mov     [MBI + MBI_FB_COLOR + 0], al    ; red position
+    mov     [MBI + MBI_FB_COLOR + 0], al
     mov     al, [si + 2]
-    mov     [MBI + MBI_FB_COLOR + 3], al    ; green size
+    mov     [MBI + MBI_FB_COLOR + 3], al
     mov     al, [si + 3]
-    mov     [MBI + MBI_FB_COLOR + 2], al    ; green position
+    mov     [MBI + MBI_FB_COLOR + 2], al
     mov     al, [si + 4]
-    mov     [MBI + MBI_FB_COLOR + 5], al    ; blue size
+    mov     [MBI + MBI_FB_COLOR + 5], al
     mov     al, [si + 5]
-    mov     [MBI + MBI_FB_COLOR + 4], al    ; blue position
+    mov     [MBI + MBI_FB_COLOR + 4], al
 
-    ; VBE fields (bit 11)
     mov     dword [MBI + MBI_VBE_CTRL], VBE_CTRL
     mov     dword [MBI + MBI_VBE_MODE_IN], VBE_MODE
     mov     ax, [best_mode]
@@ -773,14 +721,10 @@ set_video_mode:
 ; -----------------------------------------------------------------------------
 ; Protected mode
 ; -----------------------------------------------------------------------------
-
-; Call the 32-bit function at [pm_target] with ESI, EDI, ECX passed through,
-; and come back to real mode. Returns the function's EAX in EAX; every other
-; register is preserved. Interrupts are off for the duration.
 pm_call:
     pushad
     cli
-    movzx   esp, sp                 ; The 32-bit stack uses all of ESP
+    movzx   esp, sp
     lgdt    [gdt_descriptor]
     mov     eax, cr0
     or      al, 1
@@ -802,7 +746,7 @@ pm_call:
 
 [bits 16]
 .pm16:
-    mov     ax, GDT_DATA16          ; 64 KB limits before going back to real mode
+    mov     ax, GDT_DATA16
     mov     ds, ax
     mov     es, ax
     mov     fs, ax
@@ -825,7 +769,6 @@ pm_call:
     mov     eax, [pm_result]
     ret
 
-; Final switch: never returns
 enter_kernel:
     cli
     lgdt    [gdt_descriptor]
@@ -842,62 +785,58 @@ enter_kernel:
     mov     fs, ax
     mov     gs, ax
     mov     ss, ax
-    mov     esp, 0x7C00             ; The spec leaves ESP undefined; keep it sane
+    mov     esp, 0x7C00
     cld
 
     mov     eax, 0x2BADB002
     mov     ebx, MBI
     jmp     [kernel_entry]
 
-; ESI -> EDI, ECX bytes (multiple of 4)
 copy32:
     shr     ecx, 2
     rep     movsd
     ret
 
-; Place the staged kernel at its load address. EAX = 0 on success, otherwise
-; an index into place_errors.
 place_kernel32:
     cmp     byte [use_aout], 0
     jne     .aout
 
-    ; ELF32, little endian, i386, executable
     mov     esi, KERNEL_IMAGE
-    cmp     dword [esi], 0x464C457F         ; "\x7FELF"
+    cmp     dword [esi], 0x464C457F
     jne     .not_elf
-    cmp     word [esi + 4], 0x0101          ; ELFCLASS32, ELFDATA2LSB
+    cmp     word [esi + 4], 0x0101
     jne     .not_elf
-    cmp     word [esi + 18], 3              ; EM_386
+    cmp     word [esi + 18], 3
     jne     .not_elf
 
-    mov     ebx, [esi + 28]                 ; e_phoff
+    mov     ebx, [esi + 28]
     cmp     ebx, KERNEL_SECTORS * 512
     jae     .bad
     add     ebx, esi
-    movzx   ecx, word [esi + 44]            ; e_phnum
-    movzx   edx, word [esi + 42]            ; e_phentsize
+    movzx   ecx, word [esi + 44]
+    movzx   edx, word [esi + 42]
     test    ecx, ecx
     jz      .nothing
-    xor     ebp, ebp                        ; Segments loaded
+    xor     ebp, ebp
 
 .segment:
-    cmp     dword [ebx], 1                  ; PT_LOAD
+    cmp     dword [ebx], 1
     jne     .segment_next
-    mov     eax, [ebx + 20]                 ; p_memsz
+    mov     eax, [ebx + 20]
     test    eax, eax
     jz      .segment_next
-    cmp     [ebx + 16], eax                 ; p_filesz <= p_memsz
+    cmp     [ebx + 16], eax
     ja      .bad
 
-    mov     edi, [ebx + 12]                 ; p_paddr
-    cmp     edi, 0x100000                   ; Below 1 MB is the loader's
+    mov     edi, [ebx + 12]
+    cmp     edi, 0x100000
     jb      .range
     add     eax, edi
     jc      .range
-    cmp     eax, STAGING                    ; Must not run into the staged file
+    cmp     eax, STAGING
     ja      .range
 
-    mov     eax, [ebx + 4]                  ; p_offset + p_filesz inside the file
+    mov     eax, [ebx + 4]
     add     eax, [ebx + 16]
     jc      .bad
     cmp     eax, KERNEL_SECTORS * 512
@@ -908,7 +847,7 @@ place_kernel32:
     add     esi, [ebx + 4]
     mov     ecx, [ebx + 16]
     rep     movsb
-    mov     ecx, [ebx + 20]                 ; Zero the rest (.bss)
+    mov     ecx, [ebx + 20]
     sub     ecx, [ebx + 16]
     xor     eax, eax
     rep     stosb
@@ -922,27 +861,26 @@ place_kernel32:
 
     test    ebp, ebp
     jz      .nothing
-    mov     eax, [KERNEL_IMAGE + 24]        ; e_entry
+    mov     eax, [KERNEL_IMAGE + 24]
     mov     [kernel_entry], eax
     xor     eax, eax
     ret
 
-    ; a.out kludge (header flag bit 16): the header says where the image goes
 .aout:
     mov     ebx, KERNEL_IMAGE
     add     ebx, [mb_header_offset]
-    mov     eax, [ebx + 12]                 ; header_addr - load_addr is how far
-    sub     eax, [ebx + 16]                 ; into the image the header sits
+    mov     eax, [ebx + 12]
+    sub     eax, [ebx + 16]
     jb      .bad
     mov     esi, [mb_header_offset]
-    sub     esi, eax                        ; File offset of load_addr
+    sub     esi, eax
     jb      .bad
 
-    mov     edi, [ebx + 16]                 ; load_addr
+    mov     edi, [ebx + 16]
     cmp     edi, 0x100000
     jb      .range
 
-    mov     ecx, [ebx + 20]                 ; load_end_addr (0 = to end of file)
+    mov     ecx, [ebx + 20]
     test    ecx, ecx
     jz      .aout_to_eof
     sub     ecx, edi
@@ -957,7 +895,7 @@ place_kernel32:
     cmp     eax, KERNEL_SECTORS * 512
     ja      .bad
 
-    mov     eax, edi                        ; End of image, and of .bss
+    mov     eax, edi
     add     eax, ecx
     cmp     dword [ebx + 24], 0
     je      .aout_end
@@ -970,12 +908,12 @@ place_kernel32:
 
     add     esi, KERNEL_IMAGE
     rep     movsb
-    mov     ecx, eax                        ; Zero up to bss_end_addr
+    mov     ecx, eax
     sub     ecx, edi
     xor     eax, eax
     rep     stosb
 
-    mov     eax, [ebx + 28]                 ; entry_addr
+    mov     eax, [ebx + 28]
     mov     [kernel_entry], eax
     xor     eax, eax
     ret
@@ -1062,10 +1000,6 @@ place_errors:
 loader_name     db "stage2 boot loader", 0
 module_name     db "bootarea", 0
 
-msg_banner      db "stage2: loading kernel", 13, 10, 0
-msg_loading     db "reading", 0
-msg_dot         db ".", 0
-msg_newline     db 13, 10, 0
 msg_error       db 13, 10, "stage2 error: ", 0
 msg_a20         db "could not enable the A20 line", 0
 msg_memory      db "BIOS reports no memory map", 0
@@ -1080,10 +1014,10 @@ msg_no_segments db "kernel has no loadable segments", 0
 msg_no_vbe      db "no VESA BIOS extensions (VBE 2.0+)", 0
 msg_no_mode     db "no linear framebuffer mode with the requested depth", 0
 msg_set_mode    db "VBE refused to set the chosen mode", 0
+msg_newline     db 13, 10, 0
 
 stage2_end:
 
-; The header scan runs on the chunk that starts at KERNEL_LBA
 %if KERNEL_LBA % CHUNK_SECTORS != 0
   %error "KERNEL_LBA must be a multiple of CHUNK_SECTORS"
 %endif

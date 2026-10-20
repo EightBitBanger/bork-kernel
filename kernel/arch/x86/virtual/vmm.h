@@ -32,10 +32,9 @@
 // vmm_user_map_page() (shared memory, MMIO) never carry it.
 #define VM_OWNED         0x200U
 
-// Write-combining needs the PAT. Without PAT reprogramming, PWT|PCD selects
-// UC (uncached), which is what this macro used to expand to. vmm_init() now
-// reprograms PAT entry 1 (PWT=1, PCD=0) from WT to WC, and this macro yields
-// the PTE flags that select it. On CPUs without PAT it falls back to UC.
+// Write-combining needs the PAT. vmm_init() reprograms PAT entry 1
+// (PWT=1, PCD=0) from WT to WC, and this macro yields the PTE flags that
+// select it. On CPUs without PAT it falls back to UC (PWT|PCD).
 uint32_t vmm_get_write_combining_flags(void);
 bool     vmm_has_write_combining(void);
 

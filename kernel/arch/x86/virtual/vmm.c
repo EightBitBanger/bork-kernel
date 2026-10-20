@@ -41,8 +41,8 @@ static uint8_t virt_bitmap[VIRT_BITMAP_SIZE];
 
 static int find_contiguous_bits(uint8_t* bitmap, size_t bitmap_size, size_t num_bits);
 
-// The kernel page directory. Page tables are no longer reserved here: each
-// one is taken from the PMM the first time its 4 MB range is mapped.
+// The kernel page directory. Page tables are not reserved here: each one is
+// taken from the PMM the first time its 4 MB range is mapped.
 uint32_t page_directory[VM_PAGE_DIR_SIZE] __attribute__((aligned(PAGE_SIZE)));
 
 // False until vmm_init() turns paging on; until then tables are reached at
@@ -292,10 +292,12 @@ void vmm_init(struct MultibootInfo* mbi, uint32_t identity_map_size) {
 void* vmm_alloc_pages(size_t num_pages) {
     uint32_t irq_flags = irq_save();
 
+    // Out of kernel address space or frames: NULL, never a panic. Callers
+    // report it (SYS_ENOMEM from a syscall), so a process that uses up memory
+    // cannot take the kernel down with it.
     int virt_start_page = find_contiguous_bits(virt_bitmap, VIRT_BITMAP_SIZE, num_pages);
     if (virt_start_page == -1) {
         irq_restore(irq_flags);
-        kernel_crashout(0x00, 0x00000000, 0x03, "Out of physical memory");
         return NULL;
     }
 
@@ -313,8 +315,6 @@ void* vmm_alloc_pages(size_t num_pages) {
                 pmm_free_frame(phys_frame);
             vmm_free_pages((void*)start_vaddr, i);
             irq_restore(irq_flags);
-
-            kernel_crashout(0x00, 0x00000000, 0x03, "Out of physical memory");
             return NULL;
         }
 
@@ -681,7 +681,7 @@ bool vmm_user_alloc(AddressSpace* space, uint32_t vaddr, size_t num_pages, uint3
     size_t done = 0;
     for (; done < num_pages; done++) {
         uint32_t page  = vaddr + (uint32_t)done * PAGE_SIZE;
-        uint32_t frame = pmm_alloc_frame();
+        uint32_t frame = pmm_alloc_user_frame();     // Leaves the kernel reserve alone
         if (frame == PMM_NO_FRAME)
             break;
 

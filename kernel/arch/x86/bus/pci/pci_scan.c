@@ -1,16 +1,9 @@
-#include <kernel/arch/x86/io.h>
-#include <kernel/arch/x86/heap.h>
 #include <kernel/arch/x86/bus/pci/pci.h>
 #include <kernel/arch/x86/bus/pci/pci_internal.h>
-#include <kernel/arch/x86/virtual/vmm.h>
-#include <kernel/arch/x86/drivers/ahci/ahci.h>
-#include <kernel/arch/x86/drivers/ata/ata.h>
 
 #include <kernel/kernel.h>
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
-#include <kernel/console/print.h>
 #include <kernel/util/string.h>
 
 // One bit per bus number, so a misconfigured bridge (secondary bus pointing
@@ -47,56 +40,54 @@ static uint64_t pci_first_memory_bar(uint8_t bus, uint8_t dev, uint8_t func) {
     return 0;
 }
 
-static void pci_scan_function(uint8_t bus, uint8_t dev, uint8_t func, uint32_t pci_dir, uint32_t mnt_dir, struct LocalPaths* fs_paths, uint8_t depth) {
-    uint32_t id_reg = pci_config_read(bus, dev, func, 0);
-    uint16_t v_id = (uint16_t)(id_reg & 0xFFFF);
-    uint16_t d_id = (uint16_t)((id_reg >> 16) & 0xFFFF);
-
-    if (v_id == 0xFFFF || v_id == 0x0000)
-        return;
+// Fill in everything a class driver or the property nodes need.
+// Returns false if no function answers at this address.
+static bool pci_read_device_info(uint8_t bus, uint8_t dev, uint8_t func, struct PCIDeviceInfo* info) {
+    uint32_t id_reg = pci_config_read(bus, dev, func, 0x00);
+    uint16_t vendor = (uint16_t)(id_reg & 0xFFFF);
+    if (vendor == 0xFFFF || vendor == 0x0000)
+        return false;
 
     uint32_t class_reg = pci_config_read(bus, dev, func, 0x08);
-    uint8_t class_code = (uint8_t)((class_reg >> 24) & 0xFF);
-    uint8_t subclass   = (uint8_t)((class_reg >> 16) & 0xFF);
-    uint8_t prog_if    = (uint8_t)((class_reg >> 8) & 0xFF);
-
     uint32_t sub_reg   = pci_config_read(bus, dev, func, 0x2C);
-    uint16_t sub_v_id  = (uint16_t)(sub_reg & 0xFFFF);
-    uint16_t sub_id    = (uint16_t)((sub_reg >> 16) & 0xFFFF);
-
     uint32_t intr_reg  = pci_config_read(bus, dev, func, 0x3C);
-    uint8_t irq_line   = (uint8_t)(intr_reg & 0xFF);
-    uint8_t irq_pin    = (uint8_t)((intr_reg >> 8) & 0xFF);
+
+    memset(info, 0, sizeof(*info));
+    info->bus           = bus;
+    info->dev           = dev;
+    info->func          = func;
+    info->vendor_id     = vendor;
+    info->device_id     = (uint16_t)(id_reg >> 16);
+    info->class_code    = (uint8_t)(class_reg >> 24);
+    info->subclass      = (uint8_t)(class_reg >> 16);
+    info->prog_if       = (uint8_t)(class_reg >> 8);
+    info->sub_vendor_id = (uint16_t)(sub_reg & 0xFFFF);
+    info->sub_device_id = (uint16_t)(sub_reg >> 16);
+    info->irq_line      = (uint8_t)(intr_reg & 0xFF);
+    info->irq_pin       = (uint8_t)(intr_reg >> 8);
+    info->bar_physical_address = pci_first_memory_bar(bus, dev, func);
+    return true;
+}
+
+static void pci_scan_function(uint8_t bus, uint8_t dev, uint8_t func, void* pci_dir, struct PCIScanContext* ctx, uint8_t depth) {
+    struct PCIDeviceInfo info;
+    if (!pci_read_device_info(bus, dev, func, &info))
+        return;
 
     char device_node_name[16];
     format_device_string(device_node_name, dev, func);
 
-    uint32_t device_knode = create_knode(device_node_name, pci_dir);
-    const char* type_name = pci_get_class_name(class_code);
-    uint32_t type_knode = create_knode(type_name, device_knode);
+    void* device_knode = create_knode(device_node_name, pci_dir);
+    void* type_knode = create_knode(pci_get_class_name(info.class_code), device_knode);
 
     knode_set_permissions(device_knode, KMALLOC_PERMISSION_READ);
     knode_set_permissions(type_knode, KMALLOC_PERMISSION_READ);
 
-    if (class_code == 0x01) {
-        pci_handle_storage_device(bus, dev, func, subclass, prog_if, mnt_dir, fs_paths);
-    }
+    pci_probe_driver(&info, ctx);
+    pci_export_vfs_properties(type_knode, &info);
 
-    struct PCIDeviceInfo dev_info = {
-        .vendor_id = v_id,
-        .device_id = d_id,
-        .class_code = class_code,
-        .subclass = subclass,
-        .sub_vendor_id = sub_v_id,
-        .sub_device_id = sub_id,
-        .irq_line = irq_line,
-        .irq_pin = irq_pin,
-        .bar_physical_address = pci_first_memory_bar(bus, dev, func)
-    };
-    pci_export_vfs_properties(type_knode, &dev_info);
-
-    // Handle PCI-to-PCI Bridges
-    if (class_code == 0x06 && subclass == 0x04) {
+    // PCI-to-PCI bridges: scan the bus behind them
+    if (info.class_code == PCI_CLASS_BRIDGE && info.subclass == PCI_SUBCLASS_PCI_BRIDGE) {
         uint32_t bus_reg = pci_config_read(bus, dev, func, 0x18);
         uint8_t secondary_bus = (uint8_t)((bus_reg >> 8) & 0xFF);
 
@@ -107,16 +98,16 @@ static void pci_scan_function(uint8_t bus, uint8_t dev, uint8_t func, uint32_t p
         char sub_bus_name[16];
         format_bus_string(sub_bus_name, secondary_bus);
 
-        uint32_t secondary_bus_directory = create_knode(sub_bus_name, type_knode);
+        void* secondary_bus_directory = create_knode(sub_bus_name, type_knode);
         knode_set_permissions(secondary_bus_directory, KMALLOC_PERMISSION_READ);
 
-        // Same fs_paths object all the way down, so storage found behind the
-        // bridge is not overwritten when the parent scan finishes.
-        pci_scan_bus(secondary_bus, secondary_bus_directory, mnt_dir, fs_paths, (uint8_t)(depth + 1));
+        // Same context all the way down, so storage found behind the bridge
+        // is not overwritten when the parent scan finishes
+        pci_scan_bus(secondary_bus, secondary_bus_directory, ctx, (uint8_t)(depth + 1));
     }
 }
 
-void pci_scan_bus(uint8_t bus_number, uint32_t pci_directory, uint32_t mnt_directory, struct LocalPaths* fs_paths, uint8_t depth) {
+void pci_scan_bus(uint8_t bus_number, void* pci_directory, struct PCIScanContext* ctx, uint8_t depth) {
     if (!pci_bus_claim(bus_number))
         return;
 
@@ -132,7 +123,7 @@ void pci_scan_bus(uint8_t bus_number, uint32_t pci_directory, uint32_t mnt_direc
         uint8_t max_functions = (header_type & 0x80) ? 8 : 1;
 
         for (uint8_t func = 0; func < max_functions; func++) {
-            pci_scan_function(bus_number, dev, func, pci_directory, mnt_directory, fs_paths, depth);
+            pci_scan_function(bus_number, dev, func, pci_directory, ctx, depth);
         }
     }
 }
