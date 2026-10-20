@@ -14,6 +14,12 @@ static void chkdsk_print_u32(uint32_t value) {
     print(text);
 }
 
+static void chkdsk_print_u64(uint64_t value) {
+    char text[21];
+    u64tos(value, text);
+    print(text);
+}
+
 // chkdsk [path]   geometry of the device holding path (default: the
 //                 working directory)
 int console_cmd_chkdsk(int arg_count, char** args) {
@@ -29,7 +35,7 @@ int console_cmd_chkdsk(int arg_count, char** args) {
     
     print(info.device);
     print(": ");
-    chkdsk_print_u32((uint32_t)(info.device_sectors * info.device_sector_size / (1024ULL * 1024ULL)));
+    chkdsk_print_u64(info.device_sectors * info.device_sector_size / (1024ULL * 1024ULL));
     print(" MB, ");
     chkdsk_print_u32(info.device_sector_size);
     print("B sectors\n");
@@ -42,10 +48,10 @@ int console_cmd_chkdsk(int arg_count, char** args) {
     chkdsk_print_u32(info.block_size);
     print("B per block\n");
     
-    chkdsk_print_u32(info.total_size / info.block_size);
+    chkdsk_print_u64(info.total_size / info.block_size);
     print(" blocks\n");
     
-    chkdsk_print_u32(info.total_size);
+    chkdsk_print_u64(info.total_size);
     print("B total\n\n");
     return 0;
 }

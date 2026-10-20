@@ -3,6 +3,7 @@
 #define DISPLAY_IO_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 void display_init(void);
 
@@ -26,6 +27,18 @@ void display_cursor_set_position(uint16_t position);
 void display_cursor_set_line(uint16_t line);
 uint16_t display_cursor_get_position(void);
 uint16_t display_cursor_get_line(void);
+
+// Visible (blinking) cursor at the cursor cell. Off by default; the console
+// turns it on at the prompt and off while a command runs.
+void display_cursor_enable(bool enable);
+
+// Toggle the blink if its time has come. Call it every few tens of ms from
+// the thread that owns the console.
+void display_cursor_blink_tick(void);
+
+// Show the cursor solid now and restart the blink (call after each key, so
+// the cursor never vanishes while typing)
+void display_cursor_blink_reset(void);
 
 // Blank the whole screen (the cursor does not move)
 void display_clear(void);

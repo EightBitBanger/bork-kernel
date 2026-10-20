@@ -1,6 +1,9 @@
 #ifndef CONSOLE_CMD_BOOT_H
 #define CONSOLE_CMD_BOOT_H
 
+#define ADD_IMAGE_LIB
+#define ADD_BINARY_LIB
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -17,11 +20,8 @@
 
 #include <kernel/resources/resource_manager.h>
 
-//#include <kernel/console/commands/boot_dropper.h>
-
-#ifdef ADD_IMAGE_LIB
-#include <kernel/dwm/dwm.h>   // dwm_builtin_images, dwm_get_image_directory
-#endif
+// Compiled-in assets ("boot install" / "boot repair" write these to disk)
+#include <kernel/console/commands/boot_assets.h>
 
 // Initial system setup / installation
 //
@@ -62,10 +62,11 @@ static uint8_t boot_mbr[MBR_SECTOR_SIZE] __attribute__((aligned(16)));
 // System folders, relative to a device root. Parents come before children.
 static const char* const boot_system_directories[] = {
     "/bin",
-    "/bin/test",        // Built-in test programs land here
     "/sys",
-    "/sys/images",
     "/usr",
+    
+    "/sys/images",
+    "/sys/fonts",
     "/usr/desktop"
 };
 
@@ -162,7 +163,11 @@ typedef struct {
     uint32_t failed;
 } BootExportStats;
 
-// Write the compiled-in images to <image_dir>/<name>.
+// Write the compiled-in sprite images to <image_dir>/<name>.
+//
+// `image_dir` is "<root>/sys/images". The sprite table and the drop itself
+// live in boot_assets.h; this adapts its BootAssetStats to BootExportStats
+// and pulls the root back out of the image directory it was handed.
 //
 // Without `overwrite`, files that already exist are left alone, so an image
 // edited on disk is never replaced by the built-in copy. With it, existing
@@ -174,79 +179,54 @@ static void boot_export_images_to(const char* image_dir, bool overwrite, BootExp
         stats = &local;
 
 #ifdef ADD_IMAGE_LIB
-    if (!vfs_directory_check(image_dir) && !vfs_mkdir(image_dir)) {
-        stats->failed += dwm_builtin_image_count;
+    // image_dir is "<root>/sys/images"; strip the suffix to recover <root>,
+    // which is what boot_drop_sprite_assets wants (it re-appends /sys/images).
+    char root[192];
+    size_t dir_len = strlen(image_dir);
+    const char* suffix = "/sys/images";
+    size_t suffix_len = strlen(suffix);
+
+    if (dir_len >= suffix_len &&
+        strcmp(image_dir + dir_len - suffix_len, suffix) == 0 &&
+        dir_len - suffix_len < sizeof(root)) {
+        memcpy(root, image_dir, dir_len - suffix_len);
+        root[dir_len - suffix_len] = '\0';
+    } else {
+        // Not the shape we expected; nothing we can safely drop
+        stats->failed++;
         return;
     }
 
-    for (uint32_t i = 0; i < dwm_builtin_image_count; i++) {
-        const struct DWMBuiltinImage* image = &dwm_builtin_images[i];
-
-        char image_path[256];
-        if (!boot_path(image_path, sizeof(image_path), image_dir, "/") ||
-            strlen(image_path) + strlen(image->name) + 1 > sizeof(image_path)) {
-            stats->failed++;
-            continue;
-        }
-        strncat(image_path, image->name, sizeof(image_path) - strlen(image_path) - 1);
-
-        if (vfs_exists(image_path)) {
-            if (!overwrite) {
-                stats->kept++;
-                continue;
-            }
-            // Never remove a folder that happens to carry an image's name
-            if (vfs_directory_check(image_path) || !vfs_remove(image_path)) {
-                stats->failed++;
-                continue;
-            }
-        }
-
-        resource_save(image_path, RESOURCE_TYPE_SPRITE, image->sprite);
-
-        if (vfs_exists(image_path))
-            stats->written++;
-        else
-            stats->failed++;
-    }
+    BootAssetStats a = { 0, 0, 0 };
+    boot_drop_sprite_assets(root, overwrite, &a);
+    stats->written += a.written;
+    stats->kept    += a.kept;
+    stats->failed  += a.failed;
 #else
     (void)image_dir;
     (void)overwrite;
 #endif
 }
 
-// Drop the built-in test programs into <root>/bin/test. That folder is
-// created by boot_make_layout (it is in boot_system_directories), so the
-// files have a parent to live in; dropper_all only writes them. Returns true
-// only if every program was written.
-static bool boot_export_programs(const char* root) {
-    char bin_dir[128];
-    if (!boot_path(bin_dir, sizeof(bin_dir), root, "/bin/test"))
-        return false;
-    //return dropper_all(bin_dir);
-}
+// Drop the compiled-in byte assets (ELF executables, e.g. the DWM) into
+// <root>/sys. The /sys folder is created by boot_make_layout (it is in
+// boot_system_directories), so the files have a parent to live in. `stats`
+// may be NULL. Returns true only if every asset was written or kept.
+static bool boot_export_programs(const char* root, bool overwrite, BootExportStats* stats) {
+    BootExportStats local = { 0, 0, 0 };
+    if (stats == NULL)
+        stats = &local;
 
-// The original "boot images": images into the current home device
-static void boot_export_images(void) {
-    struct LocalPaths paths;
-    kernel_get_local_paths(&paths);
-
-    // No home device: nowhere to save, the DWM uses the built-in images
-    if (paths.home[0] == '\0')
-        return;
-
-    char sys_dir[128];
-    if (!boot_path(sys_dir, sizeof(sys_dir), paths.home, "/sys"))
-        return;
-
-    if (!vfs_directory_check(sys_dir) && !vfs_mkdir(sys_dir))
-        return;
-
-#ifdef ADD_IMAGE_LIB
-    char image_dir[128];
-    if (dwm_get_image_directory(image_dir, sizeof(image_dir)))
-        boot_export_images_to(image_dir, false, NULL);
+#ifdef ADD_BINARY_LIB
+    BootAssetStats a = { 0, 0, 0 };
+    boot_drop_byte_assets(root, overwrite, &a);
+    stats->written += a.written;
+    stats->kept    += a.kept;
+    stats->failed  += a.failed;
+    return a.failed == 0;
 #endif
+
+    return 0;
 }
 
 //
@@ -509,9 +489,9 @@ static int boot_install(const char* disk_name) {
     print("Formatting ");
     print(part_name);
     print("...\n");
-    struct FSDeviceContext* ctx = vfs_device_context(part);
-    if (ctx == NULL ||
-        vfs_device_format_context(ctx, fs_device_max_capacity(part), FS_MIN_SECTOR_SIZE,
+    struct FsMount* mount = vfs_device_context(part);
+    if (mount == NULL ||
+        vfs_device_format_context(mount, vfs_device_max_capacity(mount), FS_MIN_SECTOR_SIZE,
                                 false, NULL) != VFS_FORMAT_OK) {
         print("\nFormat failed\n");
         return 4;
@@ -536,9 +516,9 @@ static int boot_install(const char* disk_name) {
     if (!vfs_sync_all())
         print("  ! disk flush failed\n");
 
-    // Binary files (the /bin/test folder was just made by boot_make_layout)
-    if (!boot_export_programs(root))
-        print("  ! some test programs missing from /bin/test\n");
+    // Byte assets (the /sys folder was just made by boot_make_layout)
+    if (!boot_export_programs(root, false, NULL))
+        print("  ! some system files missing from /sys\n");
 
     print("\nInstalled. Remove the boot media and restart.\n");
     return 0;
@@ -711,10 +691,13 @@ static int boot_repair(const char* name, bool force) {
     print("skipped (no image library)\n");
 #endif
 
-    // Binary files
-    bool programs_ok = boot_export_programs(root);
-    boot_print_label("programs");
-    print(programs_ok ? "ok\n" : "failed\n");
+    // Byte assets (ELF executables, e.g. the DWM) into /sys
+
+#ifdef ADD_BINARY_LIB
+    BootExportStats programs = { 0, 0, 0 };
+    bool programs_ok = boot_export_programs(root, force, &programs);
+    boot_print_stats("programs", programs.written, " written",
+                     programs.kept, " kept", programs.failed);
 
     // Report only: the disk may intentionally hold another kernel version
     boot_repair_check_area(disk);
@@ -727,6 +710,10 @@ static int boot_repair(const char* name, bool force) {
         print("\nRepair incomplete\n");
         return 5;
     }
+#else
+    boot_print_label("binary");
+    print("skipped (no binary library)\n");
+#endif
 
     print("\nRepaired\n");
     return 0;

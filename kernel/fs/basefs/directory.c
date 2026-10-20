@@ -11,14 +11,14 @@
 // records tile that area exactly, never crossing a device sector boundary.
 //
 // Every allocation is one whole block, so a record area always ends on a
-// block boundary and starts at offset 52 (header) or 20 (extent) into it.
+// block boundary and starts at offset 72 (header) or 32 (extent) into it.
 // With blocks and sectors of at least FS_MIN_SECTOR_SIZE bytes, the first
 // stretch of every area is then longer than the largest possible record.
 // ---------------------------------------------------------------------------
 
 // Upper bound on any extent chain walk. A chain can never have more links
 // than the device has blocks, so a longer walk means a corrupt (cyclic) chain.
-static inline uint32_t dir_walk_limit(struct FSDeviceContext* ctx) {
+static inline uint64_t dir_walk_limit(struct FSDeviceContext* ctx) {
     return (ctx && ctx->block_count) ? ctx->block_count : 0xFFFFU;
 }
 
@@ -48,7 +48,7 @@ static uint32_t dir_name_length(const char* name) {
     return (uint32_t)length;
 }
 
-static bool dir_alloc_size(struct FSDeviceContext* ctx, uint32_t payload, uint32_t* size) {
+static bool dir_alloc_size(struct FSDeviceContext* ctx, uint64_t payload, uint64_t* size) {
     struct FSAllocHeader alloc;
     if (payload == FS_NULL || payload < sizeof(struct FSAllocHeader))
         return false;
@@ -59,28 +59,28 @@ static bool dir_alloc_size(struct FSDeviceContext* ctx, uint32_t payload, uint32
     return true;
 }
 
-static bool dir_header_read(struct FSDeviceContext* ctx, uint32_t address, struct FSDirectoryHeader* directory) {
-    uint32_t size;
+static bool dir_header_read(struct FSDeviceContext* ctx, uint64_t address, struct FSDirectoryHeader* directory) {
+    uint64_t size;
     if (!ctx || !dir_alloc_size(ctx, address, &size) || size < sizeof(struct FSDirectoryHeader))
         return false;
     fs_mem_read(ctx, address, directory, sizeof(struct FSDirectoryHeader));
-    // A file header is the same size: the attribute tells them apart
+    // A file allocation is at least as large: the attribute tells them apart
     return (directory->block.attributes & FS_ATTRIBUTE_DIRECTORY) != 0;
 }
 
-static void dir_header_write(struct FSDeviceContext* ctx, uint32_t address, const struct FSDirectoryHeader* directory) {
+static void dir_header_write(struct FSDeviceContext* ctx, uint64_t address, const struct FSDirectoryHeader* directory) {
     fs_mem_write(ctx, address, directory, sizeof(struct FSDirectoryHeader));
 }
 
-static bool dir_extent_read(struct FSDeviceContext* ctx, uint32_t address, struct FSDirectoryExtent* extent) {
-    uint32_t size;
+static bool dir_extent_read(struct FSDeviceContext* ctx, uint64_t address, struct FSDirectoryExtent* extent) {
+    uint64_t size;
     if (!dir_alloc_size(ctx, address, &size) || size < sizeof(struct FSDirectoryExtent))
         return false;
     fs_mem_read(ctx, address, extent, sizeof(struct FSDirectoryExtent));
     return true;
 }
 
-static void dir_extent_write(struct FSDeviceContext* ctx, uint32_t address, const struct FSDirectoryExtent* extent) {
+static void dir_extent_write(struct FSDeviceContext* ctx, uint64_t address, const struct FSDirectoryExtent* extent) {
     fs_mem_write(ctx, address, extent, sizeof(struct FSDirectoryExtent));
 }
 
@@ -89,16 +89,16 @@ static void dir_extent_write(struct FSDeviceContext* ctx, uint32_t address, cons
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    uint32_t owner;         // Directory header or extent (payload address)
+    uint64_t owner;         // Directory header or extent (payload address)
     bool     is_header;
-    uint32_t start;         // Record area [start, end)
-    uint32_t end;
-    uint32_t next;          // Next extent, FS_NULL at the end of the chain
+    uint64_t start;         // Record area [start, end)
+    uint64_t end;
+    uint64_t next;          // Next extent, FS_NULL at the end of the chain
     uint32_t count;         // Live entries according to the owner's header
 } DirArea;
 
-static bool dir_area_load(struct FSDeviceContext* ctx, uint32_t owner, bool is_header, DirArea* area) {
-    uint32_t size;
+static bool dir_area_load(struct FSDeviceContext* ctx, uint64_t owner, bool is_header, DirArea* area) {
+    uint64_t size;
     uint32_t header_size = is_header ? sizeof(struct FSDirectoryHeader) : sizeof(struct FSDirectoryExtent);
     if (!dir_alloc_size(ctx, owner, &size) || size < header_size)
         return false;
@@ -125,11 +125,11 @@ static bool dir_area_load(struct FSDeviceContext* ctx, uint32_t owner, bool is_h
 }
 
 // Fill [start, end) with free records, one per device-sector stretch
-static void dir_area_init(struct FSDeviceContext* ctx, uint32_t start, uint32_t end) {
+static void dir_area_init(struct FSDeviceContext* ctx, uint64_t start, uint64_t end) {
     uint32_t unit = dir_unit(ctx);
-    uint32_t at = start;
+    uint64_t at = start;
     while (at < end) {
-        uint32_t stretch_end = (at / unit + 1U) * unit;
+        uint64_t stretch_end = (at / unit + 1U) * unit;
         if (stretch_end > end)
             stretch_end = end;
 
@@ -144,7 +144,7 @@ static void dir_area_init(struct FSDeviceContext* ctx, uint32_t start, uint32_t 
 }
 
 // Read and check the record at `at` inside an area ending at `end`
-static bool dir_record_read(struct FSDeviceContext* ctx, uint32_t at, uint32_t end, uint32_t unit,
+static bool dir_record_read(struct FSDeviceContext* ctx, uint64_t at, uint64_t end, uint32_t unit,
                             struct FSDirEntry* entry) {
     if (end - at < sizeof(struct FSDirEntry))
         return false;
@@ -153,7 +153,7 @@ static bool dir_record_read(struct FSDeviceContext* ctx, uint32_t at, uint32_t e
     uint32_t length = entry->rec_len;
     if (length < sizeof(struct FSDirEntry) || (length % FS_DIR_ENTRY_ALIGN) != 0)
         return false;
-    if (length > end - at || (at % unit) + length > unit)
+    if (length > end - at || (uint32_t)(at % unit) + length > unit)
         return false;
     if (entry->address != FS_NULL &&
         (entry->name_len == 0 || FS_DIR_ENTRY_SIZE(entry->name_len) > length))
@@ -162,7 +162,7 @@ static bool dir_record_read(struct FSDeviceContext* ctx, uint32_t at, uint32_t e
 }
 
 // Write one record (header and name). Both land in the same device sector.
-static void dir_record_write(struct FSDeviceContext* ctx, uint32_t at, uint32_t child, uint32_t rec_len,
+static void dir_record_write(struct FSDeviceContext* ctx, uint64_t at, uint64_t child, uint32_t rec_len,
                              const char* name, uint32_t name_len, uint8_t type) {
     struct FSDirEntry entry;
     entry.address  = child;
@@ -173,7 +173,7 @@ static void dir_record_write(struct FSDeviceContext* ctx, uint32_t at, uint32_t 
     fs_mem_write(ctx, at, &entry, sizeof(struct FSDirEntry));
 }
 
-static bool dir_record_name_equals(struct FSDeviceContext* ctx, uint32_t at, const struct FSDirEntry* entry,
+static bool dir_record_name_equals(struct FSDeviceContext* ctx, uint64_t at, const struct FSDirEntry* entry,
                                    const char* name, uint32_t length) {
     if (entry->address == FS_NULL || entry->name_len != length)
         return false;
@@ -193,7 +193,7 @@ static bool dir_record_name_equals(struct FSDeviceContext* ctx, uint32_t at, con
 }
 
 // Copy a record's name out, NUL-terminated. False if it does not fit.
-static bool dir_record_copy_name(struct FSDeviceContext* ctx, uint32_t at, const struct FSDirEntry* entry,
+static bool dir_record_copy_name(struct FSDeviceContext* ctx, uint64_t at, const struct FSDirEntry* entry,
                                  char* name, size_t name_size) {
     if (name == NULL)
         return true;
@@ -214,14 +214,14 @@ static bool dir_record_copy_name(struct FSDeviceContext* ctx, uint32_t at, const
 typedef struct {
     DirArea  area;
     uint32_t unit;
-    uint32_t guard;         // Extent hops left
-    uint32_t rec;           // Current record (FS_NULL before the first)
-    uint32_t prev;          // Previous record in the same sector, or FS_NULL
+    uint64_t guard;         // Extent hops left
+    uint64_t rec;           // Current record (FS_NULL before the first)
+    uint64_t prev;          // Previous record in the same sector, or FS_NULL
     struct FSDirEntry entry;
     bool     corrupt;
 } DirWalk;
 
-static bool dir_walk_begin(struct FSDeviceContext* ctx, uint32_t directory, DirWalk* walk) {
+static bool dir_walk_begin(struct FSDeviceContext* ctx, uint64_t directory, DirWalk* walk) {
     memset(walk, 0, sizeof(DirWalk));
     walk->rec  = FS_NULL;
     walk->prev = FS_NULL;
@@ -236,7 +236,7 @@ static bool dir_walk_begin(struct FSDeviceContext* ctx, uint32_t directory, DirW
 // directory; walk->corrupt says whether it stopped early on bad data.
 static bool dir_walk_next(struct FSDeviceContext* ctx, DirWalk* walk) {
     for (;;) {
-        uint32_t at;
+        uint64_t at;
         if (walk->rec == FS_NULL) {
             at = walk->area.start;
             walk->prev = FS_NULL;
@@ -272,7 +272,7 @@ static bool dir_walk_next(struct FSDeviceContext* ctx, DirWalk* walk) {
 
 // Adjust the live counts after adding (+1) or removing (-1) an entry in
 // `area`, and stamp the directory as modified
-static void dir_count_adjust(struct FSDeviceContext* ctx, uint32_t directory, const DirArea* area, int delta) {
+static void dir_count_adjust(struct FSDeviceContext* ctx, uint64_t directory, const DirArea* area, int delta) {
     struct FSDirectoryHeader header;
     if (!dir_header_read(ctx, directory, &header))
         return;
@@ -296,9 +296,9 @@ static void dir_count_adjust(struct FSDeviceContext* ctx, uint32_t directory, co
 }
 
 // New, unlinked extent of one block, its area filled with free records
-static uint32_t dir_extent_create(struct FSDeviceContext* ctx, uint32_t prev) {
+static uint64_t dir_extent_create(struct FSDeviceContext* ctx, uint64_t prev) {
     uint32_t size = ctx->sector_size - sizeof(struct FSAllocHeader);
-    uint32_t address = fs_alloc(ctx, size);
+    uint64_t address = fs_alloc(ctx, size);
     if (address == FS_NULL)
         return FS_NULL;
 
@@ -311,7 +311,7 @@ static uint32_t dir_extent_create(struct FSDeviceContext* ctx, uint32_t prev) {
     return address;
 }
 
-static void dir_extent_unlink_and_free(struct FSDeviceContext* ctx, uint32_t directory, uint32_t extent_address) {
+static void dir_extent_unlink_and_free(struct FSDeviceContext* ctx, uint64_t directory, uint64_t extent_address) {
     struct FSDirectoryHeader header;
     struct FSDirectoryExtent extent;
     struct FSDirectoryExtent other;
@@ -341,7 +341,7 @@ static void dir_extent_unlink_and_free(struct FSDeviceContext* ctx, uint32_t dir
 }
 
 // Remove the live record for `child` (at `record` if that is not FS_NULL)
-static uint8_t dir_remove(struct FSDeviceContext* ctx, uint32_t directory, uint32_t child, uint32_t record) {
+static uint8_t dir_remove(struct FSDeviceContext* ctx, uint64_t directory, uint64_t child, uint64_t record) {
     DirWalk walk;
     if (!dir_walk_begin(ctx, directory, &walk))
         return FS_DIR_ERR_NOT_DIR;
@@ -383,7 +383,7 @@ static uint8_t dir_remove(struct FSDeviceContext* ctx, uint32_t directory, uint3
 // Create / delete
 // ---------------------------------------------------------------------------
 
-uint32_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint8_t permissions, uint32_t parent_directory) {
+uint64_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint8_t permissions, uint64_t parent_directory) {
     if (!ctx || ctx->sector_size < FS_MIN_SECTOR_SIZE)
         return FS_NULL;
     if (parent_directory != FS_NULL && dir_name_length(name) == 0)
@@ -391,7 +391,7 @@ uint32_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint
 
     // One whole block: header plus as many records as fit after it
     uint32_t size = ctx->sector_size - sizeof(struct FSAllocHeader);
-    uint32_t address = fs_alloc(ctx, size);
+    uint64_t address = fs_alloc(ctx, size);
     if (address == FS_NULL)
         return FS_NULL;
 
@@ -406,6 +406,7 @@ uint32_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint
     if (parent_directory != FS_NULL) {
         uint32_t security = directory.block.security;
         fs_file_get_security(ctx, parent_directory, &security);
+        directory.block.security = security;
     }
     directory.block.created     = fs_time_now();
     directory.block.modified    = directory.block.created;
@@ -422,18 +423,18 @@ uint32_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint
     return address;
 }
 
-bool fs_directory_delete(struct FSDeviceContext* ctx, uint32_t address) {
+bool fs_directory_delete(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSDirectoryHeader directory;
     if (!dir_header_read(ctx, address, &directory))
         return false;
 
-    uint32_t extent_address = directory.extent.next;
-    uint32_t guard = dir_walk_limit(ctx);
+    uint64_t extent_address = directory.extent.next;
+    uint64_t guard = dir_walk_limit(ctx);
     while (extent_address != FS_NULL && guard-- > 0) {
         struct FSDirectoryExtent extent;
         if (!dir_extent_read(ctx, extent_address, &extent))
             break;
-        uint32_t next = extent.extent.next;
+        uint64_t next = extent.extent.next;
         fs_free(ctx, extent_address);
         extent_address = next;
     }
@@ -446,8 +447,8 @@ bool fs_directory_delete(struct FSDeviceContext* ctx, uint32_t address) {
 // Entries
 // ---------------------------------------------------------------------------
 
-uint8_t fs_directory_add_entry(struct FSDeviceContext* ctx, uint32_t directory_address, const char* name,
-                               uint32_t child, uint8_t type) {
+uint8_t fs_directory_add_entry(struct FSDeviceContext* ctx, uint64_t directory_address, const char* name,
+                               uint64_t child, uint8_t type) {
     if (!ctx || child == FS_NULL || child == 0)
         return FS_DIR_ERR_ARGUMENT;
     uint32_t length = dir_name_length(name);
@@ -462,7 +463,7 @@ uint8_t fs_directory_add_entry(struct FSDeviceContext* ctx, uint32_t directory_a
     // One pass: the name must not exist anywhere, and remember the first
     // place the new record fits
     bool              found = false;
-    uint32_t          slot = FS_NULL;
+    uint64_t          slot = FS_NULL;
     uint32_t          slot_used = 0;    // 0: take a free record; else split a live one after this many bytes
     struct FSDirEntry slot_entry;
     DirArea           slot_area;
@@ -511,13 +512,13 @@ uint8_t fs_directory_add_entry(struct FSDeviceContext* ctx, uint32_t directory_a
 
     // No room: build a new extent completely, then link it after the last
     // area (where the walk ended)
-    uint32_t tail = walk.area.owner;
-    uint32_t extent_address = dir_extent_create(ctx, tail);
+    uint64_t tail = walk.area.owner;
+    uint64_t extent_address = dir_extent_create(ctx, tail);
     if (extent_address == FS_NULL)
         return FS_DIR_ERR_NO_SPACE;
 
     struct FSDirEntry first;
-    uint32_t first_at = extent_address + sizeof(struct FSDirectoryExtent);
+    uint64_t first_at = extent_address + sizeof(struct FSDirectoryExtent);
     fs_mem_read(ctx, first_at, &first, sizeof(struct FSDirEntry));
     if (first.rec_len < need) {             // Only with a nonsense geometry
         fs_free(ctx, extent_address);
@@ -553,13 +554,13 @@ uint8_t fs_directory_add_entry(struct FSDeviceContext* ctx, uint32_t directory_a
     return FS_DIR_OK;
 }
 
-uint8_t fs_directory_remove_entry(struct FSDeviceContext* ctx, uint32_t directory_address, uint32_t child) {
+uint8_t fs_directory_remove_entry(struct FSDeviceContext* ctx, uint64_t directory_address, uint64_t child) {
     if (!ctx || child == FS_NULL)
         return FS_DIR_ERR_ARGUMENT;
     return dir_remove(ctx, directory_address, child, FS_NULL);
 }
 
-uint8_t fs_directory_rename_entry(struct FSDeviceContext* ctx, uint32_t directory_address, uint32_t child,
+uint8_t fs_directory_rename_entry(struct FSDeviceContext* ctx, uint64_t directory_address, uint64_t child,
                                   const char* new_name) {
     if (!ctx || child == FS_NULL)
         return FS_DIR_ERR_ARGUMENT;
@@ -571,7 +572,7 @@ uint8_t fs_directory_rename_entry(struct FSDeviceContext* ctx, uint32_t director
     if (!dir_walk_begin(ctx, directory_address, &walk))
         return FS_DIR_ERR_NOT_DIR;
 
-    uint32_t          record = FS_NULL;
+    uint64_t          record = FS_NULL;
     struct FSDirEntry entry;
     while (dir_walk_next(ctx, &walk)) {
         if (dir_record_name_equals(ctx, walk.rec, &walk.entry, new_name, length)) {
@@ -611,17 +612,17 @@ uint8_t fs_directory_rename_entry(struct FSDeviceContext* ctx, uint32_t director
 }
 
 // Locate live entry `index` using the per-area counts to skip whole areas
-static bool dir_locate_index(struct FSDeviceContext* ctx, uint32_t directory, uint32_t index,
-                             uint32_t* record, struct FSDirEntry* entry) {
+static bool dir_locate_index(struct FSDeviceContext* ctx, uint64_t directory, uint32_t index,
+                             uint64_t* record, struct FSDirEntry* entry) {
     DirArea area;
     if (!ctx || !dir_area_load(ctx, directory, true, &area))
         return false;
 
     uint32_t unit  = dir_unit(ctx);
-    uint32_t guard = dir_walk_limit(ctx);
+    uint64_t guard = dir_walk_limit(ctx);
     for (;;) {
         if (index < area.count) {
-            uint32_t at = area.start;
+            uint64_t at = area.start;
             while (at < area.end) {
                 if (!dir_record_read(ctx, at, area.end, unit, entry))
                     return false;
@@ -645,7 +646,7 @@ static bool dir_locate_index(struct FSDeviceContext* ctx, uint32_t directory, ui
     }
 }
 
-uint32_t fs_directory_get_reference_count(struct FSDeviceContext* ctx, uint32_t directory_address) {
+uint32_t fs_directory_get_reference_count(struct FSDeviceContext* ctx, uint64_t directory_address) {
     struct FSDirectoryHeader directory;
     // Return 0 (not FS_NULL) on failure: callers use this as a loop bound
     if (!dir_header_read(ctx, directory_address, &directory))
@@ -653,17 +654,17 @@ uint32_t fs_directory_get_reference_count(struct FSDeviceContext* ctx, uint32_t 
     return directory.entry_count;
 }
 
-uint32_t fs_directory_get_reference(struct FSDeviceContext* ctx, uint32_t directory_address, uint32_t index) {
-    uint32_t record;
+uint64_t fs_directory_get_reference(struct FSDeviceContext* ctx, uint64_t directory_address, uint32_t index) {
+    uint64_t record;
     struct FSDirEntry entry;
     if (!dir_locate_index(ctx, directory_address, index, &record, &entry))
         return FS_NULL;
     return entry.address;
 }
 
-bool fs_directory_get_entry(struct FSDeviceContext* ctx, uint32_t directory_address, uint32_t index,
-                            uint32_t* address, char* name, size_t name_size, uint8_t* type) {
-    uint32_t record;
+bool fs_directory_get_entry(struct FSDeviceContext* ctx, uint64_t directory_address, uint32_t index,
+                            uint64_t* address, char* name, size_t name_size, uint8_t* type) {
+    uint64_t record;
     struct FSDirEntry entry;
     if (name != NULL && name_size > 0)
         name[0] = '\0';
@@ -676,7 +677,7 @@ bool fs_directory_get_entry(struct FSDeviceContext* ctx, uint32_t directory_addr
     return true;
 }
 
-bool fs_directory_get_name(struct FSDeviceContext* ctx, uint32_t directory_address, uint32_t child,
+bool fs_directory_get_name(struct FSDeviceContext* ctx, uint64_t directory_address, uint64_t child,
                            char* name, size_t name_size) {
     if (name != NULL && name_size > 0)
         name[0] = '\0';
@@ -693,7 +694,7 @@ bool fs_directory_get_name(struct FSDeviceContext* ctx, uint32_t directory_addre
     return false;
 }
 
-uint32_t fs_directory_find(struct FSDeviceContext* ctx, uint32_t directory_address, const char* name) {
+uint64_t fs_directory_find(struct FSDeviceContext* ctx, uint64_t directory_address, const char* name) {
     uint32_t length = dir_name_length(name);
     if (length == 0)
         return FS_NULL;
@@ -708,7 +709,7 @@ uint32_t fs_directory_find(struct FSDeviceContext* ctx, uint32_t directory_addre
     return FS_NULL;
 }
 
-uint32_t fs_directory_get_parent(struct FSDeviceContext* ctx, uint32_t directory_address) {
+uint64_t fs_directory_get_parent(struct FSDeviceContext* ctx, uint64_t directory_address) {
     struct FSDirectoryHeader directory;
     if (!dir_header_read(ctx, directory_address, &directory))
         return FS_NULL;
@@ -721,7 +722,7 @@ uint32_t fs_directory_get_parent(struct FSDeviceContext* ctx, uint32_t directory
 
 // First live entry of a directory. False when it has none (or on corruption,
 // which *corrupt reports).
-static bool dir_first_live(struct FSDeviceContext* ctx, uint32_t directory, uint32_t* child, bool* corrupt) {
+static bool dir_first_live(struct FSDeviceContext* ctx, uint64_t directory, uint64_t* child, bool* corrupt) {
     DirWalk walk;
     *corrupt = false;
     if (!dir_walk_begin(ctx, directory, &walk)) {
@@ -738,12 +739,12 @@ static bool dir_first_live(struct FSDeviceContext* ctx, uint32_t directory, uint
     return false;
 }
 
-static bool dir_is_directory(struct FSDeviceContext* ctx, uint32_t address) {
+static bool dir_is_directory(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSDirectoryHeader directory;
     return dir_header_read(ctx, address, &directory);
 }
 
-static uint32_t dir_node_parent(struct FSDeviceContext* ctx, uint32_t address) {
+static uint64_t dir_node_parent(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSBlockHeader block;
     fs_mem_read(ctx, address, &block, sizeof(struct FSBlockHeader));
     return block.parent;
@@ -766,7 +767,7 @@ static uint32_t dir_node_parent(struct FSDeviceContext* ctx, uint32_t address) {
 //
 // Permissions are not checked here; that is the caller's job.
 // Refuses to delete the partition's root directory.
-bool fs_directory_delete_recursive(struct FSDeviceContext* ctx, uint32_t address, uint32_t parent_directory) {
+bool fs_directory_delete_recursive(struct FSDeviceContext* ctx, uint64_t address, uint64_t parent_directory) {
     if (!ctx || address == FS_NULL)
         return false;
     if (!dir_is_directory(ctx, address))
@@ -784,11 +785,11 @@ bool fs_directory_delete_recursive(struct FSDeviceContext* ctx, uint32_t address
     // Every step frees an object, unlinks an entry or descends once into a
     // directory that will later be freed. Every object owns at least one
     // block, so running out of steps means the structure is corrupt.
-    uint32_t steps = dir_walk_limit(ctx) * 4U;
-    uint32_t current = address;
+    uint64_t steps = dir_walk_limit(ctx) * 4U;
+    uint64_t current = address;
 
     while (steps-- > 0) {
-        uint32_t child = FS_NULL;
+        uint64_t child = FS_NULL;
         bool     corrupt;
 
         if (!dir_first_live(ctx, current, &child, &corrupt)) {
@@ -799,7 +800,7 @@ bool fs_directory_delete_recursive(struct FSDeviceContext* ctx, uint32_t address
                 return true;
             }
             // Emptied a subdirectory: unlink it, free it, climb back up
-            uint32_t up = fs_directory_get_parent(ctx, current);
+            uint64_t up = fs_directory_get_parent(ctx, current);
             if (up == FS_NULL || fs_directory_remove_entry(ctx, up, current) != FS_DIR_OK)
                 return false;
             fs_directory_delete(ctx, current);

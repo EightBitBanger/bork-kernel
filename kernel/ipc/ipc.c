@@ -34,6 +34,7 @@
 #include <kernel/ipc/ipc_platform.h>
 
 #define IPC_PAGE_SIZE   4096u
+#define IPC_HANDLE_INITIAL 32u          // First handle table size; doubles up to SYS_IPC_HANDLE_MAX
 
 _Static_assert(sizeof(SysIpcMsgInfo) == 16 && sizeof(SysIpcWaitItem) == 8 &&
                sizeof(SysIpcInfo) == 32 && sizeof(SysInputEvent) == 16,
@@ -113,7 +114,8 @@ typedef struct IpcProc {
     void*     space;
     uint32_t  users;                // Threads sleeping in SYS_IPC_WAIT
     bool      dying;
-    IpcHandle handles[SYS_IPC_HANDLE_MAX];
+    IpcHandle* handles;             // handle_cap entries, grown as needed
+    uint32_t  handle_cap;
     struct IpcProc* next;
 } IpcProc;
 
@@ -264,7 +266,7 @@ static IpcPipe* ipc_pipe_new(void) {
 //
 
 static IpcHandle* ipc_handle_get(IpcProc* t, uint32_t handle) {
-    if (handle == 0 || handle > SYS_IPC_HANDLE_MAX)
+    if (handle == 0 || handle > t->handle_cap)
         return NULL;
     IpcHandle* h = &t->handles[handle - 1];
     return (h->obj != NULL) ? h : NULL;
@@ -275,13 +277,34 @@ static IpcHandle* ipc_handle_typed(IpcProc* t, uint32_t handle, uint32_t type) {
     return (h != NULL && h->obj->type == type) ? h : NULL;
 }
 
-// A free handle number other than `skip`, or 0
+// Room for more handles: double the table, up to SYS_IPC_HANDLE_MAX. Moves
+// the table, so IpcHandle pointers taken before this are stale.
+static bool ipc_handle_grow(IpcProc* t) {
+    if (t->handle_cap >= SYS_IPC_HANDLE_MAX)
+        return false;
+    uint32_t cap = t->handle_cap ? t->handle_cap * 2 : IPC_HANDLE_INITIAL;
+    if (cap > SYS_IPC_HANDLE_MAX)
+        cap = SYS_IPC_HANDLE_MAX;
+    IpcHandle* grown = (IpcHandle*)realloc(t->handles, cap * sizeof(IpcHandle));
+    if (grown == NULL)
+        return false;
+    memset(&grown[t->handle_cap], 0, (cap - t->handle_cap) * sizeof(IpcHandle));
+    t->handles    = grown;
+    t->handle_cap = cap;
+    return true;
+}
+
+// A free handle number other than `skip`, or 0 (SYS_IPC_HANDLE_MAX open,
+// or no memory to grow the table)
 static uint32_t ipc_handle_free(IpcProc* t, uint32_t skip) {
-    for (uint32_t i = 1; i <= SYS_IPC_HANDLE_MAX; i++) {
-        if (i != skip && t->handles[i - 1].obj == NULL)
-            return i;
+    for (;;) {
+        for (uint32_t i = 1; i <= t->handle_cap; i++) {
+            if (i != skip && t->handles[i - 1].obj == NULL)
+                return i;
+        }
+        if (!ipc_handle_grow(t))
+            return 0;
     }
-    return 0;
 }
 
 // Takes over one reference the caller holds
@@ -300,7 +323,7 @@ static void ipc_handle_close(IpcProc* t, IpcHandle* h, bool unmap) {
 }
 
 static void ipc_close_all(IpcProc* t, bool unmap) {
-    for (uint32_t i = 0; i < SYS_IPC_HANDLE_MAX; i++) {
+    for (uint32_t i = 0; i < t->handle_cap; i++) {
         if (t->handles[i].obj != NULL)
             ipc_handle_close(t, &t->handles[i], unmap);
     }
@@ -651,9 +674,14 @@ int32_t ipc_sys_wait(const IpcCaller* c, uint32_t user_items, uint32_t count, ui
     if (count == 0 || count > SYS_IPC_WAIT_MAX)
         return SYS_EINVAL;
 
-    SysIpcWaitItem items[SYS_IPC_WAIT_MAX];
-    if (!ipc_plat_user_read(c->space, items, user_items, count * sizeof(SysIpcWaitItem)))
+    // On the heap: SYS_IPC_WAIT_MAX items are too many for a kernel stack
+    SysIpcWaitItem* items = (SysIpcWaitItem*)malloc(count * sizeof(SysIpcWaitItem));
+    if (items == NULL)
+        return SYS_ENOMEM;
+    if (!ipc_plat_user_read(c->space, items, user_items, count * sizeof(SysIpcWaitItem))) {
+        free(items);
         return SYS_EFAULT;
+    }
 
     // Registered before the first check: no wake can slip past
     IpcSleeper sleeper;
@@ -664,6 +692,7 @@ int32_t ipc_sys_wait(const IpcCaller* c, uint32_t user_items, uint32_t count, ui
     if (t == NULL) {
         ipc_plat_unlock();
         ipc_plat_sleep_end(&sleeper);
+        free(items);
         return SYS_ENOMEM;
     }
     t->users++;
@@ -711,7 +740,8 @@ int32_t ipc_sys_wait(const IpcCaller* c, uint32_t user_items, uint32_t count, ui
     ipc_plat_sleep_end(&sleeper);
 
     if (result >= 0 && !ipc_plat_user_write(c->space, user_items, items, count * sizeof(SysIpcWaitItem)))
-        return SYS_EFAULT;
+        result = SYS_EFAULT;
+    free(items);
     return result;
 }
 
@@ -760,7 +790,7 @@ static uint32_t ipc_map_place(IpcProc* t, uint32_t bytes) {
         moved = false;
         if (candidate > IPC_MAP_END || IPC_MAP_END - candidate < bytes)
             return 0;
-        for (uint32_t i = 0; i < SYS_IPC_HANDLE_MAX; i++) {
+        for (uint32_t i = 0; i < t->handle_cap; i++) {
             IpcHandle* h = &t->handles[i];
             if (h->obj == NULL || h->map_addr == 0)
                 continue;
@@ -959,6 +989,7 @@ void ipc_process_exit(uint32_t pid) {
         ipc_plat_lock();
         ipc_close_all(t, true);
         ipc_plat_unlock();
+        free(t->handles);
         free(t);
     }
 }

@@ -11,12 +11,11 @@
 // basefs I/O on top of the generic block layer. Each context carries its
 // own BlockDevice and a one-sector cache window at ctx->device_address.
 //
-// fs_mem_read / fs_mem_write move whole sector-sized pieces with memcpy
-// (they used to make one fs_readb/fs_writeb call, with a division and a
-// cache check, per byte), and a write that covers a whole sector no longer
-// reads that sector from the disk first.
+// fs_mem_read / fs_mem_write move whole sector-sized pieces with memcpy,
+// and a write that covers a whole sector does not read that sector from the
+// disk first.
 
-#define FS_NO_SECTOR 0xFFFFFFFFU
+#define FS_NO_SECTOR 0xFFFFFFFFFFFFFFFFULL
 
 uint32_t fs_device_window_size(struct BlockDevice* device) {
     return (device != NULL) ? device->sector_size : 0;
@@ -27,11 +26,11 @@ static inline uint32_t fs_io_sector_size(struct FSDeviceContext* ctx) {
 }
 
 static inline uint8_t* fs_io_window(struct FSDeviceContext* ctx) {
-    return (uint8_t*)(uintptr_t)ctx->device_address;
+    return ctx->device_address;
 }
 
 static inline bool fs_io_ready(struct FSDeviceContext* ctx) {
-    return ctx && ctx->device && ctx->device_address != 0 && ctx->device->sector_size != 0;
+    return ctx && ctx->device && ctx->device_address != NULL && ctx->device->sector_size != 0;
 }
 
 // Write the cached sector back if it was modified
@@ -46,7 +45,7 @@ static bool fs_cache_write_back(struct FSDeviceContext* ctx) {
     return true;
 }
 
-static bool fs_cache_flush_and_fetch(struct FSDeviceContext* ctx, uint32_t target_sector) {
+static bool fs_cache_flush_and_fetch(struct FSDeviceContext* ctx, uint64_t target_sector) {
     if (!fs_io_ready(ctx))
         return false;
     if (ctx->sector_frame == target_sector)
@@ -67,7 +66,7 @@ static bool fs_cache_flush_and_fetch(struct FSDeviceContext* ctx, uint32_t targe
 
 // Make the window hold `target_sector` WITHOUT reading it, because the
 // caller is about to overwrite every byte of it.
-static bool fs_cache_claim(struct FSDeviceContext* ctx, uint32_t target_sector) {
+static bool fs_cache_claim(struct FSDeviceContext* ctx, uint64_t target_sector) {
     if (!fs_io_ready(ctx))
         return false;
     if (ctx->sector_frame == target_sector)
@@ -93,11 +92,11 @@ bool fs_cache_flush(struct FSDeviceContext* ctx) {
     return block_flush(ctx->device);
 }
 
-uint8_t fs_readb(struct FSDeviceContext* ctx, uint32_t address) {
+uint8_t fs_readb(struct FSDeviceContext* ctx, uint64_t address) {
     if (!fs_io_ready(ctx)) return 0;
     uint32_t sector_size   = fs_io_sector_size(ctx);
-    uint32_t target_sector = address / sector_size;
-    uint32_t byte_offset   = address % sector_size;
+    uint64_t target_sector = address / sector_size;
+    uint32_t byte_offset   = (uint32_t)(address % sector_size);
 
     if (!fs_cache_flush_and_fetch(ctx, target_sector))
         return 0;
@@ -105,11 +104,11 @@ uint8_t fs_readb(struct FSDeviceContext* ctx, uint32_t address) {
     return fs_io_window(ctx)[byte_offset];
 }
 
-void fs_writeb(struct FSDeviceContext* ctx, uint32_t address, uint8_t byte) {
+void fs_writeb(struct FSDeviceContext* ctx, uint64_t address, uint8_t byte) {
     if (!fs_io_ready(ctx)) return;
     uint32_t sector_size   = fs_io_sector_size(ctx);
-    uint32_t target_sector = address / sector_size;
-    uint32_t byte_offset   = address % sector_size;
+    uint64_t target_sector = address / sector_size;
+    uint32_t byte_offset   = (uint32_t)(address % sector_size);
 
     if (!fs_cache_flush_and_fetch(ctx, target_sector))
         return;
@@ -120,20 +119,20 @@ void fs_writeb(struct FSDeviceContext* ctx, uint32_t address, uint8_t byte) {
 
 #if FS_IO_DIRECT_TRANSFER
 // Number of whole sectors starting at `sector` that can bypass the window
-static uint32_t fs_io_burst_length(uint32_t size, uint32_t sector_size) {
-    uint32_t count = size / sector_size;
+static uint32_t fs_io_burst_length(uint64_t size, uint32_t sector_size) {
+    uint64_t count = size / sector_size;
     if (count > FS_IO_MAX_BURST_SECTORS)
         count = FS_IO_MAX_BURST_SECTORS;
-    return count;
+    return (uint32_t)count;
 }
 
-static inline bool fs_io_cached_in(struct FSDeviceContext* ctx, uint32_t first, uint32_t count) {
+static inline bool fs_io_cached_in(struct FSDeviceContext* ctx, uint64_t first, uint32_t count) {
     return ctx->sector_frame != FS_NO_SECTOR &&
            ctx->sector_frame >= first && ctx->sector_frame - first < count;
 }
 #endif
 
-void fs_mem_read(struct FSDeviceContext* ctx, uint32_t address, void* destination, uint32_t size) {
+void fs_mem_read(struct FSDeviceContext* ctx, uint64_t address, void* destination, uint32_t size) {
     if (!ctx || destination == NULL) return;
     uint8_t* dest_ptr = (uint8_t*)destination;
     if (!fs_io_ready(ctx)) {
@@ -143,8 +142,8 @@ void fs_mem_read(struct FSDeviceContext* ctx, uint32_t address, void* destinatio
     uint32_t sector_size = fs_io_sector_size(ctx);
 
     while (size > 0) {
-        uint32_t sector = address / sector_size;
-        uint32_t offset = address % sector_size;
+        uint64_t sector = address / sector_size;
+        uint32_t offset = (uint32_t)(address % sector_size);
 
 #if FS_IO_DIRECT_TRANSFER
         if (offset == 0 && size >= sector_size) {
@@ -173,19 +172,19 @@ void fs_mem_read(struct FSDeviceContext* ctx, uint32_t address, void* destinatio
         size     -= chunk;
     }
 
-    // Same contract as the old byte loop: unreadable bytes come back as 0
+    // Unreadable bytes come back as 0
     if (size > 0)
         memset(dest_ptr, 0, size);
 }
 
 // Shared body of fs_mem_write and fs_mem_zero (source == NULL writes zeros)
-static void fs_mem_store(struct FSDeviceContext* ctx, uint32_t address, const uint8_t* source, uint32_t size) {
+static void fs_mem_store(struct FSDeviceContext* ctx, uint64_t address, const uint8_t* source, uint64_t size) {
     if (!fs_io_ready(ctx)) return;
     uint32_t sector_size = fs_io_sector_size(ctx);
 
     while (size > 0) {
-        uint32_t sector = address / sector_size;
-        uint32_t offset = address % sector_size;
+        uint64_t sector = address / sector_size;
+        uint32_t offset = (uint32_t)(address % sector_size);
 
 #if FS_IO_DIRECT_TRANSFER
         if (source != NULL && offset == 0 && size >= sector_size) {
@@ -207,7 +206,7 @@ static void fs_mem_store(struct FSDeviceContext* ctx, uint32_t address, const ui
 
         uint32_t chunk = sector_size - offset;
         if (chunk > size)
-            chunk = size;
+            chunk = (uint32_t)size;
 
         bool ok = (chunk == sector_size) ? fs_cache_claim(ctx, sector)
                                          : fs_cache_flush_and_fetch(ctx, sector);
@@ -226,12 +225,12 @@ static void fs_mem_store(struct FSDeviceContext* ctx, uint32_t address, const ui
     }
 }
 
-void fs_mem_write(struct FSDeviceContext* ctx, uint32_t address, const void* source, uint32_t size) {
+void fs_mem_write(struct FSDeviceContext* ctx, uint64_t address, const void* source, uint32_t size) {
     if (!ctx || source == NULL) return;
     fs_mem_store(ctx, address, (const uint8_t*)source, size);
 }
 
-void fs_mem_zero(struct FSDeviceContext* ctx, uint32_t address, uint32_t size) {
+void fs_mem_zero(struct FSDeviceContext* ctx, uint64_t address, uint64_t size) {
     if (!ctx) return;
     fs_mem_store(ctx, address, NULL, size);
 }

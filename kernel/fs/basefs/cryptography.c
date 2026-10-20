@@ -3,7 +3,7 @@
 
 // These only touch the shared FSBlockHeader, so they work on directories too
 
-bool fs_file_get_certificate(struct FSDeviceContext* ctx, uint32_t address, uint32_t* cert) {
+bool fs_file_get_certificate(struct FSDeviceContext* ctx, uint64_t address, uint32_t* cert) {
     if (!ctx || address == FS_NULL || cert == NULL) return false;
     struct FSBlockHeader header;
     fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
@@ -11,7 +11,7 @@ bool fs_file_get_certificate(struct FSDeviceContext* ctx, uint32_t address, uint
     return true;
 }
 
-bool fs_file_set_certificate(struct FSDeviceContext* ctx, uint32_t address, uint32_t cert) {
+bool fs_file_set_certificate(struct FSDeviceContext* ctx, uint64_t address, uint32_t cert) {
     if (!ctx) return false;
     if (cert == 0 || cert == 0xFFFFFFFF) 
         return false;
@@ -22,7 +22,7 @@ bool fs_file_set_certificate(struct FSDeviceContext* ctx, uint32_t address, uint
     return true;
 }
 
-bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint32_t address, uint8_t* security) {
+bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint64_t address, uint8_t* security) {
     if (!ctx || address == FS_NULL || security == NULL) return false;
     struct FSBlockHeader header;
     fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
@@ -32,7 +32,7 @@ bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint32_t address, ui
     return true;
 }
 
-bool fs_file_get_security(struct FSDeviceContext* ctx, uint32_t address, uint32_t* security) {
+bool fs_file_get_security(struct FSDeviceContext* ctx, uint64_t address, uint32_t* security) {
     if (!ctx || address == FS_NULL || security == NULL) return false;
     struct FSBlockHeader header;
     fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
@@ -40,7 +40,7 @@ bool fs_file_get_security(struct FSDeviceContext* ctx, uint32_t address, uint32_
     return true;
 }
 
-bool fs_file_set_security_flag(struct FSDeviceContext* ctx, uint32_t address, uint32_t security) {
+bool fs_file_set_security_flag(struct FSDeviceContext* ctx, uint64_t address, uint32_t security) {
     if (!ctx || address == FS_NULL) return false;
     struct FSBlockHeader header;
     fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));

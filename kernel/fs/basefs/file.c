@@ -13,11 +13,11 @@
 // order. Only the last part ever grows, so once a file has extents its
 // inline part keeps its size until a truncate removes the extents.
 
-static inline uint32_t fs_file_part_header_size(uint32_t part, uint32_t file_address) {
+static inline uint32_t fs_file_part_header_size(uint64_t part, uint64_t file_address) {
     return (part == file_address) ? (uint32_t)sizeof(struct FSFileHeader) : (uint32_t)sizeof(struct FSFileExtent);
 }
 
-bool fs_file_check(struct FSDeviceContext* ctx, uint32_t address) {
+bool fs_file_check(struct FSDeviceContext* ctx, uint64_t address) {
     if (!ctx) return false;
     struct FSAllocHeader alloc;
     struct FSBlockHeader block;
@@ -43,7 +43,7 @@ static bool fs_file_struct_is_valid(const FileHandle* file) {
     return true;
 }
 
-static bool fs_file_extent_read(struct FSDeviceContext* ctx, uint32_t extent_address, struct FSFileExtent* extent) {
+static bool fs_file_extent_read(struct FSDeviceContext* ctx, uint64_t extent_address, struct FSFileExtent* extent) {
     struct FSAllocHeader alloc_header;
     if (extent_address == FS_NULL || extent_address < sizeof(struct FSAllocHeader)) return false;
     fs_mem_read(ctx, extent_address - sizeof(struct FSAllocHeader), &alloc_header, sizeof(struct FSAllocHeader));
@@ -53,24 +53,24 @@ static bool fs_file_extent_read(struct FSDeviceContext* ctx, uint32_t extent_add
     return true;
 }
 
-static void fs_file_extent_write(struct FSDeviceContext* ctx, uint32_t extent_address, const struct FSFileExtent* extent) {
+static void fs_file_extent_write(struct FSDeviceContext* ctx, uint64_t extent_address, const struct FSFileExtent* extent) {
     fs_mem_write(ctx, extent_address, extent, sizeof(struct FSFileExtent));
 }
 
-static inline uint32_t fs_file_walk_limit(struct FSDeviceContext* ctx) {
+static inline uint64_t fs_file_walk_limit(struct FSDeviceContext* ctx) {
     return (ctx && ctx->block_count) ? ctx->block_count : 0xFFFFU;
 }
 
 // Free every extent in the chain starting at `extent_address`. The walk is
 // bounded by the device's block count so a corrupt (cyclic) chain cannot
 // loop forever.
-static void fs_file_free_chain(struct FSDeviceContext* ctx, uint32_t extent_address) {
-    uint32_t guard = fs_file_walk_limit(ctx);
+static void fs_file_free_chain(struct FSDeviceContext* ctx, uint64_t extent_address) {
+    uint64_t guard = fs_file_walk_limit(ctx);
     while (extent_address != FS_NULL && guard-- > 0) {
         struct FSFileExtent extent;
         if (!fs_file_extent_read(ctx, extent_address, &extent))
             break;
-        uint32_t next = extent.extent.next;
+        uint64_t next = extent.extent.next;
         fs_free(ctx, extent_address);
         extent_address = next;
     }
@@ -80,12 +80,12 @@ static void fs_file_free_chain(struct FSDeviceContext* ctx, uint32_t extent_addr
 // Create / delete
 // ---------------------------------------------------------------------------
 
-static bool fs_file_grow(struct FSDeviceContext* ctx, uint32_t address, struct FSFileHeader* file,
-                         uint32_t new_size, uint32_t start_hint);
+static bool fs_file_grow(struct FSDeviceContext* ctx, uint64_t address, struct FSFileHeader* file,
+                         uint64_t new_size, uint64_t start_hint);
 
-uint32_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t permissions, uint32_t size, uint32_t parent_directory) {
+uint64_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t permissions, uint64_t size, uint64_t parent_directory) {
     struct FSFileHeader file;
-    uint32_t            address;
+    uint64_t            address;
 
     if (!ctx)
         return FS_NULL;
@@ -113,6 +113,7 @@ uint32_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t p
     if (parent_directory != FS_NULL) {
         uint32_t security = file.block.security;
         fs_file_get_security(ctx, parent_directory, &security);
+        file.block.security = security;
     }
     
     file.block.created     = fs_time_now();
@@ -138,7 +139,7 @@ uint32_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t p
     return address;
 }
 
-bool fs_file_delete(struct FSDeviceContext* ctx, uint32_t address) {
+bool fs_file_delete(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSFileHeader file;
     if (!fs_file_check(ctx, address))
         return false;
@@ -149,7 +150,7 @@ bool fs_file_delete(struct FSDeviceContext* ctx, uint32_t address) {
     return true;
 }
 
-uint32_t fs_file_get_size(struct FSDeviceContext* ctx, uint32_t address) {
+uint64_t fs_file_get_size(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSFileHeader file;
     if (!fs_file_check(ctx, address))
         return 0;
@@ -161,18 +162,18 @@ uint32_t fs_file_get_size(struct FSDeviceContext* ctx, uint32_t address) {
 // Shared header fields (files and directories)
 // ---------------------------------------------------------------------------
 
-static bool fs_block_read(struct FSDeviceContext* ctx, uint32_t address, struct FSBlockHeader* block) {
+static bool fs_block_read(struct FSDeviceContext* ctx, uint64_t address, struct FSBlockHeader* block) {
     if (!ctx || address == FS_NULL)
         return false;
     fs_mem_read(ctx, address, block, sizeof(struct FSBlockHeader));
     return true;
 }
 
-static void fs_block_write(struct FSDeviceContext* ctx, uint32_t address, const struct FSBlockHeader* block) {
+static void fs_block_write(struct FSDeviceContext* ctx, uint64_t address, const struct FSBlockHeader* block) {
     fs_mem_write(ctx, address, block, sizeof(struct FSBlockHeader));
 }
 
-bool fs_file_get_permissions(struct FSDeviceContext* ctx, uint32_t address, uint8_t* permissions) {
+bool fs_file_get_permissions(struct FSDeviceContext* ctx, uint64_t address, uint8_t* permissions) {
     struct FSBlockHeader block;
     if (permissions == NULL || !fs_block_read(ctx, address, &block))
         return false;
@@ -180,7 +181,7 @@ bool fs_file_get_permissions(struct FSDeviceContext* ctx, uint32_t address, uint
     return true;
 }
 
-bool fs_file_set_permissions(struct FSDeviceContext* ctx, uint32_t address, uint8_t permissions) {
+bool fs_file_set_permissions(struct FSDeviceContext* ctx, uint64_t address, uint8_t permissions) {
     struct FSBlockHeader block;
     if (!fs_block_read(ctx, address, &block))
         return false;
@@ -189,7 +190,7 @@ bool fs_file_set_permissions(struct FSDeviceContext* ctx, uint32_t address, uint
     return true;
 }
 
-bool fs_file_get_attributes(struct FSDeviceContext* ctx, uint32_t address, uint8_t* attributes) {
+bool fs_file_get_attributes(struct FSDeviceContext* ctx, uint64_t address, uint8_t* attributes) {
     struct FSBlockHeader block;
     if (attributes == NULL || !fs_block_read(ctx, address, &block))
         return false;
@@ -197,7 +198,7 @@ bool fs_file_get_attributes(struct FSDeviceContext* ctx, uint32_t address, uint8
     return true;
 }
 
-bool fs_file_set_attributes(struct FSDeviceContext* ctx, uint32_t address, uint8_t attributes) {
+bool fs_file_set_attributes(struct FSDeviceContext* ctx, uint64_t address, uint8_t attributes) {
     struct FSBlockHeader block;
     if (!fs_block_read(ctx, address, &block))
         return false;
@@ -206,7 +207,7 @@ bool fs_file_set_attributes(struct FSDeviceContext* ctx, uint32_t address, uint8
     return true;
 }
 
-bool fs_file_get_times(struct FSDeviceContext* ctx, uint32_t address, uint32_t* created, uint32_t* modified) {
+bool fs_file_get_times(struct FSDeviceContext* ctx, uint64_t address, uint32_t* created, uint32_t* modified) {
     struct FSBlockHeader block;
     if (!fs_block_read(ctx, address, &block))
         return false;
@@ -215,7 +216,7 @@ bool fs_file_get_times(struct FSDeviceContext* ctx, uint32_t address, uint32_t* 
     return true;
 }
 
-uint32_t fs_file_get_parent(struct FSDeviceContext* ctx, uint32_t address) {
+uint64_t fs_file_get_parent(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSBlockHeader block;
     if (!fs_block_read(ctx, address, &block))
         return FS_NULL;
@@ -229,29 +230,28 @@ uint32_t fs_file_get_parent(struct FSDeviceContext* ctx, uint32_t address) {
 // Data bytes the allocation behind a part (header or extent) can hold. That
 // is everything up to the end of its last block, not just what was asked of
 // fs_alloc, so the block-rounding slack is usable too.
-static uint32_t fs_file_part_capacity(struct FSDeviceContext* ctx, uint32_t part, uint32_t header_size, uint32_t* alloc_size) {
+static uint64_t fs_file_part_capacity(struct FSDeviceContext* ctx, uint64_t part, uint32_t header_size, uint64_t* alloc_size) {
     struct FSAllocHeader alloc;
     fs_mem_read(ctx, part - sizeof(struct FSAllocHeader), &alloc, sizeof(struct FSAllocHeader));
     if (alloc_size) *alloc_size = alloc.size;
-    if (alloc.size < header_size || ctx->sector_size == 0)
+    if (alloc.size < header_size || alloc.size > ctx->pool_size || ctx->sector_size == 0)
         return 0;
     uint64_t ss     = ctx->sector_size;
     uint64_t blocks = ((uint64_t)sizeof(struct FSAllocHeader) + alloc.size + ss - 1U) / ss;
-    uint64_t room   = blocks * ss - sizeof(struct FSAllocHeader) - header_size;
-    return (room > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)room;
+    return blocks * ss - sizeof(struct FSAllocHeader) - header_size;
 }
 
 // Extra room to reserve when a file of `size` bytes has to allocate
-static inline uint32_t fs_file_prealloc_for(uint32_t size) {
-    uint32_t extra = size / 8U;
-    return (extra > FS_FILE_PREALLOC_MAX) ? (uint32_t)FS_FILE_PREALLOC_MAX : extra;
+static inline uint64_t fs_file_prealloc_for(uint64_t size) {
+    uint64_t extra = size / 8U;
+    return (extra > FS_FILE_PREALLOC_MAX) ? (uint64_t)FS_FILE_PREALLOC_MAX : extra;
 }
 
 // The header's tail hint (extent.prev), if it still names the last extent
 // of this file's chain. FS_NULL means "unknown, walk the chain".
-static uint32_t fs_file_tail_from_hint(struct FSDeviceContext* ctx, uint32_t address,
+static uint64_t fs_file_tail_from_hint(struct FSDeviceContext* ctx, uint64_t address,
                                        const struct FSFileHeader* file, struct FSFileExtent* tail) {
-    uint32_t hint = file->extent.prev;
+    uint64_t hint = file->extent.prev;
     if (hint == FS_NULL || hint == address || file->extent.next == FS_NULL)
         return FS_NULL;
     if (!fs_file_extent_read(ctx, hint, tail) || tail->extent.next != FS_NULL)
@@ -267,26 +267,26 @@ static uint32_t fs_file_tail_from_hint(struct FSDeviceContext* ctx, uint32_t add
 
 // Last overflow extent of a file that has at least one.
 // `start_hint` (may be FS_NULL) is any extent known to be in the chain.
-static bool fs_file_find_tail(struct FSDeviceContext* ctx, uint32_t address, const struct FSFileHeader* file,
-                              uint32_t start_hint, uint32_t* tail_out, struct FSFileExtent* tail) {
+static bool fs_file_find_tail(struct FSDeviceContext* ctx, uint64_t address, const struct FSFileHeader* file,
+                              uint64_t start_hint, uint64_t* tail_out, struct FSFileExtent* tail) {
     *tail_out = FS_NULL;
     if (file->extent.next == FS_NULL)
         return false;
 
-    uint32_t found = fs_file_tail_from_hint(ctx, address, file, tail);
+    uint64_t found = fs_file_tail_from_hint(ctx, address, file, tail);
     if (found != FS_NULL) {
         *tail_out = found;
         return true;
     }
 
-    uint32_t current = start_hint;
+    uint64_t current = start_hint;
     if (current == FS_NULL || current == address || !fs_file_extent_read(ctx, current, tail)) {
         current = file->extent.next;
         if (!fs_file_extent_read(ctx, current, tail))
             return false;
     }
 
-    uint32_t guard = fs_file_walk_limit(ctx);
+    uint64_t guard = fs_file_walk_limit(ctx);
     while (tail->extent.next != FS_NULL) {
         if (guard-- == 0)
             return false;
@@ -305,7 +305,7 @@ static bool fs_file_find_tail(struct FSDeviceContext* ctx, uint32_t address, con
 // head again.
 //
 // On return file->cur_extent / cur_start / cur_size describe that part.
-static bool fs_file_locate(FileHandle* file, const struct FSFileHeader* header, uint32_t position) {
+static bool fs_file_locate(FileHandle* file, const struct FSFileHeader* header, uint64_t position) {
     struct FSDeviceContext* ctx = file->ctx;
     struct FSFileExtent ext_buf;
     struct FSFileExtent* ext = &ext_buf;
@@ -327,9 +327,9 @@ static bool fs_file_locate(FileHandle* file, const struct FSFileHeader* header, 
         return true;
     }
 
-    uint32_t guard   = fs_file_walk_limit(ctx);
-    uint32_t current = FS_NULL;
-    uint32_t start   = 0;
+    uint64_t guard   = fs_file_walk_limit(ctx);
+    uint64_t current = FS_NULL;
+    uint64_t start   = 0;
     bool     cached  = false;
 
     if (cursor_current && file->cur_extent != file->address &&
@@ -343,7 +343,7 @@ static bool fs_file_locate(FileHandle* file, const struct FSFileHeader* header, 
                 cached = false;     // Nearer the head: restart from there
             } else {
                 while (position < start) {
-                    uint32_t prev = ext->extent.prev;
+                    uint64_t prev = ext->extent.prev;
                     struct FSFileExtent before;
                     if (guard-- == 0 || prev == FS_NULL || prev == file->address ||
                         !fs_file_extent_read(ctx, prev, &before) ||
@@ -411,16 +411,21 @@ static bool fs_file_handle_header(const FileHandle* file, struct FSFileHeader* h
 //      remainder in one extent when possible.
 // New extents are built detached and linked only once everything has been
 // allocated; on failure everything is rolled back and the file is unchanged.
-static bool fs_file_grow(struct FSDeviceContext* ctx, uint32_t address, struct FSFileHeader* file,
-                         uint32_t new_size, uint32_t start_hint) {
-    uint32_t growth  = new_size - file->total_logical_size;
-    uint32_t reserve = fs_file_prealloc_for(new_size);
+static bool fs_file_grow(struct FSDeviceContext* ctx, uint64_t address, struct FSFileHeader* file,
+                         uint64_t new_size, uint64_t start_hint) {
+    // No file can outgrow the device; this also keeps the size sums below
+    // far from overflowing
+    if (new_size > ctx->pool_size)
+        return false;
+
+    uint64_t growth  = new_size - file->total_logical_size;
+    uint64_t reserve = fs_file_prealloc_for(new_size);
 
     // The last part: the header's inline data, or the last extent
     bool     tail_is_header = (file->extent.next == FS_NULL);
-    uint32_t tail = address;
+    uint64_t tail = address;
     struct FSFileExtent tail_ext;
-    uint32_t tail_data;
+    uint64_t tail_data;
     if (tail_is_header) {
         tail_data = file->inline_size;
     } else {
@@ -431,18 +436,18 @@ static bool fs_file_grow(struct FSDeviceContext* ctx, uint32_t address, struct F
     uint32_t tail_header = fs_file_part_header_size(tail, address);
 
     // 1 + 2: room in (or right after) the last part
-    uint32_t tail_alloc_before = 0;
+    uint64_t tail_alloc_before = 0;
     bool     tail_extended = false;
-    uint32_t capacity = fs_file_part_capacity(ctx, tail, tail_header, &tail_alloc_before);
+    uint64_t capacity = fs_file_part_capacity(ctx, tail, tail_header, &tail_alloc_before);
     if (capacity < tail_data)
         capacity = tail_data;
-    uint32_t room = capacity - tail_data;
+    uint64_t room = capacity - tail_data;
 
     if (room < growth) {
         uint64_t want = (uint64_t)tail_header + tail_data + growth;
-        if (want + reserve <= 0xFFFFFFFFULL && fs_alloc_resize(ctx, tail, (uint32_t)(want + reserve)))
+        if (fs_alloc_resize(ctx, tail, want + reserve))
             tail_extended = true;
-        else if (want <= 0xFFFFFFFFULL && fs_alloc_resize(ctx, tail, (uint32_t)want))
+        else if (fs_alloc_resize(ctx, tail, want))
             tail_extended = true;
 
         if (tail_extended) {
@@ -450,19 +455,19 @@ static bool fs_file_grow(struct FSDeviceContext* ctx, uint32_t address, struct F
             room = capacity - tail_data;
         }
     }
-    uint32_t take = (room < growth) ? room : growth;
+    uint64_t take = (room < growth) ? room : growth;
 
     // 3: new extents for whatever is left
-    uint32_t remaining = growth - take;
-    uint32_t first_new = FS_NULL;
-    uint32_t last_new  = FS_NULL;
+    uint64_t remaining = growth - take;
+    uint64_t first_new = FS_NULL;
+    uint64_t last_new  = FS_NULL;
     struct FSFileExtent last_new_ext;
-    uint32_t min_chunk = (ctx->sector_size > 16U) ? ctx->sector_size - 16U : 1U;
-    uint32_t max_chunk = 0xFFFFFFFFU - sizeof(struct FSFileExtent);
+    uint64_t min_chunk = (ctx->sector_size > 16U) ? ctx->sector_size - 16U : 1U;
+    uint64_t max_chunk = ctx->pool_size;    // fs_alloc refuses anything larger
 
     while (remaining > 0) {
-        uint32_t chunk    = (remaining > max_chunk) ? max_chunk : remaining;
-        uint32_t new_addr = FS_NULL;
+        uint64_t chunk    = (remaining > max_chunk) ? max_chunk : remaining;
+        uint64_t new_addr = FS_NULL;
 
         // Whole remainder plus preallocation in a single extent if possible
         if (reserve > 0 && chunk <= max_chunk - reserve)
@@ -485,8 +490,8 @@ static bool fs_file_grow(struct FSDeviceContext* ctx, uint32_t address, struct F
             return false;
         }
 
-        uint32_t new_capacity = fs_file_part_capacity(ctx, new_addr, sizeof(struct FSFileExtent), NULL);
-        uint32_t data         = (new_capacity < remaining) ? new_capacity : remaining;
+        uint64_t new_capacity = fs_file_part_capacity(ctx, new_addr, sizeof(struct FSFileExtent), NULL);
+        uint64_t data         = (new_capacity < remaining) ? new_capacity : remaining;
 
         struct FSFileExtent new_ext;
         memset(&new_ext, 0x00, sizeof(struct FSFileExtent));
@@ -532,10 +537,10 @@ static bool fs_file_grow(struct FSDeviceContext* ctx, uint32_t address, struct F
     return true;
 }
 
-static bool fs_file_shrink(struct FSDeviceContext* ctx, uint32_t address, struct FSFileHeader* file,
-                           uint32_t new_size) {
-    uint32_t cut         = FS_NULL;     // First extent to free
-    uint32_t new_tail    = FS_NULL;     // FS_NULL = no extents left
+static bool fs_file_shrink(struct FSDeviceContext* ctx, uint64_t address, struct FSFileHeader* file,
+                           uint64_t new_size) {
+    uint64_t cut         = FS_NULL;     // First extent to free
+    uint64_t new_tail    = FS_NULL;     // FS_NULL = no extents left
     bool     trim_header = false;
 
     if (new_size <= file->inline_size) {
@@ -545,10 +550,10 @@ static bool fs_file_shrink(struct FSDeviceContext* ctx, uint32_t address, struct
         file->inline_size  = new_size;
         trim_header        = true;
     } else {
-        uint32_t accumulated = file->inline_size;
-        uint32_t current     = file->extent.next;
-        uint32_t previous    = FS_NULL;     // FS_NULL = the header
-        uint32_t guard       = fs_file_walk_limit(ctx);
+        uint64_t accumulated = file->inline_size;
+        uint64_t current     = file->extent.next;
+        uint64_t previous    = FS_NULL;     // FS_NULL = the header
+        uint64_t guard       = fs_file_walk_limit(ctx);
 
         while (current != FS_NULL && guard-- > 0) {
             struct FSFileExtent ext;
@@ -556,7 +561,7 @@ static bool fs_file_shrink(struct FSDeviceContext* ctx, uint32_t address, struct
                 break;
 
             if (ext.extent_data_size >= new_size - accumulated) {
-                uint32_t keep = new_size - accumulated;
+                uint64_t keep = new_size - accumulated;
                 if (keep == 0) {
                     // Drop this extent and everything after it
                     cut = current;
@@ -605,7 +610,7 @@ static bool fs_file_shrink(struct FSDeviceContext* ctx, uint32_t address, struct
     return true;
 }
 
-bool fs_file_resize(struct FSDeviceContext* ctx, uint32_t address, uint32_t new_size) {
+bool fs_file_resize(struct FSDeviceContext* ctx, uint64_t address, uint64_t new_size) {
     if (!ctx) return false;
     struct FSFileHeader file;
     if (!fs_file_check(ctx, address))
@@ -623,7 +628,7 @@ bool fs_file_resize(struct FSDeviceContext* ctx, uint32_t address, uint32_t new_
 // Handles
 // ---------------------------------------------------------------------------
 
-bool fs_file_open(FileHandle* file, struct FSDeviceContext* ctx, uint32_t address, uint8_t mode) {
+bool fs_file_open(FileHandle* file, struct FSDeviceContext* ctx, uint64_t address, uint8_t mode) {
     struct FSFileHeader header;
 
     if (file == NULL)
@@ -671,7 +676,7 @@ void fs_file_close(FileHandle* file) {
     file->cur_generation = 0;
 }
 
-static inline uint32_t fs_file_cursor_data(const FileHandle* file) {
+static inline uint64_t fs_file_cursor_data(const FileHandle* file) {
     return file->cur_extent + fs_file_part_header_size(file->cur_extent, file->address);
 }
 
@@ -683,7 +688,7 @@ uint32_t fs_file_read(FileHandle* file, void* destination, uint32_t size) {
     if (!(file->mode & FS_FILE_MODE_READ)) return 0;
     if (file->position >= header.total_logical_size) return 0;
 
-    uint32_t to_read = header.total_logical_size - file->position;
+    uint64_t to_read = header.total_logical_size - file->position;
     if (to_read > size)
         to_read = size;
 
@@ -692,12 +697,12 @@ uint32_t fs_file_read(FileHandle* file, void* destination, uint32_t size) {
     while (done < to_read) {
         if (!fs_file_locate(file, &header, file->position))
             break;
-        uint32_t offset = file->position - file->cur_start;
-        uint32_t chunk  = file->cur_size - offset;
+        uint64_t offset = file->position - file->cur_start;
+        uint64_t chunk  = file->cur_size - offset;
         if (chunk > to_read - done)
             chunk = to_read - done;
-        fs_mem_read(file->ctx, fs_file_cursor_data(file) + offset, dest + done, chunk);
-        done           += chunk;
+        fs_mem_read(file->ctx, fs_file_cursor_data(file) + offset, dest + done, (uint32_t)chunk);
+        done           += (uint32_t)chunk;
         file->position += chunk;
     }
     return done;
@@ -709,13 +714,13 @@ uint32_t fs_file_write(FileHandle* file, const void* source, uint32_t size) {
     if (source == NULL || size == 0) return 0;
     if (!fs_file_handle_header(file, &header)) return 0;
     if (!(file->mode & FS_FILE_MODE_WRITE)) return 0;
-    if (file->position > 0xFFFFFFFFU - size) return 0;   // Would pass 4 GB
+    if (file->position > file->ctx->pool_size) return 0;   // Can never be stored
 
-    uint32_t end = file->position + size;
+    uint64_t end = file->position + size;
     if (end > header.total_logical_size) {
         // The cursor (if current, and in an extent) is somewhere in the
         // chain: start the tail search there rather than at the head
-        uint32_t hint = (file->cur_extent != 0 && file->cur_extent != file->address &&
+        uint64_t hint = (file->cur_extent != 0 && file->cur_extent != file->address &&
                          file->cur_generation == header.block.chain_generation) ? file->cur_extent : FS_NULL;
         if (!fs_file_grow(file->ctx, file->address, &header, end, hint))
             return 0;
@@ -726,12 +731,12 @@ uint32_t fs_file_write(FileHandle* file, const void* source, uint32_t size) {
     while (done < size) {
         if (!fs_file_locate(file, &header, file->position))
             break;
-        uint32_t offset = file->position - file->cur_start;
-        uint32_t chunk  = file->cur_size - offset;
+        uint64_t offset = file->position - file->cur_start;
+        uint64_t chunk  = file->cur_size - offset;
         if (chunk > size - done)
             chunk = size - done;
-        fs_mem_write(file->ctx, fs_file_cursor_data(file) + offset, src + done, chunk);
-        done           += chunk;
+        fs_mem_write(file->ctx, fs_file_cursor_data(file) + offset, src + done, (uint32_t)chunk);
+        done           += (uint32_t)chunk;
         file->position += chunk;
     }
     if (done > 0)
@@ -739,8 +744,8 @@ uint32_t fs_file_write(FileHandle* file, const void* source, uint32_t size) {
     return done;
 }
 
-uint32_t fs_file_seek(FileHandle* file, uint32_t position) {
-    uint32_t file_size;
+uint64_t fs_file_seek(FileHandle* file, uint64_t position) {
+    uint64_t file_size;
     if (!fs_file_struct_is_valid(file))
         return FS_NULL;
 
@@ -752,7 +757,7 @@ uint32_t fs_file_seek(FileHandle* file, uint32_t position) {
     return position;
 }
 
-uint32_t fs_file_tell(const FileHandle* file) {
+uint64_t fs_file_tell(const FileHandle* file) {
     if (file == NULL)
         return FS_NULL;
     if (!file->is_open)
@@ -760,7 +765,7 @@ uint32_t fs_file_tell(const FileHandle* file) {
     return file->position;
 }
 
-uint32_t fs_file_get_address(const FileHandle* file) {
+uint64_t fs_file_get_address(const FileHandle* file) {
     if (file == NULL)
         return FS_NULL;
     if (!file->is_open)

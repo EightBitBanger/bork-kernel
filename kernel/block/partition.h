@@ -28,6 +28,8 @@
 #define MBR_TYPE_GPT_PROTECTIVE 0xEE
 #define MBR_TYPE_BASEFS         0xDA    // Used by build-disk.sh; keep them in sync
 
+#define MBR_SIGNATURE_OFFSET    0x1B8   // 32-bit disk signature, little endian
+
 struct MbrPartition {
     uint8_t  number;        // 1..4: the table slot, also the name suffix (ata0p1)
     uint8_t  type;          // MBR_TYPE_*
@@ -50,9 +52,15 @@ struct MbrPartition {
 bool block_mbr_parse(const uint8_t* sector0, uint64_t disk_sectors,
                      struct MbrPartition out[MBR_PARTITION_COUNT], uint8_t* count);
 
+// The disk signature in a disk's first sector, or 0 (no signature) when the
+// sector does not end in 55 AA. Tells disks apart: the kernel finds the disk
+// it booted from by matching the signature of the boot area stage 2 read.
+uint32_t block_mbr_signature(const uint8_t* sector0);
+
 // Write a fresh MBR to `disk` with one active partition of `type` covering
 // [start, end of disk). Everything else in sector 0 is preserved (boot code
-// and disk signature), so a disk built by build-disk.sh keeps booting.
+// and disk signature), so a disk built by build-disk.sh keeps booting. A
+// disk with no MBR, or a zero signature, gets a fresh non-zero signature.
 // Any partition devices already created for this disk are stale afterwards;
 // the new table is picked up at the next scan (reboot).
 bool block_mbr_write_single(struct BlockDevice* disk, uint8_t type, uint64_t start);
@@ -62,7 +70,9 @@ bool block_mbr_write_single(struct BlockDevice* disk, uint8_t type, uint64_t sta
 // stage 2 and the kernel file, `image_sectors` long. Sectors 1.. are written
 // as they are; sector 0 keeps the image's boot code but gets a new table
 // with one active partition of `type` from `data_start` to the end of the
-// disk. Everything on the disk is lost; anything mounted from it must be
+// disk. The disk keeps its own signature if it had one; otherwise (or if it
+// equals the image's, a cloned disk) it gets a fresh one, so the copy is
+// never mistaken for the disk it was installed from. Everything on the disk is lost; anything mounted from it must be
 // released first (vfs_device_release_disk).
 bool block_install_boot_area(struct BlockDevice* disk, const uint8_t* image, uint32_t image_sectors,
                              uint8_t type, uint64_t data_start);
@@ -86,8 +96,8 @@ uint64_t block_partition_start(const struct BlockDevice* dev);
 // Decide what on a freshly registered disk should be mounted:
 //
 //   1. Sector 0 holds a whole-disk volume (probe() says so): the disk itself.
-//   2. Sector 0 holds an MBR: one partition device per usable entry of
-//      `type`, never the disk itself, so nothing mounted can overwrite the
+//   2. Sector 0 holds an MBR: one partition device per usable entry whose
+//      type accepts() takes, never the disk itself, so nothing mounted can overwrite the
 //      table or the boot code and kernel in front of the first partition.
 //   3. Anything else (blank, unformatted, unreadable): the disk itself, so
 //      it can be formatted as a whole-disk volume, exactly as before.
@@ -98,23 +108,25 @@ typedef enum {
     BLOCK_SCAN_WHOLE_VOLUME,    // Case 1: disk mounted whole, it holds a volume
     BLOCK_SCAN_WHOLE_BLANK,     // Case 3: disk mounted whole, nothing recognized
     BLOCK_SCAN_PARTITIONS,      // Case 2: at least one partition mounted
-    BLOCK_SCAN_NO_PARTITIONS,   // Case 2, but no usable entry of `type`: nothing mounted
+    BLOCK_SCAN_NO_PARTITIONS,   // Case 2, but no usable accepted entry: nothing mounted
     BLOCK_SCAN_ERROR            // Bad arguments, or partition devices could not be registered
 } BlockScanResult;
 
 struct BlockScanReport {
     BlockScanResult result;
     uint8_t mounted;            // Devices handed to mount()
-    uint8_t skipped;            // Entries of `type` that were not usable
+    uint8_t skipped;            // Accepted entries that were not usable
     uint8_t foreign;            // Entries of other types (left alone)
 };
 
 // True if this first sector belongs to a volume that spans the whole disk
 typedef bool (*block_probe_fn)(const uint8_t* sector0, uint32_t sector_size);
+// True if partitions of this MBR type byte should be mounted
+typedef bool (*block_type_fn)(uint8_t type);
 typedef void (*block_mount_fn)(struct BlockDevice* device, void* arg);
 
 // Not reentrant: uses one static sector buffer. Call from the boot-time scan.
-struct BlockScanReport block_scan_disk(struct BlockDevice* disk, uint8_t type,
+struct BlockScanReport block_scan_disk(struct BlockDevice* disk, block_type_fn accepts,
                                        block_probe_fn probe, block_mount_fn mount, void* arg);
 
 #endif

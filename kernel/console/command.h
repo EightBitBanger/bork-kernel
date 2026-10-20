@@ -6,8 +6,8 @@
 // Console command registry
 //
 // The built-in shell commands (ls, cd, format, ...) and the "run a program"
-// step the console falls back to. This used to live in syscall/ under
-// syscall_* names; syscall/ now holds only the ring 3 system call interface.
+// step the console falls back to. Not to be confused with syscall/, the
+// ring 3 system call interface.
 //
 // Each command is a console_cmd_* function in console/commands/<name>.h,
 // called with the words typed after the command name:
@@ -44,6 +44,7 @@ typedef enum {
     CONSOLE_CMD_FORMAT,
     CONSOLE_CMD_CHKDSK,
     CONSOLE_CMD_BOOT,
+    CONSOLE_CMD_LSUSB,
 
     CONSOLE_CMD_COUNT
 } ConsoleCommandId;

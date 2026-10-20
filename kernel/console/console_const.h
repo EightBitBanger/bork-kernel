@@ -1,4 +1,3 @@
-
 #ifndef CONSOLE_CONST_H
 #define CONSOLE_CONST_H
 
@@ -10,5 +9,8 @@ static const char* msg_dir_error         = "Directory error\n";
 static const char* msg_dir_sym           = "<DIR>";
 static const char* msg_dir_root          = "/>";
 static const char* msg_path_too_long     = "Path too long\n";
+
+static const char* msg_too_many_args     = "Too many arguments (at most 15)\n";
+static const char* msg_open_quote        = "Missing closing quote\n";
 
 #endif

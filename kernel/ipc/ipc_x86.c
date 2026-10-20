@@ -66,8 +66,9 @@ bool ipc_plat_user_write(void* space, uint32_t user_addr, const void* src, uint3
 //
 
 void* ipc_plat_alloc_pages(uint32_t pages) {
-    // vmm_alloc_pages() panics rather than fail; SYS_SHM_TOTAL_MAX keeps
-    // shared memory to a size the machine is expected to have
+    // NULL when the kernel is out of memory (the caller returns SYS_ENOMEM).
+    // SYS_SHM_TOTAL_MAX keeps shared memory to a size the machine is
+    // expected to have.
     void* kva = vmm_alloc_pages(pages);
     if (kva != NULL)
         memset(kva, 0, (size_t)pages * PAGE_SIZE);

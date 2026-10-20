@@ -1,4 +1,5 @@
 
+
 #include <stdbool.h>
 
 #include <kernel/console/display.h>
@@ -7,8 +8,7 @@
 #include <kernel/util/string.h>
 
 // The cursor lives in the display driver; print() only reads and moves it
-// through the display API. (It used to declare the driver's uint16_t cursor
-// variables as uint8_t, so columns past 255 wrapped.)
+// through the display API.
 //
 // Deferred wrap: after a character lands in the last column the cursor stays
 // on that cell with a wrap pending, and the next printable character moves to
@@ -101,6 +101,20 @@ void print(const char* str) {
     while (*str)
         print_char((uint8_t)*str++);
     display_end_update();
+}
+
+void print_next_position(int32_t* column, int32_t* line) {
+    int32_t c = display_cursor_get_position();
+    int32_t l = display_cursor_get_line();
+
+    if (print_wrap_pending()) {
+        c = 0;
+        l++;
+    }
+    wrap_pending = false;
+
+    if (column != NULL) *column = c;
+    if (line != NULL)   *line   = l;
 }
 
 void print_backspace(void) {

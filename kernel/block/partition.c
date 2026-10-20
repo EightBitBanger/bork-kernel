@@ -1,4 +1,5 @@
 #include <kernel/block/partition.h>
+#include <kernel/util/timer.h>
 
 // Partition devices and MBR scanning. See partition.h.
 //
@@ -196,6 +197,33 @@ bool block_mbr_parse(const uint8_t* sector0, uint64_t disk_sectors,
 }
 
 // Clear the table in an MBR sector and describe one active partition
+uint32_t block_mbr_signature(const uint8_t* sector0) {
+    if (sector0 == NULL || sector0[510] != 0x55 || sector0[511] != 0xAA)
+        return 0;
+    return mbr_le32(sector0 + MBR_SIGNATURE_OFFSET);
+}
+
+// A fresh disk signature for `disk`: non-zero and not `avoid`. It only has
+// to tell this machine's disks apart, so FNV-1a over the time since boot,
+// the disk's name and size and what its sector 0 held before (`old`, one
+// MBR_SECTOR_SIZE sector) is enough.
+static uint32_t mbr_new_signature(const struct BlockDevice* disk, const uint8_t* old, uint32_t avoid) {
+    uint32_t hash = 2166136261u;
+    uint64_t mix[2] = { timer_get_ms(), disk->sector_count };
+
+    const uint8_t* bytes = (const uint8_t*)mix;
+    for (uint32_t i = 0; i < sizeof(mix); i++)
+        hash = (hash ^ bytes[i]) * 16777619u;
+    for (uint32_t i = 0; i < BLOCK_NAME_MAX && disk->name[i] != '\0'; i++)
+        hash = (hash ^ (uint8_t)disk->name[i]) * 16777619u;
+    for (uint32_t i = 0; i < MBR_SECTOR_SIZE; i++)
+        hash = (hash ^ old[i]) * 16777619u;
+
+    while (hash == 0 || hash == avoid)
+        hash = hash * 16777619u + 1;
+    return hash;
+}
+
 static void mbr_fill_single(uint8_t* sector, uint8_t type, uint64_t start, uint64_t count) {
     for (uint32_t i = MBR_TABLE_OFFSET; i < 510; i++)
         sector[i] = 0;
@@ -234,11 +262,15 @@ bool block_mbr_write_single(struct BlockDevice* disk, uint8_t type, uint64_t sta
     uint8_t entries;
     bool keep = block_read(disk, 0, 1, scan_buffer) &&
                 block_mbr_parse(scan_buffer, disk->sector_count, table, &entries);
+    uint32_t signature = keep ? block_mbr_signature(scan_buffer) : 0;
+    if (signature == 0)
+        signature = mbr_new_signature(disk, scan_buffer, 0);
     if (!keep) {
         for (uint32_t i = 0; i < MBR_SECTOR_SIZE; i++)
             scan_buffer[i] = 0;
     }
 
+    mbr_put_le32(scan_buffer + MBR_SIGNATURE_OFFSET, signature);
     mbr_fill_single(scan_buffer, type, start, mbr_count_to_end(disk, start));
     return block_write(disk, 0, 1, scan_buffer) && block_flush(disk);
 }
@@ -254,6 +286,16 @@ bool block_install_boot_area(struct BlockDevice* disk, const uint8_t* image, uin
     if (image[510] != 0x55 || image[511] != 0xAA)
         return false;   // Sector 0 of the image is not a boot sector
 
+    // The disk's own signature, or a fresh one when it has none or shares
+    // the image's (a clone of the boot disk). Read before anything is
+    // written; the old sector 0 also seeds the fresh signature.
+    uint32_t image_signature = block_mbr_signature(image);
+    if (!block_read(disk, 0, 1, scan_buffer))
+        return false;
+    uint32_t signature = block_mbr_signature(scan_buffer);
+    if (signature == 0 || signature == image_signature)
+        signature = mbr_new_signature(disk, scan_buffer, image_signature);
+
     // Stage 2 and the kernel first, sector 0 last: until the new MBR lands,
     // the disk keeps whatever it had in sector 0
     for (uint32_t lba = 1; lba < image_sectors; ) {
@@ -268,6 +310,7 @@ bool block_install_boot_area(struct BlockDevice* disk, const uint8_t* image, uin
     // The image's boot code with a table describing THIS disk
     for (uint32_t i = 0; i < MBR_SECTOR_SIZE; i++)
         scan_buffer[i] = image[i];
+    mbr_put_le32(scan_buffer + MBR_SIGNATURE_OFFSET, signature);
     mbr_fill_single(scan_buffer, type, data_start, mbr_count_to_end(disk, data_start));
 
     return block_write(disk, 0, 1, scan_buffer) && block_flush(disk);
@@ -277,10 +320,10 @@ bool block_install_boot_area(struct BlockDevice* disk, const uint8_t* image, uin
 // Disk scan
 //
 
-struct BlockScanReport block_scan_disk(struct BlockDevice* disk, uint8_t type,
+struct BlockScanReport block_scan_disk(struct BlockDevice* disk, block_type_fn accepts,
                                        block_probe_fn probe, block_mount_fn mount, void* arg) {
     struct BlockScanReport report = { BLOCK_SCAN_ERROR, 0, 0, 0 };
-    if (disk == NULL || mount == NULL)
+    if (disk == NULL || mount == NULL || accepts == NULL)
         return report;
 
     bool readable = disk->sector_size <= SCAN_BUFFER_SIZE &&
@@ -305,7 +348,7 @@ struct BlockScanReport block_scan_disk(struct BlockDevice* disk, uint8_t type,
 
         bool registration_failed = false;
         for (uint8_t i = 0; i < entries; i++) {
-            if (table[i].type != type) {
+            if (!accepts(table[i].type)) {
                 report.foreign++;
                 continue;
             }

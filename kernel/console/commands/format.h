@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 #include <kernel/console/display.h>
-#include <kernel/fs/fs.h>
+#include <kernel/util/string.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/block/block.h>
 #include <kernel/block/partition.h>
@@ -40,6 +40,13 @@ static const char* msg_percent           = "%";
 static const char* msg_init_progress     = "0%";
 static const char* msg_quick_progress    = "50%";
 static const char* msg_final_progress    = "100%\n\n";
+
+// print_int() is signed 32-bit: sizes past 2 GB need this
+static void format_print_u64(uint64_t value) {
+    char text[21];
+    u64tos(value, text);
+    print(text);
+}
 
 static void format_print_progress(uint32_t percent) {
     display_cursor_set_position(0);
@@ -90,29 +97,27 @@ int console_cmd_format(int arg_count, char** args) {
         return 1;
     }
 
-    struct FSDeviceContext* active_ctx = vfs_device_context(device);
-    if (active_ctx == NULL) {
+    struct FsMount* mount = vfs_device_context(device);
+    if (mount == NULL) {
         format_suggest_partition(device);
         return 1;
     }
 
-    uint32_t max_capacity = fs_device_max_capacity(device);
+    char mount_path[8 + BLOCK_NAME_MAX];
+    strcpy(mount_path, "/mnt/");
+    strcat(mount_path, device->name);
+
+    uint64_t max_capacity = vfs_device_max_capacity(mount);
 
     // Defaults: keep the current layout, or use the whole device when blank
-    uint32_t total_capacity = max_capacity;
+    uint64_t total_capacity = max_capacity;
     uint32_t sector_size    = 512UL;
     bool     quick_format   = false;
 
-    if (active_ctx->is_open) {
-        struct FSPartitionBlock existing_part;
-        vfs_lock();
-        uint8_t has_part = fs_device_get_partition(active_ctx, &existing_part);
-        vfs_unlock();
-
-        if (has_part == 0) {
-            if (existing_part.total_size > 0)  total_capacity = existing_part.total_size;
-            if (existing_part.sector_size > 0) sector_size    = existing_part.sector_size;
-        }
+    VfsDeviceInfo existing;
+    if (vfs_device_get_info(mount_path, &existing) && existing.formatted) {
+        if (existing.total_size > 0) total_capacity = existing.total_size;
+        if (existing.block_size > 0) sector_size    = existing.block_size;
     }
 
     for (int i = 1; i < arg_count; i++) {
@@ -156,11 +161,11 @@ int console_cmd_format(int arg_count, char** args) {
                     return format_bad_argument(msg_invalid_val, argument);
                 if (bytes > max_capacity) {
                     print(msg_too_large);
-                    print_int(max_capacity);
+                    format_print_u64(max_capacity);
                     print(msg_bytes_close);
                     return 3;
                 }
-                total_capacity = (uint32_t)bytes;
+                total_capacity = bytes;
             }
             else if (value == 32 || value == 64 || value == 512 || value == 1024) {
                 sector_size = (uint32_t)value;
@@ -175,13 +180,13 @@ int console_cmd_format(int arg_count, char** args) {
     }
 
     // A size that is not a whole number of blocks would leave a partial
-    // block at the end that basefs can never allocate
+    // block at the end that the filesystem can never allocate
     total_capacity -= total_capacity % sector_size;
 
     print(msg_formatting);
     print(device->name);
     print(msg_ellipsis);
-    print_int(total_capacity);
+    format_print_u64(total_capacity);
     print(msg_bytes_total);
     print_int(sector_size);
     print(msg_sector_size);
@@ -190,7 +195,7 @@ int console_cmd_format(int arg_count, char** args) {
 
     // Wipe (unless quick), write the headers, bitmap and an empty root
     // directory, and re-open the mount, all under the VFS lock
-    VfsFormatResult result = vfs_device_format_context(active_ctx, total_capacity, sector_size,
+    VfsFormatResult result = vfs_device_format_context(mount, total_capacity, sector_size,
                                                        !quick_format, format_print_progress);
 
     if (result != VFS_FORMAT_OK) {
@@ -201,7 +206,7 @@ int console_cmd_format(int arg_count, char** args) {
         }
         if (result == VFS_FORMAT_BAD_SIZE) {
             print(msg_too_large);
-            print_int(max_capacity);
+            format_print_u64(max_capacity);
             print(msg_bytes_close);
             return 3;
         }
@@ -212,12 +217,8 @@ int console_cmd_format(int arg_count, char** args) {
     // The new root must read back. (The console's working directory needs
     // no fixing up: it is a path, and if it no longer exists the prompt
     // falls back to the nearest directory that does, here the device root.)
-    struct FSPartitionBlock partition;
-    vfs_lock();
-    uint8_t has_part = fs_device_get_partition(active_ctx, &partition);
-    vfs_unlock();
-
-    if (has_part != 0 || partition.root_directory == FS_NULL) {
+    VfsDeviceInfo formatted;
+    if (!vfs_device_get_info(mount_path, &formatted) || !formatted.formatted) {
         display_cursor_set_position(0);
         print(msg_failed);
         return 4;

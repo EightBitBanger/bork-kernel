@@ -16,8 +16,8 @@ static char hku_hive_path[REGISTRY_MAX_PATH_LEN] = { 0 };
 static size_t registry_calculate_total_export_size(struct RegistryHive* hive);
 static size_t registry_calculate_key_size_recursive(struct RegistryKey* key);
 
-// vfs_read/vfs_write return the byte count on success and -1 on error.
-// The old code tested `!vfs_read(...)`, which treated -1 (and short reads) as success.
+// vfs_read/vfs_write return the byte count on success and -1 on error, so
+// compare against the size: `!vfs_read(...)` would accept -1 and short reads.
 static bool reg_read_exact(File file, void* buffer, uint32_t size) {
     if (size == 0) return true;
     return vfs_read(file, buffer, size) == (int32_t)size;

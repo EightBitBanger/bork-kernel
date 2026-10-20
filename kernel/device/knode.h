@@ -6,24 +6,26 @@
 #define KDIRECTORY_REF_MAX    6
 #define KDIRECTORYEX_REF_MAX  11
 
+struct KernelDirectoryExtent;
+
 struct KernelDirectory {
     char name[16];
     
-    uint32_t parent;
+    struct KernelDirectory* parent;
     
-    uint32_t next;
-    uint32_t prev;
+    struct KernelDirectoryExtent* next;     // First extent
+    struct KernelDirectoryExtent* prev;     // Last extent
     
     uint32_t size;
-    uint32_t reference[KDIRECTORY_REF_MAX];
+    void* reference[KDIRECTORY_REF_MAX];
 };
 
 struct KernelDirectoryExtent {
-    uint32_t next;
-    uint32_t prev;
+    struct KernelDirectoryExtent* next;
+    struct KernelDirectoryExtent* prev;
     
     uint32_t size;
-    uint32_t reference[KDIRECTORYEX_REF_MAX];
+    void* reference[KDIRECTORYEX_REF_MAX];
 };
 
 #endif

@@ -10,6 +10,8 @@
 // Palette entries are 0xAARRGGBB; see-through pixels use opaque black
 // (SYS_GFX_SPRITE_KEY).
 
+#define COLOR(val) (uint16_t)((val) & 0xFFFF), (uint16_t)((val) >> 16)
+
 #include <stdint.h>
 
 struct Sprite {

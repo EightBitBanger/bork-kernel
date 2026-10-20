@@ -4,7 +4,8 @@
 
 // On-disk format version, stored in FSPartitionBlock.version.
 // fs_device_open refuses any other value (version 1 images had 0 there).
-#define FS_FORMAT_VERSION           2
+// Version 3: every disk address, size and file offset is 64-bit.
+#define FS_FORMAT_VERSION           3
 
 // Longest file or directory name in bytes, without terminator. Names live
 // in directory entries (FSDirEntry.name_len is 8 bits, so at most 255).

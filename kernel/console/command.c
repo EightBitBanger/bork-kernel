@@ -39,11 +39,12 @@
 
 #include <kernel/console/commands/chkdsk.h>
 #include <kernel/console/commands/boot.h>
+#include <kernel/console/commands/lsusb.h>
 
 // Indexed by id, so console_command_run() needs no search and a missing or
 // misplaced row is caught at compile time (array size) or by the NULL check.
 static const ConsoleCommand command_table[] = {
-    [CONSOLE_CMD_EXECUTE] = { "",       CONSOLE_CMD_EXECUTE, console_cmd_execute_default, 0,                       NULL },
+    [CONSOLE_CMD_EXECUTE] = { "",       CONSOLE_CMD_EXECUTE, console_cmd_execute_default, 0,                NULL },
     [CONSOLE_CMD_HELP]    = { "help",   CONSOLE_CMD_HELP,    console_cmd_help,    CONSOLE_CMD_FLAG_BUILTIN, "list commands" },
     [CONSOLE_CMD_CLS]     = { "cls",    CONSOLE_CMD_CLS,     console_cmd_clear,   CONSOLE_CMD_FLAG_BUILTIN, "clear the screen" },
     [CONSOLE_CMD_LIST]    = { "ls",     CONSOLE_CMD_LIST,    console_cmd_lsdir,   CONSOLE_CMD_FLAG_BUILTIN, "ls [dir], list a directory" },
@@ -60,7 +61,8 @@ static const ConsoleCommand command_table[] = {
     [CONSOLE_CMD_FORMAT]  = { "format", CONSOLE_CMD_FORMAT,  console_cmd_format,  CONSOLE_CMD_FLAG_BUILTIN, "format <device> [-q] [-k<KB>|-M<MB>] [-s<size>]" },
     [CONSOLE_CMD_CHKDSK]  = { "chkdsk", CONSOLE_CMD_CHKDSK,  console_cmd_chkdsk,  CONSOLE_CMD_FLAG_BUILTIN, "chkdsk [path], device geometry" },
 
-    [CONSOLE_CMD_BOOT]    = { "boot",   CONSOLE_CMD_BOOT,    console_cmd_boot,    CONSOLE_CMD_FLAG_BUILTIN, "boot install <disk> | boot repair" }
+    [CONSOLE_CMD_BOOT]    = { "boot",   CONSOLE_CMD_BOOT,    console_cmd_boot,    CONSOLE_CMD_FLAG_BUILTIN, "boot install <disk> | boot repair" },
+    [CONSOLE_CMD_LSUSB]   = { "lsusb",  CONSOLE_CMD_LSUSB,   console_cmd_lsusb,   CONSOLE_CMD_FLAG_BUILTIN, "list USB devices" }
 };
 
 _Static_assert(sizeof(command_table) / sizeof(command_table[0]) == CONSOLE_CMD_COUNT,
