@@ -3,7 +3,6 @@
 #include <kernel/malloc.h>
 
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
 #include <kernel/vfs/vfs_internal.h>
 
@@ -11,23 +10,23 @@
 #include <kernel/util/tok.h>
 #include <kernel/util/list.h>
 
-// Name validation (vfs_name_is_valid) and the VFS_NAME_MAX == FS_NAME_MAX
-// check live in vfs_parse.c, shared with path resolution.
+// Name validation (vfs_name_is_valid) lives in vfs_parse.c, shared with
+// path resolution.
 
-// True if an open file sits at `address` or anywhere below it on `ctx`.
+// True if an open file sits at `address` or anywhere below it on `mount`.
 // Freeing such an object would leave the handle pointing at freed blocks.
-// Walks each open file's parent chain (every header records its parent).
-static bool vfs_fs_node_in_use(struct FSDeviceContext* ctx, uint32_t address) {
+// Walks each open file's parent chain.
+static bool vfs_fs_node_in_use(struct FsMount* mount, uint64_t address) {
     for (struct list_node* n = open_files_head; n != NULL; n = n->next) {
         OpenFileDescriptor* desc = (OpenFileDescriptor*)n->data;
-        if (desc == NULL || !desc->in_file_system || desc->ctx != ctx)
+        if (desc == NULL || !desc->in_file_system || desc->mount != mount)
             continue;
-        uint32_t node  = desc->address;
+        uint64_t node  = desc->address;
         uint32_t guard = 1024;      // Far deeper than any real tree
-        while (node != FS_NULL && node != 0 && guard-- > 0) {
+        while (node != FS_NODE_NULL && node != 0 && guard-- > 0) {
             if (node == address)
                 return true;
-            node = fs_file_get_parent(ctx, node);
+            node = mount->type->parent(mount, node);
         }
     }
     return false;
@@ -63,25 +62,43 @@ static bool vfs_split_path(const char* path, char* parent_path, size_t parent_si
 static File do_open(const char* path, uint16_t flags) {
     if (path == NULL || path[0] == '\0') 
         return VFS_INVALID_FILE;
-    uint32_t current_knode = 0;
-    uint32_t current_fs_node = 0;
-    bool in_file_system = false;
-    struct FSDeviceContext* ctx = NULL;
 
-    if (!vfs_parse_path(path, flags, &current_knode, &current_fs_node, &in_file_system, &ctx)) {
+    // Truncating and appending change the file: they only make sense on a
+    // handle that may write
+    bool modifying = (flags & (VFS_OPEN_TRUNCATE | VFS_OPEN_APPEND)) != 0;
+    if (modifying && !(flags & VFS_OPEN_WRITE))
+        return VFS_INVALID_FILE;
+
+    void* current_knode = NULL;
+    uint64_t current_fs_node = 0;
+    bool in_file_system = false;
+    struct FsMount* mount = NULL;
+
+    if (!vfs_parse_path(path, flags, &current_knode, &current_fs_node, &in_file_system, &mount)) {
         return VFS_INVALID_FILE;
     }
     
     if (in_file_system) {
-        if (!fs_file_check(ctx, current_fs_node)) {
+        if (!vfs_node_is_file(mount, current_fs_node)) {
             return VFS_INVALID_FILE;
         }
-        if (!vfs_fs_node_allowed(ctx, current_fs_node)) {
+        if (!vfs_fs_node_allowed(mount, current_fs_node)) {
             return VFS_INVALID_FILE;    // Needs clearance the caller lacks
+        }
+        if (modifying) {
+            // Refuse rather than open read-only and drop the request
+            uint8_t perm = vfs_node_permissions(mount, current_fs_node);
+            if (!(perm & VFS_PERMISSION_WRITE))
+                return VFS_INVALID_FILE;
         }
     } else {
         uint8_t k_flags = kmalloc_get_flags(current_knode);
         if (k_flags & KMALLOC_FLAG_DIRECTORY) {
+            return VFS_INVALID_FILE;
+        }
+        // Kernel nodes are fixed-size blocks: they can neither be emptied
+        // nor grown at the end
+        if (modifying) {
             return VFS_INVALID_FILE;
         }
     }
@@ -94,31 +111,51 @@ static File do_open(const char* path, uint16_t flags) {
     if (desc->id == VFS_INVALID_FILE) desc->id = next_unique_id++;  // skip 0 on wrap
     
     desc->in_file_system = in_file_system;
-    desc->address = in_file_system ? current_fs_node : current_knode;
+    desc->address = in_file_system ? current_fs_node : 0;
+    desc->knode = in_file_system ? NULL : current_knode;
     desc->offset = 0;
     desc->flags = flags;
-    desc->ctx = ctx;
+    desc->mount = mount;
+    desc->handle = NULL;
 
     if (desc->in_file_system) {
-        uint8_t perm = 0;
-        fs_file_get_permissions(desc->ctx, desc->address, &perm);
-        
-        uint8_t target_mode = 0;
-        if ((flags & VFS_OPEN_READ) && (perm & FS_PERMISSION_READ))    target_mode |= FS_FILE_MODE_READ;
-        if ((flags & VFS_OPEN_WRITE) && (perm & FS_PERMISSION_WRITE))  target_mode |= FS_FILE_MODE_WRITE;
-        if (target_mode == 0) {
-            target_mode = FS_FILE_MODE_READ;
-        }
-        
-        if (!fs_file_open(&desc->handle, desc->ctx, desc->address, target_mode)) {
+        FsNodeAttr attr;
+        if (!mount->type->get_attr(mount, desc->address, &attr)) {
             free(desc);
             return VFS_INVALID_FILE;
         }
+        
+        uint16_t target_mode = 0;
+        if ((flags & VFS_OPEN_READ) && (attr.permissions & VFS_PERMISSION_READ))    target_mode |= VFS_OPEN_READ;
+        if ((flags & VFS_OPEN_WRITE) && (attr.permissions & VFS_PERMISSION_WRITE))  target_mode |= VFS_OPEN_WRITE;
+        if (target_mode == 0) {
+            target_mode = VFS_OPEN_READ;
+        }
+        if (flags & VFS_OPEN_APPEND) {
+            target_mode |= VFS_OPEN_APPEND;     // Handle starts at the end
+        }
+        
+        // Every check has passed and the descriptor exists: only now empty
+        // the file, so a refused open never loses data. (basefs: the resize
+        // bumps the chain generation, so other handles on this file drop
+        // their cached position safely.)
+        if ((flags & VFS_OPEN_TRUNCATE) && attr.size != 0 &&
+            !mount->type->resize(mount, desc->address, 0)) {
+            free(desc);
+            return VFS_INVALID_FILE;
+        }
+        
+        desc->handle = mount->type->open(mount, desc->address, target_mode);
+        if (desc->handle == NULL) {
+            free(desc);
+            return VFS_INVALID_FILE;
+        }
+        desc->offset = mount->type->tell(desc->handle);
     }
     
     if (!list_append(&open_files_head, &open_files_tail, desc)) {
         if (desc->in_file_system) {
-            fs_file_close(&desc->handle);
+            mount->type->close(desc->handle);
         }
         free(desc);
         return VFS_INVALID_FILE;
@@ -131,7 +168,7 @@ static void do_close(File file) {
     OpenFileDescriptor* desc = vfs_file_find_open(file);
     if (!desc) return;
     if (desc->in_file_system) {
-        fs_file_close(&desc->handle);
+        desc->mount->type->close(desc->handle);
     }
     
     list_remove(&open_files_head, &open_files_tail, desc);
@@ -142,26 +179,28 @@ static int32_t do_read(File file, void* buffer, uint32_t size) {
     OpenFileDescriptor* desc = vfs_file_find_open(file);
     if (!desc) return -1;
     if (desc->in_file_system) {
-        uint8_t parent_perm = 0;
-        fs_file_get_permissions(desc->ctx, desc->address, &parent_perm);
-        if (!(parent_perm & FS_PERMISSION_READ)) 
+        struct FsMount* mount = desc->mount;
+        uint8_t parent_perm = vfs_node_permissions(mount, desc->address);
+        if (!(parent_perm & VFS_PERMISSION_READ)) 
             return -1;
-        if (!vfs_fs_node_allowed(desc->ctx, desc->address))
+        if (!vfs_fs_node_allowed(mount, desc->address))
             return -1;
-        return fs_file_read(&desc->handle, buffer, size);
+        int32_t got = (int32_t)mount->type->read(desc->handle, buffer, size);
+        desc->offset = mount->type->tell(desc->handle);
+        return got;
     } else {
         uint8_t parent_perm = 0;
-        parent_perm = kmalloc_get_permissions(desc->address);
+        parent_perm = kmalloc_get_permissions(desc->knode);
         
         if (!(parent_perm & KMALLOC_PERMISSION_READ)) 
             return -1;
-        uint32_t node_size = kmalloc_get_size(desc->address);
+        uint32_t node_size = kmalloc_get_size(desc->knode);
         if (desc->offset >= node_size) return 0;
         if (desc->offset + size > node_size) {
             size = node_size - desc->offset;
         }
         
-        kmem_read(buffer, desc->address + desc->offset, size);
+        memcpy(buffer, (const uint8_t*)desc->knode + desc->offset, size);
         desc->offset += size;
         return (int32_t)size;
     }
@@ -172,64 +211,67 @@ static int32_t do_write(File file, const void* buffer, uint32_t size) {
     if (!desc) return -1;
     
     if (desc->in_file_system) {
-        uint8_t parent_perm = 0;
-        fs_file_get_permissions(desc->ctx, desc->address, &parent_perm);
-        if (!(parent_perm & FS_PERMISSION_WRITE)) 
+        struct FsMount* mount = desc->mount;
+        FsNodeAttr attr;
+        if (!mount->type->get_attr(mount, desc->address, &attr) ||
+            !(attr.permissions & VFS_PERMISSION_WRITE)) 
             return -1;
-        if (!vfs_fs_node_allowed(desc->ctx, desc->address))
+        if (!vfs_fs_node_allowed(mount, desc->address))
             return -1;
-        return fs_file_write(&desc->handle, buffer, size);
+        // Append: the end as it is now (another handle may have grown the
+        // file since the last write). The write grows it from there.
+        if (desc->flags & VFS_OPEN_APPEND)
+            mount->type->seek(desc->handle, attr.size);
+        int32_t written = (int32_t)mount->type->write(desc->handle, buffer, size);
+        desc->offset = mount->type->tell(desc->handle);
+        return written;
     } else {
         uint8_t parent_perm = 0;
-        parent_perm = kmalloc_get_permissions(desc->address);
+        parent_perm = kmalloc_get_permissions(desc->knode);
         
         if (!(parent_perm & KMALLOC_PERMISSION_WRITE)) 
             return -1;
-        uint32_t node_size = kmalloc_get_size(desc->address);
+        uint32_t node_size = kmalloc_get_size(desc->knode);
         if (desc->offset >= node_size) return -1;
         if (desc->offset + size > node_size) {
             size = node_size - desc->offset;
         }
         
-        kmem_write(desc->address + desc->offset, buffer, size);
+        memcpy((uint8_t*)desc->knode + desc->offset, buffer, size);
         desc->offset += size;
         return (int32_t)size;
     }
 }
 
-static uint32_t do_seek(File file, uint32_t position) {
+static uint64_t do_seek(File file, uint64_t position) {
     OpenFileDescriptor* desc = vfs_file_find_open(file);
     if (!desc) return VFS_INVALID_FILE;
     
     if (desc->in_file_system) {
-        fs_file_seek(&desc->handle, position);
+        desc->mount->type->seek(desc->handle, position);
     }
     
     desc->offset = position;
     return position;
 }
 
-static uint32_t do_tell(File file) {
+static uint64_t do_tell(File file) {
     OpenFileDescriptor* desc = vfs_file_find_open(file);
     if (!desc) return VFS_INVALID_FILE;
     
-    return (uint32_t)desc->offset;
+    return desc->offset;
 }
 
 static bool do_exists(const char* path) {
     if (path == NULL || path[0] == '\0') 
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx) {
-        if (!fs_file_check(ctx, address)) 
-            if (!fs_check_directory_valid(ctx, address)) 
-                return false;
-        return true;
-    }
-    return kmalloc_is_valid(address);
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount)
+        return vfs_node_type(mount, address) != FS_NODE_NONE;
+    return kmalloc_is_valid(vfs_address_knode(address));
 }
 
 static bool do_mkdir(const char* path) {
@@ -244,30 +286,32 @@ static bool do_mkdir(const char* path) {
     if (!vfs_name_is_valid(target_name))
         return false;
     
-    uint32_t parent = resolve_path_to_address(parent_path);
-    if (parent == 0xFFFFFFFF || parent == 0) {
+    uint64_t parent = resolve_path_to_address(parent_path);
+    if (vfs_address_is_null(parent)) {
         return false;
     }
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(parent_path);
-    if (ctx && fs_check_directory_valid(ctx, parent)) {
-        uint8_t parent_perm = 0;
-        fs_file_get_permissions(ctx, parent, &parent_perm);
+    struct FsMount* mount = vfs_device_get_context(parent_path);
+    if (mount && vfs_node_is_directory(mount, parent)) {
+        uint8_t parent_perm = vfs_node_permissions(mount, parent);
         
-        if (!(parent_perm & FS_PERMISSION_READ) || 
-            !(parent_perm & FS_PERMISSION_WRITE)) 
+        if (!(parent_perm & VFS_PERMISSION_READ) || 
+            !(parent_perm & VFS_PERMISSION_WRITE)) 
             return false;
-        if (!vfs_fs_node_allowed(ctx, parent))
+        if (!vfs_fs_node_allowed(mount, parent))
             return false;
 
         // Names are unique within a directory (files and directories alike).
         // The VFS lock makes this check-then-create atomic.
-        if (fs_directory_find(ctx, parent, target_name) != FS_NULL)
+        if (mount->type->lookup(mount, parent, target_name) != FS_NODE_NULL)
             return false;
 
-        return fs_directory_create(ctx, target_name, FS_PERMISSION_READ | FS_PERMISSION_WRITE, parent) != FS_NULL;
+        return mount->type->create(mount, parent, target_name, FS_NODE_DIRECTORY,
+                                   VFS_PERMISSION_READ | VFS_PERMISSION_WRITE) != FS_NODE_NULL;
     }
-    else if (knode_check_is_valid(parent) && !(kmalloc_get_flags(parent) & KMALLOC_FLAG_MOUNT)) {
+    
+    void* parent_knode = mount ? NULL : vfs_address_knode(parent);
+    if (knode_check_is_valid(parent_knode) && !(kmalloc_get_flags(parent_knode) & KMALLOC_FLAG_MOUNT)) {
         // Kernel nodes keep their short names. (A mount knode reached here
         // has an unusable device: its references are not entries.)
         char knode_name[VFS_KNODE_NAME_MAX];
@@ -277,19 +321,16 @@ static bool do_mkdir(const char* path) {
         memcpy(knode_name, target_name, length + 1);
 
         uint8_t parent_perm = 0;
-        knode_get_permissions(parent, &parent_perm);
+        knode_get_permissions(parent_knode, &parent_perm);
 
         if (!(parent_perm & KMALLOC_PERMISSION_READ) ||
             !(parent_perm & KMALLOC_PERMISSION_WRITE))
             return false;
 
-        uint32_t existing = knode_find_by_name(parent, knode_name);
-        if (existing != KNODE_NULL && existing != 0)
+        if (knode_find_by_name(parent_knode, knode_name) != NULL)
             return false;
 
-        // TODO: check create_knode's result once it reports failure
-        create_knode(knode_name, parent);
-        return true;
+        return create_knode(knode_name, parent_knode) != NULL;
     }
     return false;
 }
@@ -297,56 +338,49 @@ static bool do_mkdir(const char* path) {
 static bool do_remove(const char* path) {
     if (path == NULL || path[0] == '\0') 
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
-    uint32_t parent = resolve_parent_path_to_address(path);
-    if (parent == 0xFFFFFFFF || parent == 0) 
+    uint64_t parent = resolve_parent_path_to_address(path);
+    if (vfs_address_is_null(parent)) 
         return false;
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, parent)) {
-        uint8_t item_perm = 0;
-        uint8_t parent_perm = 0;
-        fs_file_get_permissions(ctx, address, &item_perm);
-        fs_file_get_permissions(ctx, parent, &parent_perm);
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount && vfs_node_is_directory(mount, parent)) {
+        uint8_t item_perm = vfs_node_permissions(mount, address);
+        uint8_t parent_perm = vfs_node_permissions(mount, parent);
         
-        if (!(item_perm & FS_PERMISSION_WRITE) || 
-            !(parent_perm & FS_PERMISSION_READ) || 
-            !(parent_perm & FS_PERMISSION_WRITE)) 
+        if (!(item_perm & VFS_PERMISSION_WRITE) || 
+            !(parent_perm & VFS_PERMISSION_READ) || 
+            !(parent_perm & VFS_PERMISSION_WRITE)) 
             return false;
         // Clearance for the directory, the object and all it contains
-        if (!vfs_fs_node_allowed(ctx, parent) || !vfs_remove_allowed(ctx, address))
+        if (!vfs_fs_node_allowed(mount, parent) || !vfs_remove_allowed(mount, address))
             return false;
         // Never free something an open handle still points into
-        if (vfs_fs_node_in_use(ctx, address))
+        if (vfs_fs_node_in_use(mount, address))
             return false;
         
-        if (fs_file_check(ctx, address)) {
-            // Unlink first: a crash then leaks blocks instead of leaving an
-            // entry that points at freed storage
-            if (fs_directory_remove_entry(ctx, parent, address) != FS_DIR_OK)
-                return false;
-            return fs_file_delete(ctx, address);
-        }
-        
-        // Directories go with everything inside them; basefs unlinks the
-        // directory from its parent before freeing anything
-        if (fs_check_directory_valid(ctx, address))
-            return fs_directory_delete_recursive(ctx, address, parent);
-        
-        return false;
+        // A directory goes with everything inside it
+        if (vfs_node_type(mount, address) == FS_NODE_NONE)
+            return false;
+        return mount->type->remove(mount, parent, address);
     } else {
+        // A device's root (its parent is the /mnt knode) is not a knode to destroy
+        if (mount)
+            return false;
+        void* knode = vfs_address_knode(address);
+        void* parent_knode = vfs_address_knode(parent);
         uint8_t item_perm = 0;
         uint8_t parent_perm = 0;
-        knode_get_permissions(address, &item_perm);
-        knode_get_permissions(parent, &parent_perm);
+        knode_get_permissions(knode, &item_perm);
+        knode_get_permissions(parent_knode, &parent_perm);
         
         if (!(item_perm & KMALLOC_PERMISSION_WRITE) || 
             !(parent_perm & KMALLOC_PERMISSION_READ) || 
             !(parent_perm & KMALLOC_PERMISSION_WRITE)) 
             return false;
-        if (destroy_knode(address, parent)) 
+        if (destroy_knode(knode, parent_knode)) 
             return true;
     }
     
@@ -359,35 +393,38 @@ static bool do_rename(const char* path, const char* name) {
     if (!vfs_name_is_valid(name)) 
         return false;
     
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
     
-    uint32_t parent_address = resolve_parent_path_to_address(path);
-    if (parent_address == 0xFFFFFFFF || parent_address == 0) {
+    uint64_t parent_address = resolve_parent_path_to_address(path);
+    if (vfs_address_is_null(parent_address)) {
         return false;
     }
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, parent_address)) {
-        uint8_t item_perm = 0;
-        fs_file_get_permissions(ctx, address, &item_perm);
-        if (!(item_perm & FS_PERMISSION_WRITE))
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount && vfs_node_is_directory(mount, parent_address)) {
+        uint8_t item_perm = vfs_node_permissions(mount, address);
+        if (!(item_perm & VFS_PERMISSION_WRITE))
             return false;
-        if (!vfs_fs_node_allowed(ctx, address) || !vfs_fs_node_allowed(ctx, parent_address))
+        if (!vfs_fs_node_allowed(mount, address) || !vfs_fs_node_allowed(mount, parent_address))
             return false;
         // The name lives in the parent's entry. The rename refuses a name
         // another entry already has (the VFS lock makes that atomic).
-        return fs_directory_rename_entry(ctx, parent_address, address, name) == FS_DIR_OK;
+        return mount->type->rename(mount, parent_address, address, name);
     } else {
         // Kernel nodes. Never a mount: its name is the device's name, and the
         // storage scan re-attaches mounts by it.
-        if (!kmalloc_is_valid(address) || !kmalloc_is_valid(parent_address))
+        if (mount)
+            return false;   // A device's root: it is named by its mount
+        void* knode = vfs_address_knode(address);
+        void* parent_knode = vfs_address_knode(parent_address);
+        if (!kmalloc_is_valid(knode) || !kmalloc_is_valid(parent_knode))
             return false;
-        if (kmalloc_get_flags(address) & KMALLOC_FLAG_MOUNT)
+        if (kmalloc_get_flags(knode) & KMALLOC_FLAG_MOUNT)
             return false;
-        if (!(kmalloc_get_permissions(address) & KMALLOC_PERMISSION_WRITE) ||
-            !(kmalloc_get_permissions(parent_address) & KMALLOC_PERMISSION_WRITE))
+        if (!(kmalloc_get_permissions(knode) & KMALLOC_PERMISSION_WRITE) ||
+            !(kmalloc_get_permissions(parent_knode) & KMALLOC_PERMISSION_WRITE))
             return false;
         
         // Kernel nodes keep their short names, unique within their folder
@@ -397,31 +434,31 @@ static bool do_rename(const char* path, const char* name) {
             return false;
         memcpy(knode_name, name, length + 1);
         
-        uint32_t existing = knode_find_by_name(parent_address, knode_name);
-        if (existing != KNODE_NULL && existing != 0)
-            return existing == address;
+        void* existing = knode_find_by_name(parent_knode, knode_name);
+        if (existing != NULL)
+            return existing == knode;
         
-        knode_set_name(address, knode_name);
+        knode_set_name(knode, knode_name);
         return true;
     }
 }
 
-static bool do_truncate(const char* path, uint32_t new_size) {
+static bool do_truncate(const char* path, uint64_t new_size) {
     if (path == NULL) 
         return false;
     if (path[0] == '\0' || path[0] == ' ') 
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    // fs_file_resize refuses directories and reports allocation failure
-    // (the file is left unchanged in that case), so pass its result on
-    if (ctx) {
-        if (!vfs_fs_node_allowed(ctx, address))
+    struct FsMount* mount = vfs_device_get_context(path);
+    // The resize refuses directories and reports allocation failure (the
+    // file is left unchanged in that case), so pass its result on
+    if (mount) {
+        if (!vfs_fs_node_allowed(mount, address))
             return false;
-        return fs_file_resize(ctx, address, new_size);
+        return mount->type->resize(mount, address, new_size);
     }
     return false;
 }
@@ -429,53 +466,52 @@ static bool do_truncate(const char* path, uint32_t new_size) {
 static bool do_stat(const char* path, FSFileStats* stats) {
     if (path == NULL || path[0] == '\0' || stats == NULL) 
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
     memset(stats, 0, sizeof(FSFileStats));
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx) {
-        bool is_directory = fs_check_directory_valid(ctx, address);
-        if (!is_directory && !fs_file_check(ctx, address))
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount) {
+        uint8_t node_type = vfs_node_type(mount, address);
+        FsNodeAttr attr;
+        if (node_type == FS_NODE_NONE || !mount->type->get_attr(mount, address, &attr))
             return false;
         
-        uint8_t fs_perm = 0;
-        fs_file_get_permissions(ctx, address, &fs_perm);
-        if (fs_perm & FS_PERMISSION_EXECUTE) stats->permissions |= VFS_PERMISSION_EXECUTE;
-        if (fs_perm & FS_PERMISSION_READ)    stats->permissions |= VFS_PERMISSION_READ;
-        if (fs_perm & FS_PERMISSION_WRITE)   stats->permissions |= VFS_PERMISSION_WRITE;
+        stats->permissions = attr.permissions;
         
-        if (is_directory) {
+        if (node_type == FS_NODE_DIRECTORY) {
             // The device's root is the mount as seen from outside
-            stats->type = (fs_directory_get_parent(ctx, address) == FS_NULL) ? VFS_TYPE_MOUNT
-                                                                              : VFS_TYPE_DIRECTORY;
+            stats->type = (mount->type->parent(mount, address) == FS_NODE_NULL) ? VFS_TYPE_MOUNT
+                                                                                 : VFS_TYPE_DIRECTORY;
         } else {
             stats->type = VFS_TYPE_FILE;
-            stats->size = fs_file_get_size(ctx, address);
+            stats->size = attr.size;
         }
         
-        fs_file_get_certificate(ctx, address, &stats->certificate);
-        fs_file_get_times(ctx, address, &stats->created, &stats->modified);
+        stats->certificate = attr.certificate;
+        stats->created     = attr.created;
+        stats->modified    = attr.modified;
         return true;
     }
     
     // Kernel nodes: folders, device values (/dev/...), and mounts whose
     // device is not usable
-    if (kmalloc_is_valid(address)) {
-        uint8_t k_perm = kmalloc_get_permissions(address);
+    void* knode = vfs_address_knode(address);
+    if (kmalloc_is_valid(knode)) {
+        uint8_t k_perm = kmalloc_get_permissions(knode);
         if (k_perm & KMALLOC_PERMISSION_EXECUTABLE) stats->permissions |= VFS_PERMISSION_EXECUTE;
         if (k_perm & KMALLOC_PERMISSION_READ)       stats->permissions |= VFS_PERMISSION_READ;
         if (k_perm & KMALLOC_PERMISSION_WRITE)      stats->permissions |= VFS_PERMISSION_WRITE;
         
-        uint8_t k_flags = kmalloc_get_flags(address);
+        uint8_t k_flags = kmalloc_get_flags(knode);
         if (k_flags & KMALLOC_FLAG_MOUNT) {
             stats->type = VFS_TYPE_MOUNT;
         } else if (k_flags & KMALLOC_FLAG_DIRECTORY) {
             stats->type = VFS_TYPE_DIRECTORY;
         } else {
             stats->type = VFS_TYPE_FILE;
-            stats->size = kmalloc_get_size(address);
+            stats->size = kmalloc_get_size(knode);
         }
         return true;
     }
@@ -483,13 +519,14 @@ static bool do_stat(const char* path, FSFileStats* stats) {
     return false;
 }
 
-static uint32_t do_get_size(File file) {
+static uint64_t do_get_size(File file) {
     OpenFileDescriptor* desc = vfs_file_find_open(file);
     if (!desc) return 0;
     if (desc->in_file_system) {
-        return fs_file_get_size(desc->ctx, desc->address);
+        FsNodeAttr attr;
+        return desc->mount->type->get_attr(desc->mount, desc->address, &attr) ? attr.size : 0;
     } else {
-        return kmalloc_get_size(desc->address);
+        return kmalloc_get_size(desc->knode);
     }
 }
 
@@ -524,16 +561,16 @@ int32_t vfs_write(File file, const void* buffer, uint32_t size) {
     return result;
 }
 
-uint32_t vfs_seek(File file, uint32_t position) {
+uint64_t vfs_seek(File file, uint64_t position) {
     vfs_lock();
-    uint32_t result = do_seek(file, position);
+    uint64_t result = do_seek(file, position);
     vfs_unlock();
     return result;
 }
 
-uint32_t vfs_tell(File file) {
+uint64_t vfs_tell(File file) {
     vfs_lock();
-    uint32_t result = do_tell(file);
+    uint64_t result = do_tell(file);
     vfs_unlock();
     return result;
 }
@@ -566,7 +603,7 @@ bool vfs_rename(const char* path, const char* name) {
     return result;
 }
 
-bool vfs_truncate(const char* path, uint32_t new_size) {
+bool vfs_truncate(const char* path, uint64_t new_size) {
     vfs_lock();
     bool result = do_truncate(path, new_size);
     vfs_unlock();
@@ -580,12 +617,9 @@ bool vfs_stat(const char* path, FSFileStats* stats) {
     return result;
 }
 
-uint32_t vfs_get_size(File file) {
+uint64_t vfs_get_size(File file) {
     vfs_lock();
-    uint32_t result = do_get_size(file);
+    uint64_t result = do_get_size(file);
     vfs_unlock();
     return result;
 }
-
-
-

@@ -1,4 +1,3 @@
-
 #ifndef _KERNEL_PROCESS_H_
 #define _KERNEL_PROCESS_H_
 
@@ -53,23 +52,38 @@
 // Security clearance: every process has a mask of SYS_SEC_* bits (see the
 // "Security clearance" section of syscall/syscall.h). The syscall layer
 // checks it on every call. The plain CreateProcess* functions give
-// PROCESS_SECURITY_DEFAULT; the *WithSecurity variants take the mask, which
-// is in place before the main thread can run. Afterwards it changes only
-// through ProcessSetSecurity() (kernel, unchecked) or SYS_SEC_SET (needs
-// SYS_SEC_ADMIN).
+// PROCESS_SECURITY_DEFAULT; the *WithSecurity variants and
+// CreateProcessLaunch() take the mask, which is in place before the main
+// thread can run. Afterwards it changes only through ProcessSetSecurity()
+// (kernel, unchecked) or SYS_SEC_SET (needs SYS_SEC_ADMIN).
+//
+// /proc: every process is listed as a read-only kernel-node file
+// /proc/<pid> (decimal pid) holding one ProcessRecord (below), from just
+// before its main thread starts until DestroyProcess(). The state, thread
+// count, security mask and heap size are kept current. /proc must exist as
+// a kernel folder (kernel_init makes it); without it processes still run,
+// unlisted. See the /proc section of process.c.
+//
+// Arguments: the main thread starts with argc / argv on its stack (layout in
+// the "Processes" section of syscall/syscall.h). CreateProcessLaunch() takes
+// them; the other loaders pass argv = { image path } (flat: { name }).
+// SYS_SPAWN reaches CreateProcessLaunch() from user space, always with a
+// mask inside the caller's own.
 
 #define PROCESS_MAX                64     // Must be <= 256 (8-bit slot field)
 #define PROCESS_NAME_MAX           16
 #define PROCESS_PATH_MAX          256
+#define PROCESS_ARG_MAX            64     // argv strings (= SYS_ARG_MAX)
+#define PROCESS_ARG_BYTES        4096     // Bytes of them, terminators included (= SYS_ARG_BYTES)
 
 #define PROCESS_IMAGE_BASE        0x40000000u            // == VM_USER_START
 #define PROCESS_IMAGE_MAX         (256u * 1024u * 1024u) // Size of the image area
 #define PROCESS_STACK_TOP         0xC0000000u            // == VM_USER_STACK_TOP
 #define PROCESS_STACK_PAGES       16                     // 64 KB
 
-// Per-process heap limit. There is no global memory accounting yet, and the
-// kernel panics when vmm_alloc_pages() runs dry (user page tables come from
-// it), so this keeps one process from exhausting the machine.
+// Per-process heap limit, so one process cannot take all user memory. Across
+// processes, user pages come from pmm_alloc_user_frame(), which leaves a
+// reserve of frames for the kernel; past that, sbrk fails with SYS_ENOMEM.
 #define PROCESS_HEAP_MAX          (64u * 1024u * 1024u)
 
 typedef int32_t ProcessId;
@@ -78,9 +92,10 @@ typedef int32_t ProcessId;
 typedef uint32_t ProcessSecurity;
 
 // What CreateProcess / CreateProcessIn / CreateProcessFromImage grant: files,
-// the console, graphics (including the screen), IPC and input. Not admin.
+// the console, graphics, IPC and starting other programs. Not the screen,
+// input or admin.
 #ifndef PROCESS_SECURITY_DEFAULT
-#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC)
+#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC | SYS_SEC_EXEC)
 #endif
 
 // Every clearance, administration included (a trusted shell or launcher)
@@ -100,6 +115,7 @@ typedef uint32_t ProcessSecurity;
 #define PROCESS_ERR_NOT_EXECUTABLE -8     // Not a file, or no VFS_PERMISSION_EXECUTE
 #define PROCESS_ERR_BAD_IMAGE      -9     // Not ELF, or a malformed one
 #define PROCESS_ERR_UNSUPPORTED   -10     // Valid ELF this kernel can't run (PIE, dynamic, TLS)
+#define PROCESS_ERR_TOO_BIG       -11     // More than PROCESS_ARG_MAX / PROCESS_ARG_BYTES of arguments
 
 typedef enum {
     PROCESS_STATE_FREE,         // Slot unused
@@ -107,6 +123,36 @@ typedef enum {
     PROCESS_STATE_RUNNING,      // Fully constructed, threads scheduled
     PROCESS_STATE_DYING         // Being destructed
 } ProcessState;
+
+// The contents of /proc/<pid>, read as a plain file (vfs_open / vfs_read,
+// or SYS_OPEN / SYS_READ from user space). Fixed layout, little endian;
+// a reader should check magic and version, and the file size against
+// sizeof(ProcessRecord). Copy this struct into user-space headers as is.
+#define PROCESS_RECORD_MAGIC    0x434F5250u     // "PROC"
+#define PROCESS_RECORD_VERSION  1
+#define PROCESS_RECORD_NAME     16              // == KNODE_NAME_LENGTH_MAX
+
+typedef struct {
+    char     node_name[PROCESS_RECORD_NAME];    // Knode name, the decimal pid. Must stay first:
+                                                // the knode layer reads every entry's name here
+    uint32_t magic;                             // PROCESS_RECORD_MAGIC
+    uint32_t version;                           // PROCESS_RECORD_VERSION
+    int32_t  pid;
+    uint32_t state;                             // ProcessState
+    uint32_t priority;                          // ThreadPriority (base)
+    uint32_t security;                          // SYS_SEC_* mask
+    uint32_t thread_count;
+    uint32_t entry;                             // User address of the entry point
+    uint32_t code_size;                         // As in ProcessInfo
+    uint32_t data_size;
+    uint32_t bss_size;
+    uint32_t heap_size;
+    char     name[PROCESS_NAME_MAX];
+    char     image_path[PROCESS_PATH_MAX];      // "<memory>" for a flat image
+} __attribute__((packed)) ProcessRecord;
+
+_Static_assert(sizeof(ProcessRecord) == 16 + 12 * 4 + PROCESS_NAME_MAX + PROCESS_PATH_MAX,
+               "ProcessRecord layout");
 
 // Read-only snapshot for debugging / task list.
 typedef struct {
@@ -154,12 +200,28 @@ ProcessId CreateProcess(const char* image_path, ThreadPriority priority);
 ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriority priority);
 
 // The same two loaders with an explicit security mask (SYS_SEC_* bits; bits
-// outside SYS_SEC_VALID are PROCESS_ERR_INVALID_ARG). Only the kernel decides
-// who gets SYS_SEC_ADMIN: there is no syscall that creates a process.
+// outside SYS_SEC_VALID are PROCESS_ERR_INVALID_ARG). SYS_SPAWN creates
+// processes from user space, but never with a bit its caller lacks, so
+// SYS_SEC_ADMIN still only spreads from processes the kernel made admin.
 ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, ThreadPriority priority,
                                     ProcessSecurity security);
 ProcessId CreateProcessFromImageWithSecurity(const char* name, const ProcessImage* image,
                                              ThreadPriority priority, ProcessSecurity security);
+
+// Everything CreateProcessWithSecurity() takes, plus the arguments
+typedef struct {
+    const char*        image_path;  // Absolute VFS path of the ELF executable
+    const char*        cwd;         // As CreateProcessIn(): NULL / "" = the executable's directory
+    ThreadPriority     priority;
+    ProcessSecurity    security;    // SYS_SEC_* mask
+    uint32_t           argc;        // 0: argv = { image_path }
+    const char* const* argv;        // argc strings (kernel memory), copied onto the new stack
+} ProcessLaunch;
+
+// Load and start an ELF executable with arguments. Same rules and errors as
+// CreateProcessWithSecurity(), plus PROCESS_ERR_TOO_BIG for too many
+// arguments. argv only needs to live until this returns.
+ProcessId CreateProcessLaunch(const ProcessLaunch* launch);
 
 // Close the process's open files, then kill every thread of the process and
 // free its address space. Thread context with interrupts on: closing files
@@ -231,6 +293,3 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
                         uint32_t cs, uint32_t address);
 
 #endif
-
-
-

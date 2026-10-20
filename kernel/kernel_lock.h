@@ -3,7 +3,7 @@
 
 // Kernel event lock.
 //
-// Replaces the old kernel_big_lock. It only guards the kernel event system
+// It only guards the kernel event system
 // (kernel_event_send / kernel_event_update and whatever kernel_event_update
 // touches), and serializes direct presents to the display (SYS_GFX_PRESENT).
 //

@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// Keep the KERNEL_FORTIFY_SOURCE wrapper macros away from the definitions.
+#define KERNEL_STRING_IMPL
 #include <kernel/util/string.h>
 
 /*
@@ -302,6 +304,23 @@ void utos(uint32_t value, char* dest) {
     dest[d] = '\0';
 }
 
+void u64tos(uint64_t value, char* dest) {
+    char buffer[20]; // 20 digits max for uint64_t
+    int i = 0;
+    int d = 0;
+
+    do {
+        buffer[i++] = (char)((value % 10) + '0');
+        value /= 10;
+    } while (value > 0);
+
+    while (i > 0) {
+        dest[d++] = buffer[--i];
+    }
+
+    dest[d] = '\0';
+}
+
 void itos(int32_t value, char* dest) {
     if (value < 0) {
         *dest++ = '-';
@@ -363,7 +382,7 @@ uint32_t stou(const char* str) {
 
 void itos_commas(uint32_t val, char* dest) {
     char raw[11];
-    utos(val, raw);  // was itos(): values > INT32_MAX printed as negative
+    utos(val, raw);  // Unsigned, so values > INT32_MAX stay positive
 
     int len = (int)strlen(raw);
     int comma_count = (len - 1) / 3;
@@ -425,3 +444,83 @@ void u16tox(uint16_t value, char* dest) {
 void u32tox(uint32_t value, char* dest) {
     utox(value, dest);
 }
+
+// Fortified (_chk) variants
+
+#define CHK_UNKNOWN ((size_t)-1)
+
+// Weak default: trap. Provide a strong __chk_fail() elsewhere to panic instead.
+__attribute__((weak, noreturn)) void __chk_fail(void) {
+    __builtin_trap();
+}
+
+void* __memcpy_chk(void* dest, const void* src, size_t n, size_t destlen) {
+    if (n > destlen) __chk_fail();
+    return memcpy(dest, src, n);
+}
+
+void* __memmove_chk(void* dest, const void* src, size_t n, size_t destlen) {
+    if (n > destlen) __chk_fail();
+    return memmove(dest, src, n);
+}
+
+void* __memset_chk(void* dest, int value, size_t n, size_t destlen) {
+    if (n > destlen) __chk_fail();
+    return memset(dest, value, n);
+}
+
+char* __strcpy_chk(char* dest, const char* src, size_t destlen) {
+    size_t len = strlen(src);
+    if (len >= destlen) __chk_fail();          // needs len + 1 bytes
+    return memcpy(dest, src, len + 1);
+}
+
+char* __strncpy_chk(char* dest, const char* src, size_t n, size_t destlen) {
+    if (n > destlen) __chk_fail();             // strncpy always writes n bytes
+    return strncpy(dest, src, n);
+}
+
+char* __strcat_chk(char* dest, const char* src, size_t destlen) {
+    if (destlen == CHK_UNKNOWN) return strcat(dest, src);
+    size_t dlen = strnlen(dest, destlen);
+    if (dlen == destlen) __chk_fail();         // dest not terminated in bounds
+    size_t slen = strlen(src);
+    if (slen >= destlen - dlen) __chk_fail();  // needs slen + 1 more bytes
+    memcpy(dest + dlen, src, slen + 1);
+    return dest;
+}
+
+char* __strncat_chk(char* dest, const char* src, size_t n, size_t destlen) {
+    if (destlen == CHK_UNKNOWN) return strncat(dest, src, n);
+    size_t dlen = strnlen(dest, destlen);
+    if (dlen == destlen) __chk_fail();
+    size_t slen = strnlen(src, n);             // only up to n chars appended
+    if (slen >= destlen - dlen) __chk_fail();
+    memcpy(dest + dlen, src, slen);
+    dest[dlen + slen] = '\0';
+    return dest;
+}
+
+size_t __strlcat_chk(char* dest, const char* src, size_t size, size_t destlen) {
+    // strlcat is self-bounding; the only lie it can be told is about size.
+    if (size > destlen) __chk_fail();
+    return strlcat(dest, src, size);
+}
+
+#ifdef KERNEL_HAVE_VSNPRINTF
+int __vsnprintf_chk(char* str, size_t maxlen, int flag, size_t slen,
+                    const char* format, va_list ap) {
+    (void)flag;  // glibc uses this for %n checks; nothing to do here
+    if (maxlen > slen) __chk_fail();
+    return vsnprintf(str, maxlen, format, ap);
+}
+
+int __snprintf_chk(char* str, size_t maxlen, int flag, size_t slen,
+                   const char* format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int r = __vsnprintf_chk(str, maxlen, flag, slen, format, ap);
+    va_end(ap);
+    return r;
+}
+#endif

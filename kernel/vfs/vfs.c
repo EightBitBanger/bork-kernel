@@ -3,7 +3,6 @@
 #include <kernel/malloc.h>
 
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
 #include <kernel/vfs/vfs.h>
 #include <kernel/vfs/vfs_internal.h>
@@ -23,9 +22,9 @@ File next_unique_id = 1;
 
 // True for a knode folder whose references are its entries. A mount knode
 // (one whose device is unusable, or path resolution would have entered it)
-// holds its cache window and context there instead, and a non-folder knode
-// has no list at all (knode_get_reference_count returns KMALLOC_NULL).
-static bool vfs_knode_has_children(uint32_t address) {
+// holds its FsMount there instead, and a non-folder knode
+// has no list at all (knode_get_reference_count returns 0).
+static bool vfs_knode_has_children(const void* address) {
     if (!knode_check_is_valid(address))
         return false;
     return (kmalloc_get_flags(address) & KMALLOC_FLAG_MOUNT) == 0;
@@ -34,25 +33,22 @@ static bool vfs_knode_has_children(uint32_t address) {
 static bool do_directory_check_mounted(const char* path) {
     if (path == NULL || path[0] == '\0') 
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == KNODE_NULL || address == FS_NULL) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
-    if (kmalloc_is_valid(address)) {
-        uint8_t k_flags = kmalloc_get_flags(address);
-        if (k_flags & KMALLOC_FLAG_MOUNT) {
-            return true;
-        }
+    
+    // On an open device the address is a filesystem node: never ask the
+    // heap about it (a 64-bit disk address is no knode)
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount) {
+        if (!vfs_node_is_directory(mount, address))
+            return false;
+        return mount->type->parent(mount, address) == FS_NODE_NULL;
     }
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, address)) {
-        uint32_t parent = fs_directory_get_parent(ctx, address);
-        if (parent == address || parent == FS_NULL) { 
-            return true;
-        }
-    }
-    
-    return false;
+    void* knode = vfs_address_knode(address);
+    return kmalloc_is_valid(knode) &&
+           (kmalloc_get_flags(knode) & KMALLOC_FLAG_MOUNT) != 0;
 }
 
 static bool do_directory_check(const char* path) {
@@ -62,38 +58,37 @@ static bool do_directory_check(const char* path) {
     if (do_directory_check_mounted(path)) 
         return true;
     
-    uint32_t address = resolve_path_to_address(path);
-    if (address == KNODE_NULL || address == FS_NULL) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
     
-    if (kmalloc_is_valid(address)) {
-        uint8_t k_flags = kmalloc_get_flags(address);
-        if (k_flags & (KMALLOC_FLAG_MOUNT | KMALLOC_FLAG_DIRECTORY)) 
-            return true;
-    }
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount)
+        return vfs_node_is_directory(mount, address);
     
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, address)) 
-        return true;
-    
-    return false;
+    void* knode = vfs_address_knode(address);
+    return kmalloc_is_valid(knode) &&
+           (kmalloc_get_flags(knode) & (KMALLOC_FLAG_MOUNT | KMALLOC_FLAG_DIRECTORY)) != 0;
 }
 
 static uint32_t do_directory_get_item_count(const char* path) {
     if (path == NULL || path[0] == '\0') 
         return 0;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == KNODE_NULL || address == FS_NULL) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return 0;
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, address)) {
-        if (!vfs_fs_node_allowed(ctx, address))
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount && vfs_node_is_directory(mount, address)) {
+        if (!vfs_fs_node_allowed(mount, address))
             return 0;   // Listing needs the directory's clearance
-        return fs_directory_get_reference_count(ctx, address);
+        return mount->type->dir_count(mount, address);
     }
-    if (!vfs_knode_has_children(address))
+    if (mount)
+        return 0;   // A file on the device
+    void* knode = vfs_address_knode(address);
+    if (!vfs_knode_has_children(knode))
         return 0;
-    return knode_get_reference_count(address);
+    return knode_get_reference_count(knode);
 }
 
 static bool do_directory_get_item(const char* path, unsigned int index, char* name_out, size_t name_size) {
@@ -102,20 +97,21 @@ static bool do_directory_get_item(const char* path, unsigned int index, char* na
     name_out[0] = '\0';
     if (path == NULL || path[0] == '\0') 
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == KNODE_NULL || address == FS_NULL) 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address)) 
         return false;
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx && fs_check_directory_valid(ctx, address)) {
-        if (!vfs_fs_node_allowed(ctx, address))
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount && vfs_node_is_directory(mount, address)) {
+        if (!vfs_fs_node_allowed(mount, address))
             return false;
         // The name comes straight from the directory entry
-        return fs_directory_get_entry(ctx, address, index, NULL, name_out, name_size, NULL);
+        return mount->type->dir_entry(mount, address, index, NULL, name_out, name_size);
     } else {
-        if (!vfs_knode_has_children(address))
-            return false;
-        uint32_t item_address = knode_get_reference(address, index);
-        if (item_address == KNODE_NULL || item_address == 0)
+        void* knode = vfs_address_knode(address);
+        if (mount || !vfs_knode_has_children(knode))
+            return false;   // A file on the device, or a knode without entries
+        void* item_address = knode_get_reference(knode, index);
+        if (item_address == NULL)
             return false;
         // knode_get_name has no length parameter: read into a buffer big
         // enough for any knode name, then copy what fits
@@ -164,6 +160,3 @@ bool vfs_directory_get_item(const char* path, unsigned int index, char* name_out
     vfs_unlock();
     return result;
 }
-
-
-

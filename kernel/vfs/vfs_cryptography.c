@@ -3,7 +3,6 @@
 #include <kernel/malloc.h>
 
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
 #include <kernel/vfs/vfs.h>
 #include <kernel/vfs/vfs_internal.h>
@@ -15,22 +14,22 @@
 //
 // Implementations (caller holds the VFS lock)
 //
-// Certificates only exist on files stored on a mounted basefs device;
-// kernel nodes and directories have none.
+// Certificates only exist on files stored on a mounted device whose
+// filesystem keeps them (basefs); kernel nodes and directories have none.
 //
 
-static bool resolve_device_file(const char* path, struct FSDeviceContext** out_ctx, uint32_t* out_address) {
+static bool resolve_device_file(const char* path, struct FsMount** out_mount, uint64_t* out_address) {
     if (path == NULL || path[0] == '\0')
         return false;
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0)
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address))
         return false;
 
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
-    if (ctx == NULL || !fs_file_check(ctx, address))
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount == NULL || !vfs_node_is_file(mount, address))
         return false;
 
-    *out_ctx = ctx;
+    *out_mount = mount;
     *out_address = address;
     return true;
 }
@@ -38,22 +37,29 @@ static bool resolve_device_file(const char* path, struct FSDeviceContext** out_c
 static bool do_file_get_certificate(const char* path, uint32_t* certificate) {
     if (certificate == NULL)
         return false;
-    struct FSDeviceContext* ctx;
-    uint32_t address;
-    if (!resolve_device_file(path, &ctx, &address))
+    struct FsMount* mount;
+    uint64_t address;
+    if (!resolve_device_file(path, &mount, &address))
         return false;
-    return fs_file_get_certificate(ctx, address, certificate);
+    FsNodeAttr attr;
+    if (!mount->type->get_attr(mount, address, &attr))
+        return false;
+    *certificate = attr.certificate;
+    return true;
 }
 
 static bool do_file_certify(const char* path, uint32_t certificate) {
-    struct FSDeviceContext* ctx;
-    uint32_t address;
-    if (!resolve_device_file(path, &ctx, &address))
+    struct FsMount* mount;
+    uint64_t address;
+    if (!resolve_device_file(path, &mount, &address))
         return false;
-    if (!vfs_fs_node_allowed(ctx, address))
+    if (!vfs_fs_node_allowed(mount, address))
         return false;
-    // fs_file_set_certificate rejects 0 and 0xFFFFFFFF
-    return fs_file_set_certificate(ctx, address, certificate);
+    if (certificate == 0 || certificate == 0xFFFFFFFFu)
+        return false;
+    if (mount->type->set_certificate == NULL)
+        return false;   // The filesystem cannot store one
+    return mount->type->set_certificate(mount, address, certificate);
 }
 
 //
@@ -73,4 +79,3 @@ bool vfs_file_certify(const char* path, uint32_t certificate) {
     vfs_unlock();
     return result;
 }
-

@@ -15,12 +15,12 @@ static struct LocalPaths kernel_paths;
 // /dev  - hardware descriptions
 // /mnt  - storage devices are mounted
 void kernel_init(void) {
-    uint32_t root_node = create_knode("", 0);
+    void* root_node = create_knode("", NULL);
     knode_set_root(root_node);
     
-    uint32_t proc = create_knode("proc", root_node);
-    uint32_t dev  = create_knode("dev", root_node);
-    uint32_t mnt  = create_knode("mnt", root_node);
+    void* proc = create_knode("proc", root_node);
+    void* dev  = create_knode("dev", root_node);
+    void* mnt  = create_knode("mnt", root_node);
     
     knode_set_permissions(proc, KMALLOC_PERMISSION_READ);
     knode_set_permissions(dev,  KMALLOC_PERMISSION_READ);
@@ -86,20 +86,19 @@ void kernel_set_local_paths(const struct LocalPaths* paths) {
     vfs_unlock();
 }
 
-uint32_t create_device(const char* name) {
-    struct Device device;
-    memset(&device, 0x00, sizeof(struct Device));
-    strcpy(device.name, name);
+struct Device* create_device(const char* name) {
+    // Zeroed by kmalloc
+    struct Device* device = kmalloc(sizeof(struct Device));
+    if (device == NULL)
+        return NULL;
     
-    uint32_t device_address = kmalloc(sizeof(struct Device));
+    strncpy(device->name, name, sizeof(device->name) - 1);
     
-    kmalloc_set_type(device_address, KMALLOC_TYPE_DEVICE);
-    kmalloc_set_permissions(device_address, KMALLOC_PERMISSION_READ | KMALLOC_PERMISSION_WRITE);
-    
-    kmem_write(device_address, &device, sizeof(struct Device));
-    return device_address;
+    kmalloc_set_type(device, KMALLOC_TYPE_DEVICE);
+    kmalloc_set_permissions(device, KMALLOC_PERMISSION_READ | KMALLOC_PERMISSION_WRITE);
+    return device;
 }
 
-void destroy_device(uint32_t address) {
-    kfree(address);
+void destroy_device(struct Device* device) {
+    kfree(device);
 }

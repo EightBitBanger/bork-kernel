@@ -53,7 +53,7 @@ void kernel_set_local_paths(const struct LocalPaths* paths);
 
 void kernel_init(void);
 
-uint32_t create_device(const char* name);
-void destroy_device(uint32_t address);
+struct Device* create_device(const char* name);
+void destroy_device(struct Device* device);
 
 #endif

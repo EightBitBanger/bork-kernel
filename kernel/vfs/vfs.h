@@ -4,8 +4,8 @@
 #define VFS_INVALID_FILE             0
 
 // Longest file/directory name in bytes, without the terminator, on a
-// storage device. Must equal FS_NAME_MAX (checked in vfs_parse.c). A buffer
-// that receives a name needs VFS_NAME_MAX + 1 bytes.
+// storage device. A filesystem may store shorter names only (it then refuses
+// longer ones). A buffer that receives a name needs VFS_NAME_MAX + 1 bytes.
 //
 // Kernel nodes (/, /dev, /mnt, ...) keep their own, shorter limit:
 // VFS_KNODE_NAME_MAX in vfs_internal.h.
@@ -19,6 +19,8 @@
 #define VFS_OPEN_READ             0x01
 #define VFS_OPEN_WRITE            0x02
 #define VFS_OPEN_CREATE           0x04
+#define VFS_OPEN_TRUNCATE         0x08  // Empty the file on open (needs WRITE)
+#define VFS_OPEN_APPEND           0x10  // Every write goes to the end (needs WRITE)
 
 #define VFS_PERMISSION_EXECUTE    0x01
 #define VFS_PERMISSION_READ       0x02
@@ -38,14 +40,14 @@ typedef uint32_t File;
                                         // is unformatted or detached (then empty)
 
 typedef struct {
-    uint32_t size;                      // Files only, 0 for directories and mounts
+    uint64_t size;                      // Files only, 0 for directories and mounts
     
     uint8_t permissions;                // VFS_PERMISSION_*
     uint8_t type;                       // VFS_TYPE_*
     uint32_t certificate;
     
     // Seconds since the Unix epoch, 0 = unknown (and always 0 for kernel
-    // nodes). Only set when basefs has a clock (fs_set_time_source).
+    // nodes). basefs only sets them once it has a clock (fs_set_time_source).
     uint32_t created;
     uint32_t modified;
 } FSFileStats;
@@ -56,7 +58,7 @@ typedef struct {
 // below takes it internally, so ordinary callers never need it. Take it
 // yourself only to:
 //   - make several vfs_* calls atomic (e.g. get_item_count + get_item loop)
-//   - call fs_* directly on a mounted device (formatting, mounting, tools)
+//   - call a filesystem directly on a mounted device (formatting, tools)
 //   - modify mount knodes outside the VFS
 // Recursive per thread. Thread context only, never from an IRQ handler.
 // If kernel_big_lock is also needed, take it first.
@@ -90,13 +92,16 @@ uint64_t vfs_device_get_used(const char* path);
 // device (or the device has been detached, see vfs_device_release_disk).
 #define VFS_DEVICE_NAME_MAX       16    // Including the terminator (BLOCK_NAME_MAX)
 
+#define VFS_FS_NAME_MAX           16    // Including the terminator
+
 typedef struct {
     char     device[VFS_DEVICE_NAME_MAX];   // "ata0p1", "ahci1", ...
+    char     filesystem[VFS_FS_NAME_MAX];   // "basefs": what the mount is driven as
     uint32_t device_sector_size;            // Bytes per hardware sector
     uint64_t device_sectors;                // Hardware sectors on the device
-    bool     formatted;                     // Holds a readable basefs volume
-    uint32_t block_size;                    // basefs allocation block (formatted only)
-    uint32_t total_size;                    // basefs pool size in bytes (formatted only)
+    bool     formatted;                     // Holds a readable volume of that filesystem
+    uint32_t block_size;                    // Allocation block (formatted only)
+    uint64_t total_size;                    // Volume size in bytes (formatted only)
 } VfsDeviceInfo;
 
 bool vfs_device_get_info(const char* path, VfsDeviceInfo* out);
@@ -119,15 +124,19 @@ typedef enum {
 // may print, but must not touch the VFS or kernel_lock.
 typedef void (*vfs_format_progress_fn)(uint32_t percent);
 
-struct FSDeviceContext;
+struct FsMount;      // A mounted volume (fs/fs_type.h)
 
-// Format a mount's context. capacity is in bytes (at most
-// fs_device_max_capacity(ctx->device)), block_size is the basefs allocation
-// block (a multiple of 4, at least FS_MIN_SECTOR_SIZE = 512). full_wipe
-// zeroes the covered sectors first.
-VfsFormatResult vfs_device_format_context(struct FSDeviceContext* ctx, uint32_t capacity,
+// Format a mount with its filesystem. capacity is in bytes (at most
+// vfs_device_max_capacity(mount)), block_size is the allocation block the
+// filesystem accepts (basefs: a multiple of 4, at least FS_MIN_SECTOR_SIZE =
+// 512). full_wipe zeroes the covered sectors first.
+VfsFormatResult vfs_device_format_context(struct FsMount* mount, uint64_t capacity,
                                           uint32_t block_size, bool full_wipe,
                                           vfs_format_progress_fn progress);
+
+// The largest volume the mount's filesystem can put on its device, 0 when
+// the mount is detached
+uint64_t vfs_device_max_capacity(struct FsMount* mount);
 
 // Quick format of the device mounted at `path` (e.g. "/mnt/ata1"), using the
 // whole disk and its native sector size as the block size
@@ -154,10 +163,28 @@ struct BlockDevice;
 // file on any of them is open. The mounts show as unformatted afterwards.
 VfsFormatResult vfs_device_release_disk(struct BlockDevice* disk);
 
-// The mount context of a block device ("ata1", "ata0p1"), or NULL if it is
-// not mounted. Hand it to vfs_device_format_context; like that call's
-// argument, it stays valid for as long as the mount exists.
-struct FSDeviceContext* vfs_device_context(struct BlockDevice* device);
+// The mount of a block device ("ata1", "ata0p1"), or NULL if it is not
+// mounted. Hand it to vfs_device_format_context; it stays valid for as long
+// as the mount exists.
+struct FsMount* vfs_device_context(struct BlockDevice* device);
+
+// Mounts
+//
+// vfs_mount_device mounts a block device as <mnt_dir>/<device name> (the
+// /mnt knode), with the filesystem whose volume it holds, or unformatted
+// with the default filesystem (basefs) when it holds none. A detached mount
+// of the same name (see vfs_device_release_disk) is re-attached instead,
+// and *remounted set. NULL when out of memory.
+struct FsMount* vfs_mount_device(struct BlockDevice* device, void* mnt_dir, bool* remounted);
+
+// Name of the filesystem driving a mount ("basefs")
+const char* vfs_mount_fs_name(const struct FsMount* mount);
+
+// For the storage scan (block_scan_disk): whether a device's first sector
+// starts a volume of any known filesystem, and whether an MBR partition
+// type belongs to one
+bool vfs_fs_probe(const uint8_t* sector0, uint32_t sector_size);
+bool vfs_fs_claims_partition(uint8_t mbr_type);
 
 // Flush every mounted storage device (allocation bitmap, sector cache and
 // the drive's write cache). Call before power-off to avoid corruption.
@@ -165,23 +192,37 @@ struct FSDeviceContext* vfs_device_context(struct BlockDevice* device);
 bool vfs_sync_all(void);
 
 // File
+//
+// vfs_open flags: VFS_OPEN_READ and/or VFS_OPEN_WRITE, plus
+//   VFS_OPEN_CREATE    create the file if it does not exist
+//   VFS_OPEN_TRUNCATE  empty the file before the handle is handed out
+//   VFS_OPEN_APPEND    the handle starts at the end, and every write lands
+//                      at the end of the file as it is at that moment
+//                      (seeks still move the read position)
+// TRUNCATE and APPEND need VFS_OPEN_WRITE and a file the caller may write
+// (permission and clearance); otherwise the open fails instead of quietly
+// falling back to read-only. Both apply to files on a storage device only:
+// kernel nodes have a fixed size, so asking for either there fails.
+// The values equal the syscall ABI's SYS_O_* (checked in syscall.c).
 File vfs_open(const char* path, uint16_t flags);
 void vfs_close(File file);
 
 int32_t vfs_read(File file, void* buffer, uint32_t size);
 int32_t vfs_write(File file, const void* buffer, uint32_t size);
 
-uint32_t vfs_seek(File file, uint32_t position);
-uint32_t vfs_tell(File file);
+// Positions and sizes are 64-bit. vfs_seek returns the
+// new position, or VFS_INVALID_FILE (0) for a bad handle.
+uint64_t vfs_seek(File file, uint64_t position);
+uint64_t vfs_tell(File file);
 
-uint32_t vfs_get_size(File file);
+uint64_t vfs_get_size(File file);
 
 // File system
 bool vfs_mkdir(const char* path);
 bool vfs_remove(const char* path);
 bool vfs_rename(const char* path, const char* name);
 bool vfs_exists(const char* path);
-bool vfs_truncate(const char* path, uint32_t new_size);
+bool vfs_truncate(const char* path, uint64_t new_size);
 
 // Copy a file, or a directory with everything inside it, to `dest` (the full
 // new path, which must not exist yet). Permissions are carried over. Refuses
@@ -206,7 +247,8 @@ bool vfs_file_certify(const char* path, uint32_t certificate);
 // Security clearance
 //
 // Every object on a mounted storage device carries a 32-bit security mask
-// (FSBlockHeader.security): the clearance bits a caller must hold to open,
+// (basefs: FSBlockHeader.security; 0 on a filesystem that cannot store one,
+// where setting it fails): the clearance bits a caller must hold to open,
 // list, change or remove it. The bits are the scheduler's SYS_SEC_* bits,
 // so a process's ProcessSecurity mask is its clearance. VFS_SECURITY_ADMIN
 // (== SYS_SEC_ADMIN, checked in syscall.c) marks administrator files; a
@@ -257,6 +299,14 @@ bool vfs_set_security(const char* path, uint32_t security);
 bool vfs_check_access(const char* path);
 bool vfs_check_parent_access(const char* path);
 
+// Kernel nodes
+//
+// Revoke every open handle on kernel node `address` before its owner frees
+// the block (e.g. /proc/<pid> when the process ends). The handles' File ids
+// become invalid: reads and writes return -1, vfs_close ignores them.
+// Thread context; takes the VFS lock (recursive, so callers may hold it).
+void vfs_knode_revoke_handles(const void* address);
+
 // Directory
 //
 // name_out receives the item's name, NUL-terminated. name_size is its
@@ -266,6 +316,3 @@ uint32_t vfs_directory_get_item_count(const char* path);
 bool vfs_directory_get_item(const char* path, unsigned int index, char* name_out, size_t name_size);
 
 #endif
-
-
-

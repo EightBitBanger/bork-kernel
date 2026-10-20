@@ -17,4 +17,3 @@ typedef struct {
 bool vfs_directory_get_size(const char* path, VfsDirectorySize* out);
 
 #endif
-

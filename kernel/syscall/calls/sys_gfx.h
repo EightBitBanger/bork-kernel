@@ -43,13 +43,15 @@
 
 #define SYS_GFX_TOTAL_BYTES     (64U << 20)
 #define SYS_GFX_EXIT_WAIT_MS    1000
+#define SYS_GFX_SURFACES_INITIAL 16
 
 typedef struct SysGfxProcess {
     uint32_t       process_id;
     AddressSpace*  space;           // Spots a reused process id
     uint32_t       users;           // Calls in progress (interrupts off to touch)
     mutex_t        lock;
-    SysGfxSurface* surfaces[SYS_GFX_SURFACE_MAX];   // Handle h is surfaces[h - 1]
+    SysGfxSurface** surfaces;       // Handle h is surfaces[h - 1]; surface_cap entries
+    uint32_t       surface_cap;     // Grows (doubling) up to SYS_GFX_SURFACE_MAX
     SysGfxResource* resources[SYS_RES_MAX];         // Resource handle h is resources[h - 1]
     uint32_t       bytes;           // Pixel memory charged to this process (surfaces and resources)
     uint32_t*      cmd_buffer;      // SYS_GFX_SUBMIT_MAX bytes, allocated on first submit
@@ -118,7 +120,7 @@ static void sys_gfx_free_resource(SysGfxProcess* t, uint32_t index) {
 }
 
 static void sys_gfx_free_all(SysGfxProcess* t) {
-    for (uint32_t i = 0; i < SYS_GFX_SURFACE_MAX; i++)
+    for (uint32_t i = 0; i < t->surface_cap; i++)
         sys_gfx_free_handle(t, i);
     for (uint32_t i = 0; i < SYS_RES_MAX; i++)
         sys_gfx_free_resource(t, i);
@@ -204,6 +206,7 @@ static void sys_gfx_destroy_table(SysGfxProcess* t) {
     }
 
     sys_gfx_free_all(t);
+    free(t->surfaces);
     free(t);
 }
 
@@ -225,7 +228,7 @@ static void sys_gfx_process_exit(uint32_t process_id) {
 }
 
 static SysGfxSurface* sys_gfx_get(SysGfxProcess* t, uint32_t handle) {
-    if (handle == 0 || handle > SYS_GFX_SURFACE_MAX)
+    if (handle == 0 || handle > t->surface_cap)
         return NULL;
     return t->surfaces[handle - 1];
 }
@@ -317,10 +320,22 @@ static int32_t sys_gfx_create_locked(SysGfxProcess* t, const SyscallArgs* args) 
         return SYS_EINVAL;
 
     uint32_t index = 0;
-    while (index < SYS_GFX_SURFACE_MAX && t->surfaces[index] != NULL)
+    while (index < t->surface_cap && t->surfaces[index] != NULL)
         index++;
-    if (index == SYS_GFX_SURFACE_MAX)
-        return SYS_EMFILE;
+    if (index == t->surface_cap) {
+        // Full: double the table, up to SYS_GFX_SURFACE_MAX
+        if (t->surface_cap >= SYS_GFX_SURFACE_MAX)
+            return SYS_EMFILE;
+        uint32_t cap = t->surface_cap ? t->surface_cap * 2 : SYS_GFX_SURFACES_INITIAL;
+        if (cap > SYS_GFX_SURFACE_MAX)
+            cap = SYS_GFX_SURFACE_MAX;
+        SysGfxSurface** grown = (SysGfxSurface**)realloc(t->surfaces, cap * sizeof(SysGfxSurface*));
+        if (grown == NULL)
+            return SYS_ENOMEM;
+        memset(&grown[t->surface_cap], 0, (cap - t->surface_cap) * sizeof(SysGfxSurface*));
+        t->surfaces    = grown;
+        t->surface_cap = cap;
+    }
 
     // Reserve the budget before allocating anything
     if (!sys_gfx_charge(t, bytes))

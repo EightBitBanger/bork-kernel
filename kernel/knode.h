@@ -6,36 +6,38 @@
 #endif
 
 #define KNODE_NAME_LENGTH_MAX       16
-#define KNODE_NULL                  KMALLOC_NULL
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
-uint32_t create_knode(const char* name, uint32_t parent_address);
-bool destroy_knode(uint32_t address, uint32_t parent_address);
+// Knodes and everything they reference are plain kernel pointers (NULL =
+// none). A reference may be another knode, a kmalloc'd value (device,
+// process record) or a raw malloc() block owned by a mount.
 
-void knode_get_name(uint32_t address, char* name);
-void knode_set_name(uint32_t address, const char* name);
+void* create_knode(const char* name, void* parent_address);
+bool destroy_knode(void* address, void* parent_address);
 
-void knode_get_permissions(uint32_t address, uint8_t* permissions);
-void knode_set_permissions(uint32_t address, uint8_t permissions);
+void knode_get_name(const void* address, char* name);
+void knode_set_name(void* address, const char* name);
 
-uint32_t knode_get_root(void);
-void knode_set_root(uint32_t address);
+void knode_get_permissions(const void* address, uint8_t* permissions);
+void knode_set_permissions(void* address, uint8_t permissions);
 
-uint8_t knode_add_reference(uint32_t directory_address, uint32_t reference_ptr);
-uint8_t knode_remove_reference(uint32_t directory_address, uint32_t reference_ptr);
-uint32_t knode_get_reference(uint32_t directory_address, uint32_t index);
-uint32_t knode_get_reference_count(uint32_t directory_address);
-uint32_t knode_find_by_name(uint32_t directory_address, const char* name);
+void* knode_get_root(void);
+void knode_set_root(void* address);
 
-uint32_t create_extent(void);
-void     destroy_extent(uint32_t address);
+uint8_t knode_add_reference(void* directory_address, void* reference_ptr);
+uint8_t knode_remove_reference(void* directory_address, const void* reference_ptr);
+void* knode_get_reference(const void* directory_address, uint32_t index);
+uint32_t knode_get_reference_count(const void* directory_address);
+void* knode_find_by_name(const void* directory_address, const char* name);
 
-uint32_t knode_get_parent(uint32_t directory_address);
-uint32_t knode_get_root(void);
+void* create_extent(void);
+void  destroy_extent(void* address);
 
-bool knode_check_is_valid(uint32_t address);
+void* knode_get_parent(void* directory_address);
+
+bool knode_check_is_valid(const void* address);
 
 #endif
-

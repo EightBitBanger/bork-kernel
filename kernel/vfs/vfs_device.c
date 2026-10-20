@@ -3,7 +3,7 @@
 #include <kernel/malloc.h>
 
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
+#include <kernel/fs/fs_type.h>
 #include <kernel/block/block.h>
 #include <kernel/block/partition.h>
 
@@ -19,48 +19,18 @@
 
 _Static_assert(VFS_DEVICE_NAME_MAX == BLOCK_NAME_MAX, "VFS_DEVICE_NAME_MAX must match BLOCK_NAME_MAX");
 
-struct FSDeviceContext* vfs_device_get_mount_context(const char* path) {
-    uint32_t address = resolve_path_to_mount_point(path);
-    if (address == 0xFFFFFFFF || address == 0) 
-        return NULL;
-    if (knode_check_is_valid(address) == 0) 
-        return NULL;
-    
-    // Check if the node is actually a mounted filesystem
-    uint8_t flags = kmalloc_get_flags(address);
-    if ((flags & KMALLOC_FLAG_MOUNT) == 0) {
-        return NULL;
-    }
-    
-    uint32_t ctx = knode_get_reference(address, 1);
-    if (ctx == 0 || ctx == KMALLOC_NULL)
-        return NULL;
-    return (struct FSDeviceContext*)ctx;
+struct FsMount* vfs_device_get_mount_context(const char* path) {
+    // NULL unless the node is actually a mounted filesystem
+    return vfs_knode_mount(resolve_path_to_mount_point(path));
 }
 
-struct FSDeviceContext* vfs_device_get_context(const char* path) {
+struct FsMount* vfs_device_get_context(const char* path) {
     // Path resolution only enters an open device, so with any other one the
-    // resolved address is the mount knode itself, not a basefs address.
-    // Handing that context out made callers read the disk at a knode
+    // resolved address is the mount knode itself, not a filesystem node.
+    // Handing that mount out made callers read the disk at a knode
     // address and treat whatever was there as a header.
-    struct FSDeviceContext* ctx = vfs_device_get_mount_context(path);
-    return (ctx != NULL && ctx->is_open) ? ctx : NULL;
-}
-
-uint8_t* vfs_device_get_block(const char* path) {
-    uint32_t address = resolve_path_to_mount_point(path);
-    if (address == 0xFFFFFFFF || address == 0) 
-        return NULL;
-    if (knode_check_is_valid(address) == 0) 
-        return NULL;
-    
-    // Check if the node is actually a mounted filesystem
-    uint8_t flags = kmalloc_get_flags(address);
-    if ((flags & KMALLOC_FLAG_MOUNT) == 0) {
-        return NULL;
-    }
-    
-    return (uint8_t*)knode_get_reference(address, 0);
+    struct FsMount* mount = vfs_device_get_mount_context(path);
+    return (mount != NULL && mount->is_open) ? mount : NULL;
 }
 
 // The returned pointer is only safe to use while the caller holds the VFS
@@ -87,87 +57,80 @@ OpenFileDescriptor* vfs_file_find_open(File id) {
 // Implementations (caller holds the VFS lock)
 //
 
-static uint64_t do_device_get_capacity(const char* path) {
-    uint32_t address = resolve_path_to_mount_point(path);
-    if (address == 0xFFFFFFFF || address == 0) 
+// Total size of the volume, 0 when it is not open
+static uint64_t vfs_mount_volume_size(struct FsMount* mount) {
+    FsVolumeInfo volume;
+    if (mount == NULL || !mount->is_open || !mount->type->volume_info(mount, &volume))
         return 0;
-    if (knode_check_is_valid(address) == 0) 
-        return 0;
-    
-    struct FSDeviceContext* device_context = (struct FSDeviceContext*)knode_get_reference(address, 1);
-    if (!device_context) return 0;
+    return volume.total_size;
+}
 
-    return device_context->pool_size;
+static uint64_t do_device_get_capacity(const char* path) {
+    return vfs_mount_volume_size(vfs_device_get_mount_context(path));
 }
 
 static bool do_device_get_info(const char* path, VfsDeviceInfo* out) {
     memset(out, 0, sizeof(VfsDeviceInfo));
     
-    struct FSDeviceContext* ctx = vfs_device_get_mount_context(path);
-    if (ctx == NULL || ctx->device == NULL)
+    struct FsMount* mount = vfs_device_get_mount_context(path);
+    if (mount == NULL || mount->device == NULL)
         return false;   // Not on a mount, or the mount was detached
     
-    struct BlockDevice* device = ctx->device;
+    struct BlockDevice* device = mount->device;
     size_t length = strnlen(device->name, BLOCK_NAME_MAX - 1);
     memcpy(out->device, device->name, length);
     out->device[length] = '\0';
     out->device_sector_size = device->sector_size;
     out->device_sectors     = device->sector_count;
     
-    struct FSPartitionBlock partition;
-    if (ctx->is_open && fs_device_get_partition(ctx, &partition) == 0) {
+    length = strnlen(mount->type->name, VFS_FS_NAME_MAX - 1);
+    memcpy(out->filesystem, mount->type->name, length);
+    out->filesystem[length] = '\0';
+    
+    FsVolumeInfo volume;
+    if (mount->is_open && mount->type->volume_info(mount, &volume)) {
         out->formatted  = true;
-        out->block_size = partition.sector_size;
-        out->total_size = partition.total_size;
+        out->block_size = volume.block_size;
+        out->total_size = volume.total_size;
     }
     return true;
 }
 
 static uint64_t do_device_get_used(const char* path) {
-    struct FSDeviceContext* device_context = vfs_device_get_context(path);
-    if (!device_context) return 0;
-    return fs_get_used_bytes(device_context);
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (!mount) return 0;
+    return mount->type->used_bytes(mount);
 }
 
 static bool do_sync_all(void) {
-    uint32_t root = knode_get_root();
-    uint32_t mnt  = knode_find_by_name(root, "mnt");
-    if (mnt == KNODE_NULL || mnt == 0)
+    void* mnt = vfs_mnt_directory();
+    if (mnt == NULL)
         return true;   // No mount directory: nothing to flush
     
     bool ok = true;
     uint32_t count = knode_get_reference_count(mnt);
     
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t mount = knode_get_reference(mnt, i);
-        if (mount == KNODE_NULL || mount == 0)
+        struct FsMount* mount = vfs_knode_mount(knode_get_reference(mnt, i));
+        if (mount == NULL)
             continue;
-        if ((kmalloc_get_flags(mount) & KMALLOC_FLAG_MOUNT) == 0)
-            continue;
-        
-        // Reference 1 of a mount knode is its FSDeviceContext (see pci.c)
-        uint32_t ctx_ref = knode_get_reference(mount, 1);
-        if (ctx_ref == KMALLOC_NULL || ctx_ref == 0)
-            continue;
-        
-        struct FSDeviceContext* ctx = (struct FSDeviceContext*)ctx_ref;
         
         // An unformatted device was never written through, so it has
         // nothing pending; skip it rather than poke the hardware
-        if (!ctx->is_open)
+        if (!mount->is_open)
             continue;
         
-        if (!fs_device_sync(ctx))
+        if (!mount->type->sync(mount))
             ok = false;
     }
     
     return ok;
 }
 
-static bool vfs_context_has_open_files(const struct FSDeviceContext* ctx) {
+static bool vfs_mount_has_open_files(const struct FsMount* mount) {
     for (struct list_node* n = open_files_head; n != NULL; n = n->next) {
         OpenFileDescriptor* desc = (OpenFileDescriptor*)n->data;
-        if (desc != NULL && desc->ctx == ctx)
+        if (desc != NULL && desc->in_file_system && desc->mount == mount)
             return true;
     }
     return false;
@@ -179,12 +142,12 @@ static bool vfs_context_has_open_files(const struct FSDeviceContext* ctx) {
 static uint8_t vfs_wipe_zeroes[VFS_WIPE_BUFFER_SIZE] __attribute__((aligned(16)));
 
 // Zero every device sector the new filesystem will cover
-static bool vfs_wipe_device(struct BlockDevice* device, uint32_t capacity, vfs_format_progress_fn progress) {
+static bool vfs_wipe_device(struct BlockDevice* device, uint64_t capacity, vfs_format_progress_fn progress) {
     uint32_t sector_size = device->sector_size;
     if (sector_size > VFS_WIPE_BUFFER_SIZE)
         return false;
     
-    uint64_t total   = ((uint64_t)capacity + sector_size - 1) / sector_size;
+    uint64_t total   = (capacity + sector_size - 1) / sector_size;
     uint32_t chunk   = VFS_WIPE_BUFFER_SIZE / sector_size;
     uint32_t percent = 0;
     
@@ -203,158 +166,133 @@ static bool vfs_wipe_device(struct BlockDevice* device, uint32_t capacity, vfs_f
     return true;
 }
 
-static VfsFormatResult do_device_format_context(struct FSDeviceContext* ctx, uint32_t capacity,
+static VfsFormatResult do_device_format_context(struct FsMount* mount, uint64_t capacity,
                                                 uint32_t block_size, bool full_wipe,
                                                 vfs_format_progress_fn progress) {
-    if (ctx == NULL || ctx->device == NULL || ctx->device_address == 0)
+    if (mount == NULL || mount->device == NULL)
         return VFS_FORMAT_NOT_MOUNTED;
     
-    struct BlockDevice* device = ctx->device;
-    uint32_t window = ctx->device_address;
+    struct BlockDevice* device = mount->device;
+    const struct FsType* type = mount->type;
     
-    if (block_size < FS_MIN_SECTOR_SIZE || (block_size % 4U) != 0 ||
-        capacity < block_size || capacity > fs_device_max_capacity(device))
+    if (!type->format_check(device, capacity, block_size))
         return VFS_FORMAT_BAD_SIZE;
     
     // Open files hold addresses into the old layout: refuse rather than
     // leave them pointing into freshly formatted space
-    if (vfs_context_has_open_files(ctx))
+    if (vfs_mount_has_open_files(mount))
         return VFS_FORMAT_BUSY;
     
     // Commit what is pending on the old filesystem, then forget everything
-    // the context has cached about it (the window is about to be reused)
-    if (ctx->is_open)
-        fs_device_sync(ctx);
-    ctx->is_open      = false;
-    ctx->sector_frame = 0xFFFFFFFF;
-    ctx->sector_dirty = false;
-    ctx->frame_offset = FS_INVALID_FRAME;
-    ctx->frame_dirty  = false;
+    // the mount has cached about it (its buffers are about to be reused)
+    if (mount->is_open)
+        type->sync(mount);
+    type->detach(mount);
     
     VfsFormatResult result = VFS_FORMAT_OK;
     
     if (full_wipe && !vfs_wipe_device(device, capacity, progress))
         result = VFS_FORMAT_IO_ERROR;
     
-    if (result == VFS_FORMAT_OK && !fs_device_format(device, window, capacity, block_size))
+    if (result == VFS_FORMAT_OK && !type->format(mount, device, capacity, block_size))
         result = VFS_FORMAT_IO_ERROR;
     
-    // Re-open even on failure, so the context matches what is on disk now
-    struct FSPartitionBlock part;
-    *ctx = fs_device_open(device, window, &part);
+    // Re-open even on failure, so the mount matches what is on disk now
+    if (!type->attach(mount, device))
+        mount->device = device;     // Out of memory: keep it formattable
     
-    if (result == VFS_FORMAT_OK && (!ctx->is_open || part.root_directory == FS_NULL))
+    if (result == VFS_FORMAT_OK && (!mount->is_open || type->root(mount) == FS_NODE_NULL))
         result = VFS_FORMAT_IO_ERROR;
     
     return result;
 }
 
 // Cut a mount loose from its disk: it reports as unformatted and every
-// basefs call on it becomes a no-op (fs_io_ready fails without a device).
-// The mount knode stays; pci_mount_block_device re-attaches it by name.
-static void vfs_context_detach(struct FSDeviceContext* ctx) {
-    ctx->is_open      = false;
-    ctx->device       = NULL;
-    ctx->pool_size    = 0;
-    ctx->block_count  = 0;
-    ctx->sector_frame = 0xFFFFFFFF;
-    ctx->sector_dirty = false;
-    ctx->frame_offset = FS_INVALID_FRAME;
-    ctx->frame_dirty  = false;
+// filesystem call on it becomes a no-op. The mount knode stays;
+// vfs_mount_device re-attaches it by name.
+static void vfs_mount_detach(struct FsMount* mount) {
+    mount->type->detach(mount);
 }
 
-// The context of the i-th entry of /mnt, or NULL if it is not a mount
-static struct FSDeviceContext* vfs_mount_context(uint32_t mnt, uint32_t index) {
-    uint32_t mount = knode_get_reference(mnt, index);
-    if (mount == KNODE_NULL || mount == 0 || mount == KMALLOC_NULL)
-        return NULL;
-    if ((kmalloc_get_flags(mount) & KMALLOC_FLAG_MOUNT) == 0)
-        return NULL;
-    
-    // Reference 1 of a mount knode is its FSDeviceContext (see pci.c)
-    uint32_t ctx_ref = knode_get_reference(mount, 1);
-    if (ctx_ref == KMALLOC_NULL || ctx_ref == 0)
-        return NULL;
-    return (struct FSDeviceContext*)ctx_ref;
+// The mount of the i-th entry of /mnt, or NULL if it is not a mount
+static struct FsMount* vfs_mount_at(void* mnt, uint32_t index) {
+    return vfs_knode_mount(knode_get_reference(mnt, index));
 }
 
-static uint32_t vfs_mnt_directory(void) {
-    uint32_t mnt = knode_find_by_name(knode_get_root(), "mnt");
-    return (mnt == KNODE_NULL || mnt == KMALLOC_NULL) ? 0 : mnt;
-}
-
-static bool vfs_context_on_disk(const struct FSDeviceContext* ctx, const struct BlockDevice* disk) {
-    return ctx->device != NULL &&
-           (ctx->device == disk || block_partition_parent(ctx->device) == disk);
+static bool vfs_mount_on_disk(const struct FsMount* mount, const struct BlockDevice* disk) {
+    return mount->device != NULL &&
+           (mount->device == disk || block_partition_parent(mount->device) == disk);
 }
 
 // Detach every mount on `disk` or on one of its partitions, after syncing
 // it. Refuses (and changes nothing) while a file on any of them is open.
 static VfsFormatResult do_release_disk(struct BlockDevice* disk) {
-    uint32_t mnt = vfs_mnt_directory();
-    if (mnt == 0)
+    void* mnt = vfs_mnt_directory();
+    if (mnt == NULL)
         return VFS_FORMAT_OK;
     uint32_t count = knode_get_reference_count(mnt);
     
     for (uint32_t i = 0; i < count; i++) {
-        struct FSDeviceContext* ctx = vfs_mount_context(mnt, i);
-        if (ctx != NULL && vfs_context_on_disk(ctx, disk) && vfs_context_has_open_files(ctx))
+        struct FsMount* mount = vfs_mount_at(mnt, i);
+        if (mount != NULL && vfs_mount_on_disk(mount, disk) && vfs_mount_has_open_files(mount))
             return VFS_FORMAT_BUSY;
     }
     
     for (uint32_t i = 0; i < count; i++) {
-        struct FSDeviceContext* ctx = vfs_mount_context(mnt, i);
-        if (ctx == NULL || !vfs_context_on_disk(ctx, disk))
+        struct FsMount* mount = vfs_mount_at(mnt, i);
+        if (mount == NULL || !vfs_mount_on_disk(mount, disk))
             continue;
-        if (ctx->is_open)
-            fs_device_sync(ctx);
-        vfs_context_detach(ctx);
+        if (mount->is_open)
+            mount->type->sync(mount);
+        vfs_mount_detach(mount);
     }
     return VFS_FORMAT_OK;
 }
 
-static struct FSDeviceContext* vfs_find_device_context(const struct BlockDevice* device) {
-    uint32_t mnt = vfs_mnt_directory();
-    if (mnt == 0)
+static struct FsMount* vfs_find_device_mount(const struct BlockDevice* device) {
+    void* mnt = vfs_mnt_directory();
+    if (mnt == NULL)
         return NULL;
     uint32_t count = knode_get_reference_count(mnt);
     for (uint32_t i = 0; i < count; i++) {
-        struct FSDeviceContext* ctx = vfs_mount_context(mnt, i);
-        if (ctx != NULL && ctx->device == device)
-            return ctx;
+        struct FsMount* mount = vfs_mount_at(mnt, i);
+        if (mount != NULL && mount->device == device)
+            return mount;
     }
     return NULL;
 }
 
-// Replace whatever a whole disk holds with an MBR whose single basefs
-// partition starts at `first_sector`. The whole-disk mount is detached
-// afterwards (it would otherwise cover the new table, and a format through
-// it would erase the table again); the partition mounts on the next boot.
+// Replace whatever a whole disk holds with an MBR whose single partition,
+// of the mount's filesystem type, starts at `first_sector`. The whole-disk
+// mount is detached afterwards (it would otherwise cover the new table, and
+// a format through it would erase the table again); the partition mounts on
+// the next boot.
 static VfsFormatResult do_device_partition(const char* path, uint64_t first_sector) {
-    struct FSDeviceContext* ctx = vfs_device_get_mount_context(path);
-    if (ctx == NULL || ctx->device == NULL)
+    struct FsMount* mount = vfs_device_get_mount_context(path);
+    if (mount == NULL || mount->device == NULL)
         return VFS_FORMAT_NOT_MOUNTED;
     
     // Only whole disks get a table; a partition cannot hold another one
-    if (block_partition_parent(ctx->device) != NULL)
+    if (block_partition_parent(mount->device) != NULL)
         return VFS_FORMAT_BAD_SIZE;
-    if (ctx->device->sector_size != MBR_SECTOR_SIZE ||
-        first_sector == 0 || first_sector >= ctx->device->sector_count)
+    if (mount->device->sector_size != MBR_SECTOR_SIZE || mount->type->mbr_type == 0 ||
+        first_sector == 0 || first_sector >= mount->device->sector_count)
         return VFS_FORMAT_BAD_SIZE;
     
-    if (vfs_context_has_open_files(ctx))
+    if (vfs_mount_has_open_files(mount))
         return VFS_FORMAT_BUSY;
     
-    if (ctx->is_open)
-        fs_device_sync(ctx);
+    if (mount->is_open)
+        mount->type->sync(mount);
     
-    struct BlockDevice* disk = ctx->device;
+    struct BlockDevice* disk = mount->device;
+    uint8_t mbr_type = mount->type->mbr_type;
     
     // Detach first: from here on nothing can write through the old mount,
     // whether or not the table write below succeeds
-    vfs_context_detach(ctx);
+    vfs_mount_detach(mount);
     
-    if (!block_mbr_write_single(disk, MBR_TYPE_BASEFS, first_sector))
+    if (!block_mbr_write_single(disk, mbr_type, first_sector))
         return VFS_FORMAT_IO_ERROR;
     return VFS_FORMAT_OK;
 }
@@ -385,22 +323,31 @@ uint64_t vfs_device_get_used(const char* path) {
     return result;
 }
 
-VfsFormatResult vfs_device_format_context(struct FSDeviceContext* ctx, uint32_t capacity,
+VfsFormatResult vfs_device_format_context(struct FsMount* mount, uint64_t capacity,
                                           uint32_t block_size, bool full_wipe,
                                           vfs_format_progress_fn progress) {
     vfs_lock();
-    VfsFormatResult result = do_device_format_context(ctx, capacity, block_size, full_wipe, progress);
+    VfsFormatResult result = do_device_format_context(mount, capacity, block_size, full_wipe, progress);
+    vfs_unlock();
+    return result;
+}
+
+uint64_t vfs_device_max_capacity(struct FsMount* mount) {
+    if (mount == NULL)
+        return 0;
+    vfs_lock();
+    uint64_t result = (mount->device != NULL) ? mount->type->max_capacity(mount->device) : 0;
     vfs_unlock();
     return result;
 }
 
 bool vfs_device_format(const char* path) {
     vfs_lock();
-    struct FSDeviceContext* ctx = vfs_device_get_mount_context(path);
+    struct FsMount* mount = vfs_device_get_mount_context(path);
     VfsFormatResult result = VFS_FORMAT_NOT_MOUNTED;
-    if (ctx != NULL && ctx->device != NULL) {
-        result = do_device_format_context(ctx, fs_device_max_capacity(ctx->device),
-                                          ctx->device->sector_size, false, NULL);
+    if (mount != NULL && mount->device != NULL) {
+        result = do_device_format_context(mount, mount->type->max_capacity(mount->device),
+                                          mount->device->sector_size, false, NULL);
     }
     vfs_unlock();
     return result == VFS_FORMAT_OK;
@@ -428,11 +375,10 @@ VfsFormatResult vfs_device_release_disk(struct BlockDevice* disk) {
     return result;
 }
 
-struct FSDeviceContext* vfs_device_context(struct BlockDevice* device) {
+struct FsMount* vfs_device_context(struct BlockDevice* device) {
     if (device == NULL) return NULL;
     vfs_lock();
-    struct FSDeviceContext* ctx = vfs_find_device_context(device);
+    struct FsMount* mount = vfs_find_device_mount(device);
     vfs_unlock();
-    return ctx;
+    return mount;
 }
-

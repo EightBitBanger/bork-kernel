@@ -1,3 +1,4 @@
+
 #ifndef _KERNEL_SYSCALL_H_
 #define _KERNEL_SYSCALL_H_
 
@@ -79,7 +80,11 @@
 #define SYS_GETHOME    47   // (buf, size)              home path length (system device root)
 #define SYS_TIME       48   // (uint64_t* ms)           0, milliseconds since boot
 #define SYS_INPUT_WARP 49   // (handle, x, y, SysInputEvent* scratch)  0, pointer moved
-#define SYS_COUNT      50
+#define SYS_SPAWN      50   // (path, argv or 0, cwd or 0, mask)       process id    (needs SYS_SEC_EXEC)
+#define SYS_FINFO      51   // (path, SysFileInfo*)     0
+#define SYS_CHMOD      52   // (path, permissions)      0
+#define SYS_SYNC       53   // ()                       0, every file system written out
+#define SYS_COUNT      54
 
 #define SYS_OK               0
 #define SYS_ENOSYS          -1  // Unknown syscall number
@@ -103,7 +108,8 @@
 #define SYS_ESRCH          -19  // No such process
 #define SYS_EAGAIN         -20  // Not now: nothing to receive / queue full / try again
 #define SYS_EPIPE          -21  // The other end of the pipe is closed
-#define SYS_EBADFMT        -22  // Not a resource file this kernel can load
+#define SYS_EBADFMT        -22  // Not a resource file / executable this kernel can load
+#define SYS_E2BIG          -23  // Argument list too long (SYS_SPAWN)
 
 #define SYS_ERROR_MIN       -4095
 
@@ -132,6 +138,7 @@
 //                        shm_unmap, and ipc_wait on those handles
 //   SYS_SEC_INPUT        take the keyboard and mouse: input_open,
 //                        input_read, and ipc_wait on an input handle
+//   SYS_SEC_EXEC         start other programs: spawn
 //   SYS_SEC_ADMIN        configure security masks: SYS_SEC_SET on any
 //                        process (itself included) and SYS_SEC_GET on other
 //                        processes; create ports named "sys.*"
@@ -144,7 +151,11 @@
 // change or remove it only when its own mask holds every bit of the file's
 // (SYS_EACCES otherwise). Files marked with SYS_SEC_ADMIN are administrator
 // files: a user program (SYS_SEC_ADMIN clear) cannot touch them. stat still
-// works on them. New files and directories inherit their directory's mask.
+// works on them. A directory's mask also guards the way through it, as Unix
+// search permission does: nothing inside a directory the process is not
+// cleared for can be reached, whatever its own mask (SYS_EACCES from the
+// path checks; a lookup through it reports SYS_ENOENT). New files and
+// directories inherit their directory's mask.
 //
 // The bits are independent: SYS_SEC_ADMIN does not imply the others, but an
 // administrative process can grant itself whatever it needs. An admin that
@@ -164,12 +175,13 @@
 #define SYS_SEC_GFX_SCREEN  0x00000010u
 #define SYS_SEC_IPC         0x00000020u
 #define SYS_SEC_INPUT       0x00000040u
+#define SYS_SEC_EXEC        0x00000080u
 #define SYS_SEC_ADMIN       0x00000100u
 
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | \
                              SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | SYS_SEC_IPC | \
-                             SYS_SEC_INPUT | SYS_SEC_ADMIN)
+                             SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN)
 
 //
 // Files
@@ -201,8 +213,8 @@
 #define SYS_O_READ          0x01
 #define SYS_O_WRITE         0x02
 #define SYS_O_CREATE        0x04    // Create the file if it does not exist
-#define SYS_O_TRUNC         0x08    // Empty an existing file (needs WRITE)
-#define SYS_O_APPEND        0x10    // Every write goes to the end (needs WRITE)
+#define SYS_O_TRUNC         0x08    // Empty an existing file (needs WRITE)       = VFS_OPEN_TRUNCATE
+#define SYS_O_APPEND        0x10    // Every write goes to the end (needs WRITE)  = VFS_OPEN_APPEND
 #define SYS_O_EXCL          0x20    // With CREATE: fail with SYS_EEXIST if it exists
 
 // SYS_SEEK whence
@@ -257,7 +269,7 @@ typedef struct {
 // the first error; otherwise the number of commands run.
 //
 
-#define SYS_GFX_SURFACE_MAX     16              // Surfaces per process
+#define SYS_GFX_SURFACE_MAX     256             // Surfaces per process (the table grows to this)
 #define SYS_GFX_MAX_DIM         4096            // Largest surface width / height
 #define SYS_GFX_PROCESS_BYTES   (32U << 20)     // Pixel memory per process
 #define SYS_GFX_SUBMIT_MAX      65536           // Bytes per SYS_GFX_SUBMIT
@@ -381,13 +393,13 @@ typedef struct {
 // Waiting on a pipe, port or shm needs SYS_SEC_IPC, on input SYS_SEC_INPUT.
 //
 
-#define SYS_IPC_HANDLE_MAX      64              // Handles per process
+#define SYS_IPC_HANDLE_MAX      1024            // Handles per process (the table grows to this)
 #define SYS_IPC_MSG_MAX         512             // Bytes per message
 #define SYS_IPC_QUEUE_MAX       64              // Messages queued per direction
 #define SYS_IPC_GLOBAL_BYTES    (4U << 20)      // Message bytes queued system-wide
 #define SYS_IPC_NAME_MAX        32              // Port name bytes, terminator included
 #define SYS_IPC_BACKLOG         16              // Connections waiting per port
-#define SYS_IPC_WAIT_MAX        32              // Items per SYS_IPC_WAIT
+#define SYS_IPC_WAIT_MAX        128             // Items per SYS_IPC_WAIT
 #define SYS_IPC_WAIT_FOREVER    0xFFFFFFFFu
 #define SYS_SHM_MAX             (16U << 20)     // Bytes per shared block
 #define SYS_SHM_TOTAL_MAX       (64U << 20)     // Bytes in all shared blocks together
@@ -533,6 +545,86 @@ typedef struct {
     uint32_t reserved;
 } SysResInfo;
 
+//
+// File details: SYS_FINFO, SYS_CHMOD
+//
+// SYS_FINFO(path, SysFileInfo*) tells what SYS_STAT doesn't: the clearance
+// a file requires (its security mask, the same SYS_SEC_* bits a process
+// holds), whether the caller's clearance covers it, whether the caller could
+// change its permissions, and for a storage device's root how full the
+// device is. Works on files the caller may not open (like stat). Needs
+// SYS_SEC_FILE_READ.
+//
+// SYS_CHMOD(path, permissions) replaces a file's or folder's SYS_PERM_* bits.
+// Needs SYS_SEC_FILE_WRITE, clearance for the file and the folder holding
+// it, and that folder must be writable (SYS_EACCES otherwise). A device's
+// root is SYS_EBUSY; bits outside SYS_PERM_* are SYS_EINVAL.
+//
+
+#define SYS_FINFO_DEVICE    0x0001  // A storage device's root: device_* are filled in
+#define SYS_FINFO_ACCESS    0x0002  // The caller's clearance covers `security`
+#define SYS_FINFO_CHMOD     0x0004  // SYS_CHMOD on it would be allowed for the caller
+
+// Filled by SYS_FINFO. 32 bytes.
+typedef struct {
+    uint32_t security;          // SYS_SEC_* bits the file requires (0: anyone)
+    uint32_t flags;             // SYS_FINFO_*
+    uint32_t device_used;       // DEVICE: as the device reports them (vfs_device_get_*)
+    uint32_t device_capacity;
+    uint32_t reserved[4];
+} SysFileInfo;
+
+//
+// SYS_SYNC() writes what every mounted file system still holds in memory
+// (cached blocks, directory entries, allocation tables) to its device, so a
+// file just written, renamed or removed survives a reset. Needs
+// SYS_SEC_FILE_WRITE; SYS_EIO if a device refused a write.
+//
+
+//
+// Processes
+//
+// SYS_SPAWN(path, argv, cwd, mask) loads the ELF executable at `path`
+// (relative paths start in the working directory) as a new process and
+// returns its id. Needs SYS_SEC_EXEC. The caller does not wait: the new
+// process may already be running when the call returns, and it lives on
+// independently of the caller.
+//
+//   argv   user array of string pointers ending in NULL, or 0. Copied in
+//          before anything else happens. At most SYS_ARG_MAX strings and
+//          SYS_ARG_BYTES bytes of them, terminators included (SYS_E2BIG
+//          beyond). 0 or an empty array gives argv = { resolved path }.
+//          By convention argv[0] is the program's name.
+//   cwd    the child's working directory: 0 = the caller's, "" = the
+//          directory holding the executable, anything else a path
+//          (relative to the caller's). One that is not a usable directory
+//          starts the child in "/".
+//   mask   the child's SYS_SEC_* mask, or SYS_SPAWN_INHERIT for the caller's
+//          own. It must hold only bits the caller holds (SYS_EPERM): a
+//          process can hand clearance down, never invent it.
+//   The child runs at the caller's base priority.
+//
+// Errors: SYS_ENOENT, SYS_EISDIR, SYS_EACCES (the file's clearance, or not
+// marked executable), SYS_EBADFMT (not an ELF this kernel can run),
+// SYS_E2BIG, SYS_ENAMETOOLONG, SYS_EAGAIN (process table full), SYS_ENOMEM,
+// SYS_EFAULT, SYS_EINVAL, SYS_EPERM.
+//
+// Program entry, for every process however it was started: ESP is 16-byte
+// aligned and points at
+//
+//   [esp]          argc
+//   [esp + 4]      argv[0] .. argv[argc - 1], then NULL
+//   after that     envp: NULL (no environment is passed yet)
+//
+// with the strings themselves higher up on the same stack. A process the
+// kernel starts itself gets argc 1, argv[0] = its image path (or its name
+// for a flat image).
+//
+
+#define SYS_SPAWN_INHERIT       0xFFFFFFFFu     // mask: the caller's own
+#define SYS_ARG_MAX             64              // Strings in argv
+#define SYS_ARG_BYTES           4096            // Bytes of them, terminators included
+
 // Kernel side: set up the serial output and locks the syscalls use. The IDT
 // gate is installed by idt_init().
 void syscall_init(void);
@@ -556,6 +648,8 @@ bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, cons
 void syscall_process_exit(uint32_t process_id);
 
 #endif
+
+
 
 
 

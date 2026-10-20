@@ -691,9 +691,9 @@ uint32_t thread_handler_c(uint32_t current_esp) {
 
     // FPU/SSE state is saved and restored by the entry stubs
     // (scheduler_context.asm / scheduler_yield_context.asm), around this
-    // function. Doing it here was too late: everything above (wd_tick,
+    // function. Here would be too late: everything above (wd_tick,
     // reap_threads -> free -> memset, the 64-bit timestamp math, which GCC
-    // may move through %xmm0 when SSE is enabled) ran first and could
+    // may move through %xmm0 when SSE is enabled) runs first and could
     // clobber the outgoing thread's XMM registers.
     return next->esp;
 }

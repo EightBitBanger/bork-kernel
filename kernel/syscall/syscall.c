@@ -1,3 +1,4 @@
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -36,6 +37,13 @@
 #include <kernel/syscall/calls/sys_home.h>      // gethome
 #include <kernel/syscall/calls/sys_time.h>      // time
 #include <kernel/syscall/calls/sys_input.h>     // input_warp
+
+// Processes: start another program with arguments
+#include <kernel/syscall/calls/sys_spawn.h>     // spawn
+
+// File details beyond stat: security mask, device usage; permission changes
+#include <kernel/syscall/calls/sys_finfo.h>     // finfo chmod
+#include <kernel/syscall/calls/sys_sync.h>      // sync
 
 typedef struct {
     const char* name;       // For traces and reports
@@ -105,6 +113,10 @@ static const SyscallEntry syscall_table[] = {
     [SYS_GETHOME]     = { "gethome",     sys_gethome,     0 },      // Always, like getcwd
     [SYS_TIME]        = { "time",        sys_time,        0 },
     [SYS_INPUT_WARP]  = { "input_warp",  sys_input_warp,  INP },    // + the caller's input handle
+    [SYS_SPAWN]       = { "spawn",       sys_spawn,       SYS_SEC_EXEC },   // + a child mask within the caller's
+    [SYS_FINFO]       = { "finfo",       sys_finfo,       R },
+    [SYS_CHMOD]       = { "chmod",       sys_chmod,       W },
+    [SYS_SYNC]        = { "sync",        sys_sync,        W },
 };
 
 #undef R
@@ -124,6 +136,9 @@ _Static_assert(SYS_TYPE_FILE == VFS_TYPE_FILE && SYS_TYPE_DIRECTORY == VFS_TYPE_
 _Static_assert(SYS_PERM_EXECUTE == VFS_PERMISSION_EXECUTE && SYS_PERM_READ == VFS_PERMISSION_READ &&
                SYS_PERM_WRITE == VFS_PERMISSION_WRITE, "SYS_PERM_* must match VFS_PERMISSION_*");
 _Static_assert(sizeof(SysStat) == 20, "SysStat is part of the user ABI");
+_Static_assert(SYS_O_READ == VFS_OPEN_READ && SYS_O_WRITE == VFS_OPEN_WRITE &&
+               SYS_O_CREATE == VFS_OPEN_CREATE && SYS_O_TRUNC == VFS_OPEN_TRUNCATE &&
+               SYS_O_APPEND == VFS_OPEN_APPEND, "SYS_O_* must match VFS_OPEN_*");
 _Static_assert(SYS_FD_FIRST < SYS_FD_MAX, "no room for descriptors");
 _Static_assert(sizeof(SysGfxRect) == 16 && sizeof(SysGfxInfo) == 32, "gfx structures are part of the user ABI");
 _Static_assert(SYS_GFX_BLEND_COPY == GFX_BLEND_COPY && SYS_GFX_BLEND_ALPHA == GFX_BLEND_ALPHA &&
@@ -202,6 +217,8 @@ void syscall_dispatch(struct SyscallFrame* frame) {
 
     frame->eax = (uint32_t)syscall_table[number].handler(&args);
 }
+
+
 
 
 

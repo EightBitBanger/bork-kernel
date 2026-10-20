@@ -84,7 +84,7 @@ static bool sys_user_put(AddressSpace* space, uint32_t user_addr, const void* sr
 
 static int32_t sys_stat_to_user(AddressSpace* space, uint32_t user_addr, const FSFileStats* st) {
     SysStat out = {
-        .size        = st->size,
+        .size        = (st->size > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)st->size,
         .type        = st->type,
         .permissions = st->permissions,
         .created     = st->created,

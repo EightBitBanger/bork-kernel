@@ -1,3 +1,4 @@
+
 #ifndef _KERNEL_SYS_FILE_H_
 #define _KERNEL_SYS_FILE_H_
 
@@ -25,10 +26,18 @@
 
 #define SYS_O_ALL     (SYS_O_READ | SYS_O_WRITE | SYS_O_CREATE | SYS_O_TRUNC | SYS_O_APPEND | SYS_O_EXCL)
 
+// The VFS works in 64-bit sizes and positions; the syscall ABI stops at
+// SYS_OFFSET_MAX. A larger file looks SYS_OFFSET_MAX long from user space.
+static inline uint32_t sys_clamp_offset(uint64_t value) {
+    return (value > SYS_OFFSET_MAX) ? SYS_OFFSET_MAX : (uint32_t)value;
+}
+
 // Resolve, create and open `path`. Caller holds the VFS lock, so the
 // existence checks and the open are one step.
 static int32_t sys_open_path(char* path, uint32_t flags, File* out) {
     uint16_t vfs_flags = sys_vfs_open_flags(flags);
+    if (flags & SYS_O_TRUNC)
+        vfs_flags |= VFS_OPEN_TRUNCATE;     // The VFS empties it as it opens
     bool exists = vfs_exists(path);
 
     if (exists) {
@@ -59,17 +68,10 @@ static int32_t sys_open_path(char* path, uint32_t flags, File* out) {
 
     File file = vfs_open(path, vfs_flags);
     if (file == VFS_INVALID_FILE) {
-        // A refused create: kernel folder, read-only directory, bad name, full device
+        // A refused create: kernel folder, read-only directory, bad name, full
+        // device. An existing file: TRUNC/APPEND on a kernel node (fixed
+        // size), or the truncate itself failed.
         return exists ? SYS_EIO : SYS_EACCES;
-    }
-
-    if ((flags & SYS_O_TRUNC) && vfs_get_size(file) != 0) {
-        vfs_close(file);
-        if (!vfs_truncate(path, 0))
-            return SYS_EIO;
-        file = vfs_open(path, (uint16_t)(vfs_flags & ~VFS_OPEN_CREATE));
-        if (file == VFS_INVALID_FILE)
-            return SYS_EIO;
     }
 
     *out = file;
@@ -84,6 +86,11 @@ static int32_t sys_open_path(char* path, uint32_t flags, File* out) {
 // reports SYS_EIO until it is closed.
 static bool sys_file_grow(SysFile* f, uint32_t new_size) {
     vfs_lock();
+    // Never shrink: a file past SYS_OFFSET_MAX only looks that short here
+    if (vfs_get_size(f->file) >= new_size) {
+        vfs_unlock();
+        return true;
+    }
     vfs_close(f->file);
     bool grown = vfs_truncate(f->path, new_size);
     f->file = vfs_open(f->path, sys_vfs_open_flags(f->flags));
@@ -144,7 +151,7 @@ static int32_t sys_open_locked(SysProcessFiles* t, const SyscallArgs* args) {
     f->path   = saved;
     f->file   = file;
     f->flags  = flags;
-    f->offset = (flags & SYS_O_APPEND) ? vfs_get_size(file) : 0;
+    f->offset = (flags & SYS_O_APPEND) ? sys_clamp_offset(vfs_get_size(file)) : 0;
     return fd;
 }
 
@@ -195,7 +202,7 @@ static int32_t sys_read_locked(SysProcessFiles* t, const SyscallArgs* args) {
         return SYS_EFAULT;
 
     // Clamp here rather than trust each device's end-of-file behaviour
-    uint32_t size = vfs_get_size(f->file);
+    uint32_t size = sys_clamp_offset(vfs_get_size(f->file));
     if (f->offset >= size)
         return 0;
     if (length > size - f->offset)
@@ -266,23 +273,33 @@ static int32_t sys_write_locked(SysProcessFiles* t, const SyscallArgs* args) {
     if (!vmm_user_check(space, user_buffer, length, false))
         return SYS_EFAULT;
 
-    uint32_t size = vfs_get_size(f->file);
-    if (f->flags & SYS_O_APPEND)
+    uint32_t size = sys_clamp_offset(vfs_get_size(f->file));
+    bool append = (f->flags & SYS_O_APPEND) != 0;
+
+    if (append) {
+        // The handle was opened VFS_OPEN_APPEND: every vfs_write lands at
+        // the end of the file and grows it there, so nothing is sized up
+        // front (a pre-grow would move "the end" past the new zeros)
         f->offset = size;
+        if (size >= SYS_OFFSET_MAX)
+            return SYS_ENOSPC;
+        if (length > SYS_OFFSET_MAX - size)
+            length = SYS_OFFSET_MAX - size;
+    } else {
+        // offset <= SYS_OFFSET_MAX and length <= SYS_RW_MAX: cannot wrap
+        uint32_t end = f->offset + length;
+        if (end > size) {
+            sys_file_grow(f, end);      // On failure the write stops at the old end
+            if (f->file == VFS_INVALID_FILE)
+                return SYS_EIO;
+            size = sys_clamp_offset(vfs_get_size(f->file));
+        }
 
-    // offset <= SYS_OFFSET_MAX and length <= SYS_RW_MAX: cannot wrap
-    uint32_t end = f->offset + length;
-    if (end > size) {
-        sys_file_grow(f, end);      // On failure the write stops at the old end
-        if (f->file == VFS_INVALID_FILE)
-            return SYS_EIO;
-        size = vfs_get_size(f->file);
+        if (f->offset >= size)
+            return SYS_ENOSPC;
+        if (length > size - f->offset)
+            length = size - f->offset;
     }
-
-    if (f->offset >= size)
-        return SYS_ENOSPC;
-    if (length > size - f->offset)
-        length = size - f->offset;
 
     uint8_t* bounce = (uint8_t*)malloc(SYS_IO_CHUNK);
     if (bounce == NULL)
@@ -305,6 +322,7 @@ static int32_t sys_write_locked(SysProcessFiles* t, const SyscallArgs* args) {
         int32_t wrote = vfs_write(f->file, bounce, want);
         if (wrote <= 0) {
             if (wrote < 0) error = SYS_EIO;
+            else if (append) error = SYS_ENOSPC;    // The file could not grow
             break;
         }
 
@@ -315,6 +333,11 @@ static int32_t sys_write_locked(SysProcessFiles* t, const SyscallArgs* args) {
     }
 
     free(bounce);
+
+    // Append: other descriptors on the file may have written in between,
+    // so the position is wherever this handle's last write ended
+    if (append && done > 0)
+        f->offset = sys_clamp_offset(vfs_tell(f->file));
     return (done > 0) ? (int32_t)done : error;
 }
 
@@ -396,5 +419,6 @@ static int32_t sys_fstat(const SyscallArgs* args) {
 }
 
 #endif
+
 
 

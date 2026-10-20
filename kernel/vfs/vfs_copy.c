@@ -57,7 +57,7 @@ static bool copy_file(const char* src, const char* dest) {
     File in = vfs_open(src, VFS_OPEN_READ);
     if (in == VFS_INVALID_FILE) return false;
 
-    uint32_t size = vfs_get_size(in);
+    uint64_t size = vfs_get_size(in);
 
     // Create the destination, then size it BEFORE writing: writes do not
     // reliably extend a file past the space it already owns
@@ -85,9 +85,9 @@ static bool copy_file(const char* src, const char* dest) {
             vfs_seek(in, 0);
             vfs_seek(out, 0);
 
-            uint32_t remaining = size;
+            uint64_t remaining = size;
             while (remaining > 0) {
-                uint32_t chunk = (remaining < VFS_COPY_CHUNK) ? remaining : VFS_COPY_CHUNK;
+                uint32_t chunk = (remaining < VFS_COPY_CHUNK) ? (uint32_t)remaining : VFS_COPY_CHUNK;
 
                 int32_t got = vfs_read(in, buffer, chunk);
                 if (got <= 0) { ok = false; break; }   // Unreadable source (permissions)
@@ -202,5 +202,3 @@ bool vfs_copy(const char* src, const char* dest) {
 
     return ok;
 }
-
-

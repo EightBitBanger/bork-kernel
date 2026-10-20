@@ -1,3 +1,4 @@
+
 #ifndef _KERNEL_SYS_FILES_H_
 #define _KERNEL_SYS_FILES_H_
 
@@ -263,10 +264,14 @@ static SysFile* sys_fd_get(SysProcessFiles* t, uint32_t fd) {
     return (f->path != NULL) ? f : NULL;
 }
 
+// The VFS flags a descriptor's handle is (re)opened with. TRUNC is left
+// out on purpose: it applies once, at SYS_OPEN (sys_open_path adds it), and
+// must not empty the file again when sys_file_grow reopens the handle.
 static uint16_t sys_vfs_open_flags(uint32_t flags) {
     uint16_t vfs_flags = 0;
-    if (flags & SYS_O_READ)  vfs_flags |= VFS_OPEN_READ;
-    if (flags & SYS_O_WRITE) vfs_flags |= VFS_OPEN_WRITE;
+    if (flags & SYS_O_READ)   vfs_flags |= VFS_OPEN_READ;
+    if (flags & SYS_O_WRITE)  vfs_flags |= VFS_OPEN_WRITE;
+    if (flags & SYS_O_APPEND) vfs_flags |= VFS_OPEN_APPEND;
     return vfs_flags;
 }
 
@@ -313,4 +318,5 @@ static void sys_files_rename_paths(SysProcessFiles* t, const char* old_path, con
 }
 
 #endif
+
 

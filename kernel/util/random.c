@@ -6,8 +6,8 @@
  * Classic ANSI C LCG. The high 15 bits of the state are returned, since the
  * low bits of an LCG with a power-of-two modulus have very short periods.
  *
- * TODO: seed from a persistent file / hardware RNG (previous VFS-based draft
- * removed from this file; it belongs in the cryptography module).
+ * TODO: seed from a persistent file / hardware RNG (in the cryptography
+ * module, not here).
  */
 
 static uint32_t rand_state = 123456789;

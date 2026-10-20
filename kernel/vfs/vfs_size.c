@@ -13,7 +13,6 @@
 #include <kernel/malloc.h>
 
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
 #include <kernel/vfs/vfs.h>
 #include <kernel/vfs/vfs_internal.h>
@@ -22,35 +21,44 @@
 
 #define VFS_SIZE_MAX_DEPTH   32
 
-// Directory on a mounted basefs device
-static void size_walk_fs(struct FSDeviceContext* ctx, uint32_t dir, uint32_t depth, VfsDirectorySize* out) {
+// File size on a mounted volume, 0 if it cannot be read
+static uint64_t size_of_fs_file(struct FsMount* mount, uint64_t node) {
+    FsNodeAttr attr;
+    return mount->type->get_attr(mount, node, &attr) ? attr.size : 0;
+}
+
+// Directory on a mounted volume
+static void size_walk_fs(struct FsMount* mount, uint64_t dir, uint32_t depth, VfsDirectorySize* out) {
     if (depth >= VFS_SIZE_MAX_DEPTH) {
         out->complete = false;
         return;
     }
 
-    uint32_t parent = fs_directory_get_parent(ctx, dir);
-    uint32_t count  = fs_directory_get_reference_count(ctx, dir);
+    uint64_t parent = mount->type->parent(mount, dir);
+    uint32_t count  = mount->type->dir_count(mount, dir);
 
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t ref = fs_directory_get_reference(ctx, dir, i);
-
-        // Never follow a link back up (would loop forever)
-        if (ref == FS_NULL || ref == 0 || ref == dir || ref == parent)
+        uint64_t ref = FS_NODE_NULL;
+        if (!mount->type->dir_entry(mount, dir, i, &ref, NULL, 0))
             continue;
 
-        if (fs_file_check(ctx, ref)) {
-            out->bytes += fs_file_get_size(ctx, ref);
+        // Never follow a link back up (would loop forever)
+        if (ref == FS_NODE_NULL || ref == 0 || ref == dir || ref == parent)
+            continue;
+
+        uint8_t type = vfs_node_type(mount, ref);
+        if (type == FS_NODE_FILE) {
+            out->bytes += size_of_fs_file(mount, ref);
             out->files++;
-        } else if (fs_check_directory_valid(ctx, ref)) {
+        } else if (type == FS_NODE_DIRECTORY) {
             out->folders++;
-            size_walk_fs(ctx, ref, depth + 1, out);
+            size_walk_fs(mount, ref, depth + 1, out);
         }
     }
 }
 
 // Kernel node folder (/, /dev, /mnt, ...)
-static void size_walk_knode(uint32_t dir, uint32_t depth, VfsDirectorySize* out) {
+static void size_walk_knode(void* dir, uint32_t depth, VfsDirectorySize* out) {
     if (depth >= VFS_SIZE_MAX_DEPTH) {
         out->complete = false;
         return;
@@ -59,8 +67,8 @@ static void size_walk_knode(uint32_t dir, uint32_t depth, VfsDirectorySize* out)
     uint32_t count = knode_get_reference_count(dir);
 
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t child = knode_get_reference(dir, i);
-        if (child == KNODE_NULL || child == 0 || child == dir)
+        void* child = knode_get_reference(dir, i);
+        if (child == NULL || child == dir)
             continue;
         if (!kmalloc_is_valid(child))
             continue;
@@ -91,26 +99,27 @@ static bool do_directory_get_size(const char* path, VfsDirectorySize* out) {
     if (path == NULL || path[0] == '\0')
         return false;
 
-    uint32_t address = resolve_path_to_address(path);
-    if (address == 0xFFFFFFFF || address == 0)
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address))
         return false;
 
-    struct FSDeviceContext* ctx = vfs_device_get_context(path);
+    struct FsMount* mount = vfs_device_get_context(path);
 
     // On a device (a mount point resolves to the device's root directory)
-    if (ctx && fs_check_directory_valid(ctx, address)) {
-        size_walk_fs(ctx, address, 0, out);
+    if (mount && vfs_node_is_directory(mount, address)) {
+        size_walk_fs(mount, address, 0, out);
         return true;
     }
-    if (ctx && fs_file_check(ctx, address)) {
-        out->bytes = fs_file_get_size(ctx, address);
+    if (mount && vfs_node_is_file(mount, address)) {
+        out->bytes = size_of_fs_file(mount, address);
         out->files = 1;
         return true;
     }
 
-    // Kernel nodes
-    if (kmalloc_is_valid(address)) {
-        uint8_t flags = kmalloc_get_flags(address);
+    // Kernel nodes (only when the path is not on an open device)
+    void* knode = mount ? NULL : vfs_address_knode(address);
+    if (knode != NULL && kmalloc_is_valid(knode)) {
+        uint8_t flags = kmalloc_get_flags(knode);
 
         // Mount whose device is not open (unformatted): nothing to count
         if (flags & KMALLOC_FLAG_MOUNT) {
@@ -119,9 +128,9 @@ static bool do_directory_get_size(const char* path, VfsDirectorySize* out) {
         }
 
         if (flags & KMALLOC_FLAG_DIRECTORY) {
-            size_walk_knode(address, 0, out);
+            size_walk_knode(knode, 0, out);
         } else {
-            out->bytes = kmalloc_get_size(address);
+            out->bytes = kmalloc_get_size(knode);
             out->files = 1;
         }
         return true;
@@ -143,4 +152,3 @@ bool vfs_directory_get_size(const char* path, VfsDirectorySize* out) {
     vfs_unlock();
     return result;
 }
-

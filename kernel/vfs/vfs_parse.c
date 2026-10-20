@@ -3,17 +3,12 @@
 #include <kernel/malloc.h>
 
 #include <kernel/knode.h>
-#include <kernel/fs/fs.h>
 
 #include <kernel/vfs/vfs_internal.h>
 
 #include <kernel/util/string.h>
 #include <kernel/util/tok.h>
 #include <kernel/util/list.h>
-
-// VFS_NAME_MAX is the public name limit and must match what basefs stores.
-// (Array size goes negative, failing the build, if the two ever drift apart.)
-typedef char vfs_name_max_matches_fs[(VFS_NAME_MAX == FS_NAME_MAX) ? 1 : -1];
 
 bool vfs_name_is_valid(const char* name) {
     if (name == NULL || name[0] == '\0' || name[0] == ' ')
@@ -44,42 +39,39 @@ bool vfs_path_fits(const char* path) {
 // the LAST component of a path, as the mount knode itself, so it can be
 // listed (empty), stat'ed, entered with cd and formatted. Any path that
 // tries to go through it returns false ("does not exist"): its knode
-// references are the cache window and the context, not children, and
-// walking them as directory entries would read raw memory as names.
-static bool vfs_enter_mount(uint32_t knode, bool final, uint32_t* fs_node, struct FSDeviceContext** ctx, bool* in_file_system) {
+// reference is the FsMount, not a child, and walking it as a directory
+// entry would read raw memory as names.
+static bool vfs_enter_mount(void* knode, bool final, uint64_t* fs_node, struct FsMount** mount, bool* in_file_system) {
     uint8_t flags = kmalloc_get_flags(knode);
     if (!(flags & KMALLOC_FLAG_MOUNT))
         return true;
 
-    uint32_t device_address = knode_get_reference(knode, 0);
-    uint32_t device_context = knode_get_reference(knode, 1);
-    if (device_context == 0 || device_context == KMALLOC_NULL ||
-        device_address == KMALLOC_NULL || device_address == 0)
+    struct FsMount* m = vfs_knode_mount(knode);
+    if (m == NULL || !m->is_open)
         return final;
 
-    struct FSDeviceContext* context = (struct FSDeviceContext*)device_context;
-    struct FSPartitionBlock partition;
-    if (!context->is_open || fs_device_get_partition(context, &partition) != 0)
+    uint64_t root = m->type->root(m);
+    if (root == FS_NODE_NULL)
         return final;   // Bad magic, another format version, or detached
 
-    *fs_node        = partition.root_directory;
-    *ctx            = context;
+    *fs_node        = root;
+    *mount          = m;
     *in_file_system = true;
     return true;
 }
 
 // ".." inside a device. Leaves the device when standing on its root.
-static void vfs_fs_parent(uint32_t* knode, uint32_t* fs_node, struct FSDeviceContext** ctx, bool* in_file_system) {
-    struct FSPartitionBlock partition;
-    fs_device_get_partition(*ctx, &partition);
+static void vfs_fs_parent(void** knode, uint64_t* fs_node, struct FsMount** mount, bool* in_file_system) {
+    struct FsMount* m = *mount;
+    uint64_t parent = (*fs_node == m->type->root(m)) ? FS_NODE_NULL : m->type->parent(m, *fs_node);
 
-    if (*fs_node == partition.root_directory) {
+    if (parent == FS_NODE_NULL) {
         *in_file_system = false;
         *fs_node        = 0;
-        *ctx            = NULL;
+        *mount          = NULL;
         *knode          = knode_get_parent(*knode);
     } else {
-        *fs_node = fs_directory_get_parent(*ctx, *fs_node);
+        *fs_node = parent;
     }
 }
 
@@ -139,14 +131,14 @@ bool vfs_path_normalize(const char* base, const char* path, char* out, size_t si
     return true;
 }
 
-uint32_t resolve_path_to_address(const char* path) {
+uint64_t resolve_path_to_address(const char* path) {
     if (!vfs_path_fits(path))
-        return 0xFFFFFFFF;
+        return FS_NODE_NULL;
 
-    uint32_t current_knode = knode_get_root();
-    uint32_t current_fs_node = 0;
+    void* current_knode = knode_get_root();
+    uint64_t current_fs_node = 0;
     bool in_file_system = false;
-    struct FSDeviceContext* current_ctx = NULL;
+    struct FsMount* current_mount = NULL;
 
     char path_scratch[VFS_PATH_MAX];
     strcpy(path_scratch, path);     // Fits: checked above
@@ -169,23 +161,29 @@ uint32_t resolve_path_to_address(const char* path) {
             if (strcmp(token, "..") == 0) {
                 current_knode = knode_get_parent(current_knode);
             } else {
-                uint32_t next_node = knode_find_by_name(current_knode, token);
-                if (next_node == 0xFFFFFFFF || next_node == 0) {
-                    return 0xFFFFFFFF;
+                void* next_node = knode_find_by_name(current_knode, token);
+                if (next_node == NULL) {
+                    return FS_NODE_NULL;
                 }
                 current_knode = next_node;
             }
 
-            if (!vfs_enter_mount(current_knode, next == NULL, &current_fs_node, &current_ctx, &in_file_system))
-                return 0xFFFFFFFF;
+            if (!vfs_enter_mount(current_knode, next == NULL, &current_fs_node, &current_mount, &in_file_system))
+                return FS_NODE_NULL;
         } else {
+            // Going through a directory, into a child or back out with "..",
+            // needs the caller's clearance for it (the Unix search check).
+            // The object at the end of the path is the caller's to check.
+            if (!vfs_fs_node_allowed(current_mount, current_fs_node))
+                return FS_NODE_NULL;
+
             if (strcmp(token, "..") == 0) {
-                vfs_fs_parent(&current_knode, &current_fs_node, &current_ctx, &in_file_system);
+                vfs_fs_parent(&current_knode, &current_fs_node, &current_mount, &in_file_system);
             } else {
                 // Names live in the directory: this reads only its sectors
-                uint32_t found = fs_directory_find(current_ctx, current_fs_node, token);
-                if (found == 0 || found == FS_NULL) {
-                    return 0xFFFFFFFF;
+                uint64_t found = current_mount->type->lookup(current_mount, current_fs_node, token);
+                if (found == 0 || found == FS_NODE_NULL) {
+                    return FS_NODE_NULL;
                 }
                 current_fs_node = found;
             }
@@ -194,13 +192,13 @@ uint32_t resolve_path_to_address(const char* path) {
         token = next;
     }
 
-    return in_file_system ? current_fs_node : current_knode;
+    return in_file_system ? current_fs_node : vfs_knode_address(current_knode);
 }
 
-uint32_t resolve_path_to_mount_point(const char* path) {
+void* resolve_path_to_mount_point(const char* path) {
     if (!vfs_path_fits(path))
-        return 0xFFFFFFFF;
-    uint32_t current_knode = knode_get_root();
+        return NULL;
+    void* current_knode = knode_get_root();
 
     if (kmalloc_get_flags(current_knode) & KMALLOC_FLAG_MOUNT) {
         return current_knode;
@@ -221,9 +219,9 @@ uint32_t resolve_path_to_mount_point(const char* path) {
         if (strcmp(token, "..") == 0) {
             current_knode = knode_get_parent(current_knode);
         } else {
-            uint32_t next_node = knode_find_by_name(current_knode, token);
-            if (next_node == 0xFFFFFFFF || next_node == 0) {
-                return 0xFFFFFFFF;
+            void* next_node = knode_find_by_name(current_knode, token);
+            if (next_node == NULL) {
+                return NULL;
             }
             current_knode = next_node;
         }
@@ -239,9 +237,9 @@ uint32_t resolve_path_to_mount_point(const char* path) {
     return current_knode;
 }
 
-uint32_t resolve_parent_path_to_address(const char* path) {
+uint64_t resolve_parent_path_to_address(const char* path) {
     if (!vfs_path_fits(path)) {
-        return 0xFFFFFFFF;
+        return FS_NODE_NULL;
     }
 
     char parent_path[VFS_PATH_MAX];
@@ -261,14 +259,14 @@ uint32_t resolve_parent_path_to_address(const char* path) {
     return resolve_path_to_address(parent_path);
 }
 
-bool vfs_parse_path(const char* path, uint16_t flags, uint32_t* out_knode, uint32_t* out_fs_node, bool* out_in_fs, struct FSDeviceContext** out_ctx) {
+bool vfs_parse_path(const char* path, uint16_t flags, void** out_knode, uint64_t* out_fs_node, bool* out_in_fs, struct FsMount** out_mount) {
     if (!vfs_path_fits(path))
         return false;
 
-    uint32_t current_knode = knode_get_root();
-    uint32_t current_fs_node = 0;
+    void* current_knode = knode_get_root();
+    uint64_t current_fs_node = 0;
     bool in_file_system = false;
-    struct FSDeviceContext* current_ctx = NULL;
+    struct FsMount* current_mount = NULL;
 
     char path_scratch[VFS_PATH_MAX];
     strcpy(path_scratch, path);     // Fits: checked above
@@ -289,22 +287,26 @@ bool vfs_parse_path(const char* path, uint16_t flags, uint32_t* out_knode, uint3
             if (strcmp(token, "..") == 0) {
                 current_knode = knode_get_parent(current_knode);
             } else {
-                uint32_t next_node = knode_find_by_name(current_knode, token);
-                if (next_node == KNODE_NULL || next_node == 0) {
+                void* next_node = knode_find_by_name(current_knode, token);
+                if (next_node == NULL) {
                     return false;
                 }
                 current_knode = next_node;
             }
 
-            if (!vfs_enter_mount(current_knode, next == NULL, &current_fs_node, &current_ctx, &in_file_system))
+            if (!vfs_enter_mount(current_knode, next == NULL, &current_fs_node, &current_mount, &in_file_system))
                 return false;
         } else {
-            if (strcmp(token, "..") == 0) {
-                vfs_fs_parent(&current_knode, &current_fs_node, &current_ctx, &in_file_system);
-            } else {
-                uint32_t found = fs_directory_find(current_ctx, current_fs_node, token);
+            // The search check, as in resolve_path_to_address()
+            if (!vfs_fs_node_allowed(current_mount, current_fs_node))
+                return false;
 
-                if (found == 0 || found == FS_NULL) {
+            if (strcmp(token, "..") == 0) {
+                vfs_fs_parent(&current_knode, &current_fs_node, &current_mount, &in_file_system);
+            } else {
+                uint64_t found = current_mount->type->lookup(current_mount, current_fs_node, token);
+
+                if (found == 0 || found == FS_NODE_NULL) {
                     // Missing last component + VFS_OPEN_CREATE: make the file
                     if (next != NULL || !(flags & VFS_OPEN_CREATE))
                         return false;
@@ -314,18 +316,18 @@ bool vfs_parse_path(const char* path, uint16_t flags, uint32_t* out_knode, uint3
                         return false;
 
                     // Creating an entry changes the directory
-                    uint8_t dir_perm = 0;
-                    fs_file_get_permissions(current_ctx, current_fs_node, &dir_perm);
-                    if (!(dir_perm & FS_PERMISSION_WRITE))
+                    uint8_t dir_perm = vfs_node_permissions(current_mount, current_fs_node);
+                    if (!(dir_perm & VFS_PERMISSION_WRITE))
                         return false;
 
                     // ...and needs the directory's security clearance
-                    if (!vfs_fs_node_allowed(current_ctx, current_fs_node))
+                    if (!vfs_fs_node_allowed(current_mount, current_fs_node))
                         return false;
 
-                    uint8_t default_perms = FS_PERMISSION_READ | FS_PERMISSION_WRITE;
-                    uint32_t new_file_address = fs_file_create(current_ctx, token, default_perms, 0, current_fs_node);
-                    if (new_file_address == FS_NULL) {
+                    uint8_t default_perms = VFS_PERMISSION_READ | VFS_PERMISSION_WRITE;
+                    uint64_t new_file_address = current_mount->type->create(current_mount, current_fs_node, token,
+                                                                            FS_NODE_FILE, default_perms);
+                    if (new_file_address == FS_NODE_NULL) {
                         return false;
                     }
                     current_fs_node = new_file_address;
@@ -340,8 +342,6 @@ bool vfs_parse_path(const char* path, uint16_t flags, uint32_t* out_knode, uint3
     *out_knode = current_knode;
     *out_fs_node = current_fs_node;
     *out_in_fs = in_file_system;
-    if (out_ctx) *out_ctx = current_ctx;
+    if (out_mount) *out_mount = current_mount;
     return true;
 }
-
-

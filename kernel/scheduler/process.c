@@ -6,6 +6,7 @@
 #include <kernel/scheduler/scheduler.h>
 #include <kernel/resources/classes/elf.h>
 #include <kernel/mutex.h>
+#include <kernel/knode.h>
 
 #include <kernel/arch/x86/irq.h>
 #include <kernel/arch/x86/virtual/vmm.h>
@@ -78,6 +79,10 @@ typedef struct {
     struct list_node* threads_head;
     struct list_node* threads_tail;
     uint32_t thread_count;
+
+    // Kernel node of /proc/<pid> (NULL: none). Set and cleared with the VFS
+    // lock held, which also guards the knode tree.
+    void* proc_node;
 } Process;
 
 // Fills in p->image, p->entry and the byte counts, mapping the image into
@@ -250,6 +255,159 @@ static void process_log_prefix(ProcessId pid) {
     serial_puts(") ");
 }
 
+// /proc
+//
+// Every process is a kernel-node file /proc/<pid>: one ProcessRecord
+// (process.h), stored straight in a kmalloc block and linked into the
+// /proc knode the way /dev links its device blocks. Like any knode, its
+// name sits in the first 16 bytes; the VFS lists it, stats it and reads
+// it as a plain read-only file.
+//
+// The VFS cannot make such a file (vfs_open creates only on storage
+// devices, and /proc is read-only), so this talks to the knode layer
+// directly, holding the VFS lock: it guards the knode tree and the open
+// handles that may point into a record.
+//
+// Made before the main thread exists, refreshed when the state, thread
+// count, security mask or heap changes, and removed by DestroyProcess()
+// (the one place every process ends). If there is no /proc, processes
+// still run unlisted (reported once on COM1).
+
+static void* proc_dir     = NULL;   // /proc knode, found on first use
+static bool proc_warned   = false;
+
+static inline bool interrupts_enabled(void) {
+    uint32_t flags;
+    __asm__ volatile("pushfl; popl %0" : "=r"(flags));
+    return (flags & 0x200) != 0;
+}
+
+// Caller holds the VFS lock
+static void* proc_directory(void) {
+    if (proc_dir == NULL) {
+        void* dir = knode_find_by_name(knode_get_root(), "proc");
+        if (knode_check_is_valid(dir))
+            proc_dir = dir;
+    }
+    return proc_dir;
+}
+
+static void proc_node_name(ProcessId pid, char out[PROCESS_RECORD_NAME]) {
+    char digits[10];
+    uint32_t v = (uint32_t)pid;
+    int n = 0;
+    do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v != 0);
+
+    memset(out, 0, PROCESS_RECORD_NAME);
+    for (int i = 0; i < n; i++)
+        out[i] = digits[n - 1 - i];
+}
+
+// Snapshot of `p` (interrupts off, or the slot is ours)
+static void proc_fill(const Process* p, ProcessRecord* r) {
+    memset(r, 0, sizeof(*r));
+    proc_node_name(p->pid, r->node_name);
+    r->magic        = PROCESS_RECORD_MAGIC;
+    r->version      = PROCESS_RECORD_VERSION;
+    r->pid          = p->pid;
+    r->state        = (uint32_t)p->state;
+    r->priority     = (uint32_t)p->priority;
+    r->security     = p->security;
+    r->thread_count = p->thread_count;
+    r->entry        = p->entry;
+    r->code_size    = p->code_bytes;
+    r->data_size    = p->data_bytes;
+    r->bss_size     = p->bss_bytes;
+    r->heap_size    = p->heap.size;
+    memcpy(r->name, p->name, PROCESS_NAME_MAX);
+    memcpy(r->image_path, p->image_path, PROCESS_PATH_MAX);
+}
+
+// Make /proc/<pid>. The slot is CREATING (ours), interrupts are on.
+// A failure is not fatal: the process just has no entry.
+static void proc_publish(Process* p) {
+    ProcessRecord record;
+    proc_fill(p, &record);
+
+    vfs_lock();
+
+    void* dir  = proc_directory();
+    void* node = NULL;
+    if (dir != NULL)
+        node = kmalloc(sizeof(ProcessRecord));
+
+    if (node != NULL) {
+        memcpy(node, &record, sizeof(record));
+        kmalloc_set_permissions(node, KMALLOC_PERMISSION_READ);
+        if (knode_add_reference(dir, node)) {
+            uint32_t irq = irq_save();
+            p->proc_node = node;
+            irq_restore(irq);
+        } else {
+            kfree(node);
+            node = NULL;
+        }
+    }
+
+    vfs_unlock();
+
+    if (node == NULL && !proc_warned) {
+        proc_warned = true;
+        process_log_prefix(p->pid);
+        serial_puts(dir == NULL ? "not listed: no /proc\n"
+                             : "not listed: /proc entry could not be made\n");
+    }
+}
+
+// Take /proc/<pid> away. Interrupts on.
+static void proc_unpublish(ProcessId pid) {
+    vfs_lock();
+
+    void* node = NULL;
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    if (p != NULL) {
+        node = p->proc_node;
+        p->proc_node = NULL;
+    }
+    irq_restore(irq);
+
+    if (node != NULL) {
+        vfs_knode_revoke_handles(node);     // No open handle may point into it
+        knode_remove_reference(proc_dir, node);
+        kfree(node);
+    }
+
+    vfs_unlock();
+}
+
+// Rewrite /proc/<pid> from the Process. The record never changes size, so
+// this is one write in place. Skipped with interrupts off (the VFS lock
+// may sleep): the entry is then a little stale until the next refresh.
+static void proc_refresh(ProcessId pid) {
+    if (!interrupts_enabled())
+        return;
+
+    ProcessRecord record;
+    void* node = NULL;
+
+    vfs_lock();
+
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    if (p != NULL && p->proc_node != NULL) {
+        node = p->proc_node;
+        proc_fill(p, &record);
+    }
+    irq_restore(irq);
+
+    // proc_node only changes under the VFS lock, so `node` is still live
+    if (node != NULL)
+        memcpy(node, &record, sizeof(record));
+
+    vfs_unlock();
+}
+
 // Loaders
 
 // Flat image: one read/write/execute region at PROCESS_IMAGE_BASE. The
@@ -320,13 +478,70 @@ static int process_load_elf(Process* p, void* ctx) {
     return PROCESS_OK;
 }
 
+// Arguments
+//
+// Written to the top of the main thread's user stack before it exists:
+//
+//   esp ->  argc
+//           argv[0] .. argv[argc - 1]   (user addresses of the strings)
+//           NULL                        (end of argv)
+//           NULL                        (envp: empty for now)
+//           ... alignment padding ...
+//           the strings, back to back
+//           16 bytes of zeros up to PROCESS_STACK_TOP
+//
+// esp is 16-byte aligned. The stack pages are zeroed, so a program that
+// ignores the arguments reads argc as 0.
+static int process_push_args(Process* p, uint32_t argc, const char* const* argv, uint32_t* esp_out) {
+    if (argc > PROCESS_ARG_MAX)
+        return PROCESS_ERR_TOO_BIG;
+    if (argc > 0 && argv == NULL)
+        return PROCESS_ERR_INVALID_ARG;
+
+    uint32_t bytes = 0;
+    for (uint32_t i = 0; i < argc; i++) {
+        if (argv[i] == NULL)
+            return PROCESS_ERR_INVALID_ARG;
+        uint32_t n = (uint32_t)strnlen(argv[i], PROCESS_ARG_BYTES) + 1;
+        if (n > PROCESS_ARG_BYTES - bytes)
+            return PROCESS_ERR_TOO_BIG;
+        bytes += n;
+    }
+
+    uint32_t words   = argc + 3;
+    uint32_t strings = (PROCESS_INITIAL_ESP - bytes) & ~15u;
+    uint32_t esp     = (strings - words * 4u) & ~15u;
+
+    uint32_t vector[PROCESS_ARG_MAX + 3];
+    uint32_t at = strings;
+    vector[0] = argc;
+    for (uint32_t i = 0; i < argc; i++) {
+        uint32_t n = (uint32_t)strlen(argv[i]) + 1;
+        if (!vmm_user_copy_to(p->space, at, argv[i], n))
+            return PROCESS_ERR_NO_MEMORY;
+        vector[1 + i] = at;
+        at += n;
+    }
+    vector[argc + 1] = 0;
+    vector[argc + 2] = 0;
+
+    if (!vmm_user_copy_to(p->space, esp, vector, words * 4u))
+        return PROCESS_ERR_NO_MEMORY;
+    *esp_out = esp;
+    return PROCESS_OK;
+}
+
+_Static_assert(PROCESS_ARG_BYTES + (PROCESS_ARG_MAX + 3) * 4 + 64 < PROCESS_STACK_PAGES * PAGE_SIZE,
+               "arguments must leave room on the stack");
+
 // Build
 
 // Reserve a slot, create the address space, let `load` put the image in it,
-// then add the heap, the stack, the file table (working directory `cwd`)
-// and the main thread.
+// then add the heap, the stack (with argc / argv on it), the file table
+// (working directory `cwd`) and the main thread.
 static ProcessId process_build(const char* name, const char* path, const char* cwd,
                                ThreadPriority priority, ProcessSecurity security,
+                               uint32_t argc, const char* const* argv,
                                ProcessLoadFn load, void* ctx) {
     if (priority < PRIORITY_IDLE || priority > PRIORITY_REALTIME)
         return PROCESS_ERR_INVALID_ARG;
@@ -375,6 +590,12 @@ static ProcessId process_build(const char* name, const char* path, const char* c
         goto fail;
     }
 
+    // Arguments at the top of that stack; the main thread starts below them
+    uint32_t initial_esp = PROCESS_INITIAL_ESP;
+    error = process_push_args(p, argc, argv, &initial_esp);
+    if (error != PROCESS_OK)
+        goto fail;
+
     // Descriptor table and working directory. In place before the main
     // thread exists, so its very first file call already resolves relative
     // paths against `cwd`. (Interrupts on: this checks the directory
@@ -385,10 +606,13 @@ static ProcessId process_build(const char* name, const char* path, const char* c
     }
     files_ready = true;
 
+    // /proc/<pid>, before any thread of the process can run (and end it)
+    proc_publish(p);
+
     // Main thread. Interrupts stay off until the process is RUNNING, so the
     // thread cannot run (and, say, exit) before its process is complete.
     irq = irq_save();
-    ThreadBlock* thread = thread_create_user(p->entry, PROCESS_INITIAL_ESP, priority,
+    ThreadBlock* thread = thread_create_user(p->entry, initial_esp, priority,
                                              p->cr3, p->pid, p->name);
     if (thread != NULL) {
         if (list_append(&p->threads_head, &p->threads_tail, thread)) {
@@ -407,6 +631,8 @@ static ProcessId process_build(const char* name, const char* path, const char* c
         goto fail;
     }
 
+    proc_refresh(p->pid);           // Now RUNNING, with its main thread
+
     process_log_prefix(p->pid);
     serial_puts("started, entry ");
     serial_put_hex(p->entry);
@@ -420,6 +646,7 @@ fail:
     // only frees it (interrupts are on here)
     if (files_ready)
         syscall_process_exit((uint32_t)p->pid);
+    proc_unpublish(p->pid);
     process_free_address_space(p);
     irq = irq_save();
     process_release_slot(p);
@@ -444,8 +671,10 @@ ProcessId CreateProcessFromImageWithSecurity(const char* name, const ProcessImag
     if (image->entry_offset >= memory_size)
         return PROCESS_ERR_INVALID_ARG;
 
-    // No file to be next to: start at the top
-    return process_build(name, "<memory>", "/", priority, security, process_load_flat, (void*)image);
+    // No file to be next to: start at the top. argv = { name }.
+    const char* arg0 = (name && name[0]) ? name : "process";
+    return process_build(name, "<memory>", "/", priority, security, 1, &arg0,
+                         process_load_flat, (void*)image);
 }
 
 ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriority priority) {
@@ -454,6 +683,31 @@ ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriorit
 
 ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, ThreadPriority priority,
                                     ProcessSecurity security) {
+    ProcessLaunch launch = { image_path, cwd, priority, security, 0, NULL };
+    return CreateProcessLaunch(&launch);
+}
+
+ProcessId CreateProcessLaunch(const ProcessLaunch* launch) {
+    if (launch == NULL)
+        return PROCESS_ERR_INVALID_ARG;
+
+    const char*     image_path = launch->image_path;
+    const char*     cwd        = launch->cwd;
+    ThreadPriority  priority   = launch->priority;
+    ProcessSecurity security   = launch->security;
+
+    // No arguments given: argv = { image_path }, as for every kernel launch
+    uint32_t argc = launch->argc;
+    const char* const* argv = launch->argv;
+    if (argc == 0) {
+        argc = 1;
+        argv = &image_path;
+    }
+    if (argc > PROCESS_ARG_MAX)
+        return PROCESS_ERR_TOO_BIG;
+    if (argv == NULL)
+        return PROCESS_ERR_INVALID_ARG;
+
     if (image_path == NULL || image_path[0] != '/')
         return PROCESS_ERR_INVALID_ARG;
     if (strnlen(image_path, PROCESS_PATH_MAX) >= PROCESS_PATH_MAX)
@@ -491,7 +745,8 @@ ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, Thr
     const char* name = strrchr(image_path, '/');
     name = (name != NULL) ? name + 1 : image_path;
 
-    ProcessId pid = process_build(name, image_path, cwd, priority, security, process_load_elf, &source);
+    ProcessId pid = process_build(name, image_path, cwd, priority, security, argc, argv,
+                                  process_load_elf, &source);
 
     vfs_close(file);
     return pid;
@@ -520,6 +775,9 @@ int DestroyProcess(ProcessId pid) {
     // of the process finishes a file call already in progress (bounded by
     // SYS_FILES_EXIT_WAIT_MS). Every way a process ends comes through here.
     syscall_process_exit((uint32_t)pid);
+
+    // Its /proc entry goes next, also with interrupts on (VFS lock)
+    proc_unpublish(pid);
 
     irq = irq_save();
 
@@ -622,6 +880,8 @@ int ProcessSetSecurity(ProcessId pid, ProcessSecurity security, ProcessSecurity*
         serial_puts(" by pid ");
         serial_put_dec((uint32_t)process_current_id());
         serial_puts("\n");
+
+        proc_refresh(pid);
     }
     return PROCESS_OK;
 }
@@ -644,6 +904,7 @@ const char* process_error_string(int code) {
         case PROCESS_ERR_NOT_EXECUTABLE: return "The file is not marked executable";
         case PROCESS_ERR_BAD_IMAGE:      return "Not a valid ELF executable";
         case PROCESS_ERR_UNSUPPORTED:    return "Unsupported executable";
+        case PROCESS_ERR_TOO_BIG:        return "Argument list too long";
         default:                         return "Unknown error";
     }
 }
@@ -745,6 +1006,8 @@ int process_sbrk(int32_t increment, uint32_t* previous) {
     }
 
     *previous = old_break;
+    if (increment != 0)
+        proc_refresh(pid);
     return PROCESS_OK;
 }
 
@@ -820,5 +1083,3 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
     // Not in the process table (should not happen): end just this thread
     kthread_exit();
 }
-
-

@@ -50,7 +50,8 @@ void wd_init(void);
 bool wd_watch(ThreadBlock* thread, const char* name, uint32_t report_ms, uint32_t panic_ms);
 void wd_unwatch(ThreadBlock* thread);
 
-// Called by a watched thread once per loop iteration / unit of work
+// Called by a watched thread once per loop iteration / unit of work 
+// to pet the watch dog so it doesn`t attack and reset the system (good boy!)
 void wd_pet(void);
 
 // Old name, kept for existing callers
@@ -91,4 +92,3 @@ void wd_note_deadlock(const mutex_t* wanted, uint32_t caller);
 bool wd_nmi_init(void);
 
 #endif
-
