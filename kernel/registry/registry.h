@@ -65,12 +65,22 @@ bool registry_hive_export(struct RegistryHive* hive, const char* path);
 // (or the registry was never initiated).
 bool registry_hive_save_all(void);
 
+// The file `hive` was loaded from by registry_hive_initiate(), "" before
+// then. Lets a caller tell whether a hive file on disk is the live one.
+const char* registry_hive_path(const struct RegistryHive* hive);
+
 //
 // Convenience helpers (registry_util.c)
 //
-// The registry has no lock of its own. Today only the boot thread (load)
-// touches it; anything else that starts using it needs a lock first.
+// Locking: the boot thread loads the registry before anything else runs.
+// After that, everything that reads or changes a hive (the registry
+// syscalls, "boot repair" on the live system disk) holds registry_lock()
+// around it. Lock order: registry lock -> VFS lock (registry_hive_export
+// writes files), never the reverse.
 //
+
+void registry_lock(void);
+void registry_unlock(void);
 
 // Walk a '/'-separated path below `root` ("software/shell/menus"). Every
 // segment must be shorter than REGISTRY_MAX_NAME_LEN. With `create`, missing
@@ -91,6 +101,9 @@ bool registry_set_string(struct RegistryKey* parent, const char* name, uint16_t 
 // Read a value as a string into `out` (always terminated, cut to fit).
 // Returns false, with out = "", when the value does not exist.
 bool registry_get_string(struct RegistryKey* parent, const char* name, char* out, size_t size);
+
+// Free every subkey and value below `key`, leaving the key itself (empty)
+void registry_clear_key(struct RegistryKey* key);
 
 #endif
 

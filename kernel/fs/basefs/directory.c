@@ -826,3 +826,204 @@ bool fs_directory_delete_recursive(struct FSDeviceContext* ctx, uint64_t address
     return false;
 }
 
+
+// ---------------------------------------------------------------------------
+// Consistency check
+// ---------------------------------------------------------------------------
+
+// Rewrite the length of the record at `at`
+static void dir_record_set_length(struct FSDeviceContext* ctx, uint64_t at, uint32_t rec_len) {
+    struct FSDirEntry entry;
+    fs_mem_read(ctx, at, &entry, sizeof(struct FSDirEntry));
+    entry.rec_len = (uint16_t)rec_len;
+    fs_mem_write(ctx, at, &entry, sizeof(struct FSDirEntry));
+}
+
+// True if records starting at `at` follow each other cleanly up to exactly
+// `stretch_end`
+static bool dir_check_tiles(struct FSDeviceContext* ctx, uint64_t at, uint64_t stretch_end,
+                            uint64_t area_end, uint32_t unit) {
+    while (at < stretch_end) {
+        struct FSDirEntry entry;
+        if (!dir_record_read(ctx, at, area_end, unit, &entry))
+            return false;
+        at += entry.rec_len;
+    }
+    return at == stretch_end;
+}
+
+// Where the records pick up again after a damaged one at `bad`: the first
+// aligned place from `from` on whose records tile the rest of the stretch,
+// or `stretch_end` when none does
+static uint64_t dir_check_resync(struct FSDeviceContext* ctx, uint64_t bad, uint64_t from,
+                                 uint64_t stretch_end, uint64_t area_end, uint32_t unit) {
+    for (uint64_t at = from; at < stretch_end; at += FS_DIR_ENTRY_ALIGN) {
+        if (at > bad && dir_check_tiles(ctx, at, stretch_end, area_end, unit))
+            return at;
+    }
+    return stretch_end;
+}
+
+// Check the records of one area, stepping over damaged ones. Returns the
+// live entries left in it.
+//
+// Records never cross a device sector, so damage stays inside its stretch.
+// After a damaged record the stretch is searched for the place where
+// sound records start again, and only the bytes in between are lost:
+// repairing gives them to the record before (or makes them one free record
+// when the damage starts the stretch). Entries the callback refuses are
+// removed the way dir_remove does it, without the count and extent
+// bookkeeping (the caller recounts).
+static uint32_t dir_check_area(struct FSDeviceContext* ctx, uint64_t directory, const DirArea* area,
+                               uint32_t unit, bool repair, fs_check_entry_fn entry_fn, void* user,
+                               FSDirCheck* out) {
+    uint32_t live = 0;
+    uint64_t at   = area->start;
+    uint64_t prev = FS_NULL;    // Previous record in the same stretch
+
+    while (at < area->end) {
+        if (at == area->start || (at % unit) == 0)
+            prev = FS_NULL;
+        uint64_t stretch_end = (at / unit + 1U) * unit;
+        if (stretch_end > area->end)
+            stretch_end = area->end;
+
+        struct FSDirEntry entry;
+        if (!dir_record_read(ctx, at, area->end, unit, &entry)) {
+            out->bad_records++;
+            // A free record needs room for itself in front of the sound ones
+            uint64_t from = (prev != FS_NULL) ? at + FS_DIR_ENTRY_ALIGN : at + sizeof(struct FSDirEntry);
+            uint64_t resume = dir_check_resync(ctx, at, from, stretch_end, area->end, unit);
+            if (repair) {
+                if (prev != FS_NULL)
+                    dir_record_set_length(ctx, prev, (uint32_t)(resume - prev));
+                else if (resume == stretch_end)
+                    dir_area_init(ctx, at, stretch_end);
+                else
+                    dir_record_write(ctx, at, FS_NULL, (uint32_t)(resume - at), "", 0, FS_ENTRY_TYPE_NONE);
+            }
+            if (resume == stretch_end) {
+                at = stretch_end;
+                continue;
+            }
+            // Sound records follow. Repairing, the record in front of them
+            // (`prev`, or the new free one) now reaches them; otherwise
+            // nothing does.
+            if (!repair)
+                prev = FS_NULL;
+            else if (prev == FS_NULL)
+                prev = at;
+            at = resume;
+            continue;
+        }
+
+        if (entry.address != FS_NULL) {
+            bool keep = (entry_fn == NULL) || entry_fn(user, directory, at, &entry);
+            if (!keep && repair) {
+                if (prev != FS_NULL) {
+                    // Merge into the record before it, which stays `prev`
+                    struct FSDirEntry before;
+                    fs_mem_read(ctx, prev, &before, sizeof(struct FSDirEntry));
+                    dir_record_set_length(ctx, prev, before.rec_len + entry.rec_len);
+                    at += entry.rec_len;
+                    continue;
+                }
+                struct FSDirEntry freed = entry;
+                freed.address  = FS_NULL;
+                freed.name_len = 0;
+                freed.type     = FS_ENTRY_TYPE_NONE;
+                fs_mem_write(ctx, at, &freed, sizeof(struct FSDirEntry));
+            } else {
+                live++;
+            }
+        }
+
+        prev = at;
+        at  += entry.rec_len;
+    }
+    return live;
+}
+
+bool fs_directory_check(struct FSDeviceContext* ctx, uint64_t directory, bool repair,
+                        fs_check_extent_fn extent_fn, fs_check_entry_fn entry_fn, void* user,
+                        FSDirCheck* out) {
+    memset(out, 0, sizeof(FSDirCheck));
+
+    struct FSDirectoryHeader header;
+    DirArea area;
+    if (!ctx || !dir_header_read(ctx, directory, &header) || !dir_area_load(ctx, directory, true, &area))
+        return false;
+
+    uint32_t unit  = dir_unit(ctx);
+    uint64_t guard = dir_walk_limit(ctx);
+    uint64_t previous = FS_NULL;            // Area before this one (FS_NULL: none)
+    uint32_t total = 0;
+    bool     header_dirty = false;
+
+    for (;;) {
+        uint32_t live = dir_check_area(ctx, directory, &area, unit, repair, entry_fn, user, out);
+        total += live;
+
+        if (area.is_header) {
+            if (header.inline_entries != live) {
+                out->bad_counts = true;
+                header.inline_entries = live;
+                header_dirty = true;
+            }
+        } else {
+            struct FSDirectoryExtent extent;
+            dir_extent_read(ctx, area.owner, &extent);
+            bool dirty = false;
+            if (extent.entry_count != live) {
+                out->bad_counts = true;
+                extent.entry_count = live;
+                dirty = true;
+            }
+            if (extent.extent.prev != previous) {
+                out->bad_links = true;
+                extent.extent.prev = previous;
+                dirty = true;
+            }
+            if (dirty && repair)
+                dir_extent_write(ctx, area.owner, &extent);
+        }
+
+        if (area.next == FS_NULL)
+            break;
+
+        DirArea next;
+        if (guard-- == 0 || !dir_area_load(ctx, area.next, false, &next) ||
+            (extent_fn != NULL && !extent_fn(user, area.next))) {
+            // Cut the chain here; whatever hung off it is lost
+            out->bad_chain = true;
+            if (area.is_header) {
+                header.extent.next = FS_NULL;
+                header_dirty = true;
+            } else if (repair) {
+                struct FSDirectoryExtent extent;
+                dir_extent_read(ctx, area.owner, &extent);
+                extent.extent.next = FS_NULL;
+                dir_extent_write(ctx, area.owner, &extent);
+            }
+            break;
+        }
+        previous = area.owner;
+        area = next;
+    }
+
+    // The tail hint names the last extent, FS_NULL when there is none
+    uint64_t tail = area.is_header ? FS_NULL : area.owner;
+    if (header.extent.prev != tail) {
+        out->bad_links = true;
+        header.extent.prev = tail;
+        header_dirty = true;
+    }
+    if (header.entry_count != total) {
+        out->bad_counts = true;
+        header.entry_count = total;
+        header_dirty = true;
+    }
+    if (header_dirty && repair)
+        dir_header_write(ctx, directory, &header);
+    return true;
+}

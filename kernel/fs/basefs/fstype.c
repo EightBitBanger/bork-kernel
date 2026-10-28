@@ -11,6 +11,7 @@
 
 #include <kernel/fs/fs.h>
 #include <kernel/fs/fs_type.h>
+#include <kernel/fs/basefs/check.h>
 #include <kernel/block/block.h>
 #include <kernel/block/partition.h>
 
@@ -103,6 +104,8 @@ static void basefs_detach(struct FsMount* m) {
     ctx->sector_dirty = false;
     ctx->frame_offset = FS_INVALID_FRAME;
     ctx->frame_dirty  = false;
+    ctx->used_scan    = 0;
+    ctx->used_blocks  = 0;
     m->device  = NULL;
     m->is_open = false;
 }
@@ -130,8 +133,8 @@ static bool basefs_volume_info(struct FsMount* m, FsVolumeInfo* out) {
     return true;
 }
 
-static uint64_t basefs_used_bytes(struct FsMount* m) {
-    return fs_get_used_bytes(basefs_ctx(m));
+static bool basefs_used_bytes(struct FsMount* m, uint64_t* out, uint32_t* percent) {
+    return fs_used_bytes_step(basefs_ctx(m), out, percent);
 }
 
 static uint64_t basefs_max_capacity(struct BlockDevice* device) {
@@ -148,6 +151,10 @@ static bool basefs_format(struct FsMount* m, struct BlockDevice* device, uint64_
     if (bm == NULL || !basefs_window_for(bm, device))
         return false;
     return fs_device_format(device, bm->ctx.device_address, capacity, block_size);
+}
+
+static VfsCheckResult basefs_check(struct FsMount* m, bool repair, VfsCheckReport* report) {
+    return fs_device_check(basefs_ctx(m), repair, report);
 }
 
 //
@@ -308,7 +315,7 @@ static uint64_t basefs_tell(void* file) {
 
 const struct FsType fs_type_basefs = {
     .name            = "basefs",
-    .mbr_type        = MBR_TYPE_BASEFS,
+    .mbr_types       = { MBR_TYPE_BASEFS },
     .probe           = basefs_probe,
 
     .attach          = basefs_attach,
@@ -320,6 +327,7 @@ const struct FsType fs_type_basefs = {
     .max_capacity    = basefs_max_capacity,
     .format_check    = basefs_format_check,
     .format          = basefs_format,
+    .check           = basefs_check,
 
     .root            = basefs_root,
     .node_type       = basefs_node_type,

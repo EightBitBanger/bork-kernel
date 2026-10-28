@@ -12,6 +12,7 @@
 #include <kernel/boot/x86/interrupt.h>
 #include <kernel/console/mouse.h>
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/scheduler/process.h>
 #include <kernel/mutex.h>
 #include <kernel/util/string.h>
 #include <kernel/util/timer.h>
@@ -161,6 +162,10 @@ void ipc_plat_wake_all(void) {
     for (IpcKSleeper* s = ipc_sleepers; s != NULL; s = s->next)
         event_signal(&s->ev);
     irq_restore(flags);
+}
+
+bool ipc_plat_cancelled(void) {
+    return process_current_kill_pending();
 }
 
 //

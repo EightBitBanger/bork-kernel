@@ -1,6 +1,18 @@
 #include <kernel/malloc.h>
 #include <kernel/registry/registry.h>
+#include <kernel/mutex.h>
 #include <kernel/util/string.h>
+
+// Zeroed is unlocked (mutex_init only clears it), so no init call is needed
+static mutex_t registry_mutex;
+
+void registry_lock(void) {
+    mutex_lock(&registry_mutex);
+}
+
+void registry_unlock(void) {
+    mutex_unlock(&registry_mutex);
+}
 
 struct RegistryKey* registry_open_key(struct RegistryKey* root, const char* path,
                                       bool create, uint16_t permissions) {
@@ -79,4 +91,25 @@ bool registry_get_string(struct RegistryKey* parent, const char* name, char* out
     if (n > 0 && value->data != NULL) memcpy(out, value->data, n);
     out[n] = '\0';
     return true;
+}
+
+void registry_clear_key(struct RegistryKey* key) {
+    if (key == NULL) return;
+    
+    struct RegistryKey* child = key->child_keys;
+    while (child != NULL) {
+        struct RegistryKey* next = child->next;
+        registry_free_key(child);
+        child = next;
+    }
+    key->child_keys = NULL;
+    
+    struct RegistryValue* value = key->values;
+    while (value != NULL) {
+        struct RegistryValue* next = value->next;
+        if (value->data != NULL) free(value->data);
+        free(value);
+        value = next;
+    }
+    key->values = NULL;
 }

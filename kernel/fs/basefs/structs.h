@@ -34,6 +34,14 @@ struct FSDeviceContext {
     bool sector_dirty;
     
     uint64_t alloc_hint;            // Next-fit start block for fs_alloc (in memory only)
+    
+    // Used-block count (in memory only, see fs_used_bytes_step): the set
+    // bitmap bits below used_scan. The count is built a chunk at a time;
+    // fs_bitmap_set / _clear keep it current for bits already counted, so
+    // once used_scan reaches block_count it is the exact number of blocks
+    // in use and never needs the disk again.
+    uint64_t used_scan;
+    uint64_t used_blocks;
 };
 
 // ---------------------------------------------------------------------------

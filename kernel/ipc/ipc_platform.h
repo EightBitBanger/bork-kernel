@@ -60,6 +60,10 @@ void ipc_plat_sleep(IpcSleeper* s, uint32_t timeout_ms);   // SYS_IPC_WAIT_FOREV
 void ipc_plat_sleep_end(IpcSleeper* s);
 void ipc_plat_wake_all(void);
 
+// True when the calling process is being killed: a wait gives up at once
+// (the kernel ends the process as the call returns)
+bool ipc_plat_cancelled(void);
+
 //
 // Input devices
 //

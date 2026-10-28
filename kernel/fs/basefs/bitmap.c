@@ -19,6 +19,8 @@ void fs_bitmap_set(struct FSDeviceContext* ctx, uint64_t index) {
     if (!(ctx->frame_bitmap[local_byte] & mask)) {
         ctx->frame_bitmap[local_byte] |= mask;
         ctx->frame_dirty = true;
+        if (index < ctx->used_scan)
+            ctx->used_blocks++;
     }
 }
 
@@ -30,6 +32,8 @@ void fs_bitmap_clear(struct FSDeviceContext* ctx, uint64_t index) {
     if (ctx->frame_bitmap[local_byte] & mask) {
         ctx->frame_bitmap[local_byte] &= ~mask;
         ctx->frame_dirty = true;
+        if (index < ctx->used_scan && ctx->used_blocks > 0)
+            ctx->used_blocks--;
     }
 }
 

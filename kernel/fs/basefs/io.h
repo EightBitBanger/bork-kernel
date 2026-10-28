@@ -18,8 +18,10 @@ void fs_writeb(struct FSDeviceContext* ctx, uint64_t address, uint8_t byte);
 void fs_mem_read(struct FSDeviceContext* ctx, uint64_t address, void* destination, uint32_t size);
 void fs_mem_write(struct FSDeviceContext* ctx, uint64_t address, const void* source, uint32_t size);
 
-// Write "size" zero bytes starting at "address"
+// Write "size" zero bytes (or copies of "byte") starting at "address".
+// Whole sectors are written straight to the disk, many per command.
 void fs_mem_zero(struct FSDeviceContext* ctx, uint64_t address, uint64_t size);
+void fs_mem_fill(struct FSDeviceContext* ctx, uint64_t address, uint8_t byte, uint64_t size);
 
 void fs_cache_sync(struct FSDeviceContext* ctx);
 

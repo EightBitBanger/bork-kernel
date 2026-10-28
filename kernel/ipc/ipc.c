@@ -30,6 +30,7 @@
 #include <kernel/syscall/syscall.h>
 #include <kernel/malloc.h>
 #include <kernel/util/string.h>
+#include <kernel/util/nospec.h>
 #include <kernel/ipc/ipc.h>
 #include <kernel/ipc/ipc_platform.h>
 
@@ -37,7 +38,7 @@
 #define IPC_HANDLE_INITIAL 32u          // First handle table size; doubles up to SYS_IPC_HANDLE_MAX
 
 _Static_assert(sizeof(SysIpcMsgInfo) == 16 && sizeof(SysIpcWaitItem) == 8 &&
-               sizeof(SysIpcInfo) == 32 && sizeof(SysInputEvent) == 16,
+               sizeof(SysIpcInfo) == 32 && sizeof(SysInputEvent) == 16 && sizeof(SysWinSize) == 8,
                "IPC structures are part of the user ABI");
 
 //
@@ -64,6 +65,7 @@ typedef struct {
     uint32_t count;
     uint32_t bytes;
     uint32_t ends;                  // Messages carrying a pipe end
+    uint32_t head_used;             // Bytes of the head message read already (terminal input)
 } IpcQueue;
 
 struct IpcPipe;
@@ -79,6 +81,7 @@ typedef struct IpcPipe {
     IpcEnd   end[2];
     IpcQueue queue[2];              // queue[i]: messages waiting for end i
     bool     closed[2];             // end i has no references left
+    uint16_t columns, rows;         // Terminal size (SYS_TTY_RESIZE)
 } IpcPipe;
 
 typedef struct IpcPort {
@@ -116,6 +119,7 @@ typedef struct IpcProc {
     bool      dying;
     IpcHandle* handles;             // handle_cap entries, grown as needed
     uint32_t  handle_cap;
+    IpcEnd*   tty;                  // Terminal behind descriptors 0-2 (holds a reference), or NULL
     struct IpcProc* next;
 } IpcProc;
 
@@ -177,6 +181,7 @@ static IpcMsg* ipc_queue_pop(IpcQueue* q) {
     q->head = m->next;
     if (q->head == NULL)
         q->tail = NULL;
+    q->head_used = 0;
     q->count--;
     q->bytes -= m->length;
     if (m->attach != NULL && m->attach->type == SYS_IPC_TYPE_PIPE)
@@ -252,6 +257,8 @@ static IpcPipe* ipc_pipe_new(void) {
     if (pipe == NULL)
         return NULL;
     memset(pipe, 0, sizeof(IpcPipe));
+    pipe->columns = SYS_TTY_DEFAULT_COLUMNS;
+    pipe->rows    = SYS_TTY_DEFAULT_ROWS;
     for (uint32_t i = 0; i < 2; i++) {
         pipe->end[i].obj.type = SYS_IPC_TYPE_PIPE;
         pipe->end[i].obj.refs = 1;
@@ -268,7 +275,7 @@ static IpcPipe* ipc_pipe_new(void) {
 static IpcHandle* ipc_handle_get(IpcProc* t, uint32_t handle) {
     if (handle == 0 || handle > t->handle_cap)
         return NULL;
-    IpcHandle* h = &t->handles[handle - 1];
+    IpcHandle* h = &t->handles[array_index_nospec(handle - 1, t->handle_cap)];   // Spectre v1
     return (h->obj != NULL) ? h : NULL;
 }
 
@@ -326,6 +333,11 @@ static void ipc_close_all(IpcProc* t, bool unmap) {
     for (uint32_t i = 0; i < t->handle_cap; i++) {
         if (t->handles[i].obj != NULL)
             ipc_handle_close(t, &t->handles[i], unmap);
+    }
+    if (t->tty != NULL) {
+        IpcEnd* tty = t->tty;
+        t->tty = NULL;
+        ipc_unref(&tty->obj);
     }
 }
 
@@ -594,9 +606,12 @@ int32_t ipc_sys_recv(const IpcCaller* c, uint32_t pipe_handle, uint32_t user_buf
     if (m == NULL)
         IPC_LEAVE(pipe->closed[end->side ^ 1] ? SYS_EPIPE : SYS_EAGAIN);
 
-    SysIpcMsgInfo info = { m->length, 0, m->sender, 0 };
+    // A terminal's reads may have taken the front of it (the child's end
+    // passed on by its host): the rest is the message
+    uint32_t length = m->length - q->head_used;
+    SysIpcMsgInfo info = { length, 0, m->sender, 0 };
 
-    if (size < m->length) {
+    if (size < length) {
         if (user_info != 0 && !ipc_plat_user_write(c->space, user_info, &info, sizeof(info)))
             IPC_LEAVE(SYS_EFAULT);
         IPC_LEAVE(SYS_ERANGE);
@@ -613,7 +628,7 @@ int32_t ipc_sys_recv(const IpcCaller* c, uint32_t pipe_handle, uint32_t user_buf
     // Both copies before anything changes: a fault leaves the message queued
     if (user_info != 0 && !ipc_plat_user_write(c->space, user_info, &info, sizeof(info)))
         IPC_LEAVE(SYS_EFAULT);
-    if (!ipc_plat_user_write(c->space, user_buf, m->data, m->length))
+    if (!ipc_plat_user_write(c->space, user_buf, m->data + q->head_used, length))
         IPC_LEAVE(SYS_EFAULT);
 
     ipc_queue_pop(q);
@@ -621,11 +636,10 @@ int32_t ipc_sys_recv(const IpcCaller* c, uint32_t pipe_handle, uint32_t user_buf
         ipc_handle_install(t, slot, m->attach);     // The message's reference moves over
         m->attach = NULL;
     }
-    int32_t length = (int32_t)m->length;
     ipc_msg_free(m);
 
     ipc_plat_wake_all();    // The sender has room again
-    IPC_LEAVE(length);
+    IPC_LEAVE((int32_t)length);
 }
 
 //
@@ -700,8 +714,8 @@ int32_t ipc_sys_wait(const IpcCaller* c, uint32_t user_items, uint32_t count, ui
     uint32_t start  = ipc_plat_time_ms();
     int32_t  result = 0;
     while (1) {
-        // Lock held here
-        if (t->dying) {
+        // Lock held here. A kill of this process cuts the wait short too.
+        if (t->dying || ipc_plat_cancelled()) {
             result = SYS_EPIPE;
             break;
         }
@@ -851,7 +865,7 @@ int32_t ipc_sys_info(const IpcCaller* c, uint32_t handle, uint32_t user_info) {
             IpcPipe* pipe = end->pipe;
             if (pipe->closed[end->side ^ 1])
                 info.flags |= SYS_IPC_INFO_PEER_CLOSED;
-            info.size    = pipe->queue[end->side].bytes;
+            info.size    = pipe->queue[end->side].bytes - pipe->queue[end->side].head_used;
             info.pending = pipe->queue[end->side].count;
             break;
         }
@@ -946,6 +960,225 @@ bool ipc_input_grabbed(void) {
 void ipc_input_irq(void) {
     if (ipc_grab)
         ipc_plat_wake_all();
+}
+
+//
+// Terminals
+//
+
+int32_t ipc_sys_tty_resize(const IpcCaller* c, uint32_t handle, uint32_t columns, uint32_t rows) {
+    if (columns == 0 || columns > 0xFFFF || rows == 0 || rows > 0xFFFF)
+        return SYS_EINVAL;
+
+    IPC_ENTER(c, t);
+    IpcHandle* h = ipc_handle_typed(t, handle, SYS_IPC_TYPE_PIPE);
+    if (h == NULL)
+        IPC_LEAVE(SYS_EBADF);
+    IpcPipe* pipe = ((IpcEnd*)h->obj)->pipe;
+    pipe->columns = (uint16_t)columns;
+    pipe->rows    = (uint16_t)rows;
+    IPC_LEAVE(SYS_OK);
+}
+
+int32_t ipc_tty_take(const IpcCaller* c, uint32_t handle, void** out) {
+    IPC_ENTER(c, t);
+    IpcHandle* h = ipc_handle_typed(t, handle, SYS_IPC_TYPE_PIPE);
+    if (h == NULL)
+        IPC_LEAVE(SYS_EBADF);
+    ipc_ref(h->obj);
+    *out = h->obj;
+    IPC_LEAVE(SYS_OK);
+}
+
+void ipc_tty_drop(void* tty) {
+    if (tty == NULL)
+        return;
+    ipc_plat_lock();
+    ipc_unref((IpcObject*)tty);
+    ipc_plat_unlock();
+}
+
+bool ipc_process_start(uint32_t pid, void* space, void* tty) {
+    if (tty == NULL)
+        return true;    // No table until the process's first IPC call
+
+    IpcCaller c = { pid, space, 0 };
+    ipc_plat_lock();
+    IpcProc* t = ipc_proc(&c);
+    if (t != NULL) {
+        ipc_ref((IpcObject*)tty);
+        t->tty = (IpcEnd*)tty;
+    }
+    ipc_plat_unlock();
+    return t != NULL;
+}
+
+// The caller's table when it has a terminal, else NULL. Never creates one.
+// Lock held.
+static IpcProc* ipc_proc_tty(const IpcCaller* c) {
+    for (IpcProc* t = ipc_procs; t != NULL; t = t->next) {
+        if (t->pid == c->pid)
+            return (t->space == c->space && t->tty != NULL) ? t : NULL;
+    }
+    return NULL;
+}
+
+int32_t ipc_stdio_read(const IpcCaller* c, uint32_t user_buf, uint32_t size) {
+    IpcSleeper sleeper;
+    ipc_plat_sleep_begin(&sleeper);
+
+    ipc_plat_lock();
+    IpcProc* t = ipc_proc_tty(c);
+    if (t == NULL || size == 0) {
+        ipc_plat_unlock();
+        ipc_plat_sleep_end(&sleeper);
+        return (t == NULL) ? SYS_EBADF : 0;
+    }
+    t->users++;
+
+    int32_t result;
+    while (1) {
+        // Lock held here. Teardown keeps t->tty until users is back to 0.
+        if (t->dying || ipc_plat_cancelled()) {
+            result = SYS_EPIPE;
+            break;
+        }
+
+        IpcEnd*   end  = t->tty;
+        IpcPipe*  pipe = end->pipe;
+        IpcQueue* q    = &pipe->queue[end->side];
+        IpcMsg*   m    = q->head;
+        if (m != NULL) {
+            // As much of the next message as fits; the rest stays queued
+            uint32_t n = m->length - q->head_used;
+            if (n > size)
+                n = size;
+            if (!ipc_plat_user_write(c->space, user_buf, m->data + q->head_used, n)) {
+                result = SYS_EFAULT;
+                break;
+            }
+            q->head_used += n;
+            if (q->head_used == m->length) {
+                ipc_queue_pop(q);
+                ipc_msg_free(m);    // Drops any handle that came with it: nobody here takes it
+                ipc_plat_wake_all();
+            }
+            result = (int32_t)n;
+            break;
+        }
+        if (pipe->closed[end->side ^ 1]) {
+            result = 0;     // End of file
+            break;
+        }
+
+        ipc_plat_unlock();
+        ipc_plat_sleep(&sleeper, SYS_IPC_WAIT_FOREVER);
+        ipc_plat_lock();
+    }
+
+    t->users--;
+    ipc_plat_unlock();
+    ipc_plat_sleep_end(&sleeper);
+    return result;
+}
+
+int32_t ipc_stdio_write(const IpcCaller* c, uint32_t user_buf, uint32_t length) {
+    ipc_plat_lock();
+    IpcProc* t = ipc_proc_tty(c);
+    if (t == NULL) {
+        ipc_plat_unlock();
+        return SYS_ENOTTY;
+    }
+    t->users++;     // Keeps the table (and its terminal) while unlocked
+    ipc_plat_unlock();
+
+    IpcSleeper sleeper;
+    ipc_plat_sleep_begin(&sleeper);
+
+    uint32_t done   = 0;
+    int32_t  result = SYS_OK;
+    while (done < length && result == SYS_OK) {
+        uint32_t n = length - done;
+        if (n > SYS_IPC_MSG_MAX)
+            n = SYS_IPC_MSG_MAX;
+
+        // Copy in before taking the lock
+        IpcMsg* m = (IpcMsg*)malloc(sizeof(IpcMsg) + n);
+        if (m == NULL) {
+            result = SYS_ENOMEM;
+            break;
+        }
+        if (!ipc_plat_user_read(c->space, m->data, user_buf + done, n)) {
+            free(m);
+            result = SYS_EFAULT;
+            break;
+        }
+        m->next   = NULL;
+        m->length = n;
+        m->sender = c->pid;
+        m->attach = NULL;
+
+        ipc_plat_lock();
+        while (1) {
+            IpcEnd*  end  = t->tty;
+            IpcPipe* pipe = end->pipe;
+            uint32_t peer = end->side ^ 1;
+
+            if (t->dying || ipc_plat_cancelled() || pipe->closed[peer]) {
+                result = SYS_EPIPE;
+                break;
+            }
+            if (pipe->queue[peer].count < SYS_IPC_QUEUE_MAX && ipc_queued + n <= SYS_IPC_GLOBAL_BYTES) {
+                ipc_queue_push(&pipe->queue[peer], m);
+                m = NULL;
+                ipc_plat_wake_all();
+                done += n;
+                break;
+            }
+
+            // The host's queue is full: wait for it to read
+            ipc_plat_unlock();
+            ipc_plat_sleep(&sleeper, SYS_IPC_WAIT_FOREVER);
+            ipc_plat_lock();
+        }
+        ipc_plat_unlock();
+        if (m != NULL)
+            free(m);
+    }
+
+    ipc_plat_lock();
+    t->users--;
+    ipc_plat_unlock();
+    ipc_plat_sleep_end(&sleeper);
+
+    // What went out counts, like a short write
+    return (done > 0) ? (int32_t)done : result;
+}
+
+int32_t ipc_stdio_ioctl(const IpcCaller* c, uint32_t request, uint32_t user_arg) {
+    ipc_plat_lock();
+    IpcProc* t = ipc_proc_tty(c);
+    if (t == NULL)
+        IPC_LEAVE(SYS_ENOTTY);
+
+    IpcEnd*  end  = t->tty;
+    IpcPipe* pipe = end->pipe;
+    switch (request) {
+        case SYS_TIOCGWINSZ: {
+            SysWinSize size = { pipe->rows, pipe->columns, 0, 0 };
+            if (!ipc_plat_user_write(c->space, user_arg, &size, sizeof(size)))
+                IPC_LEAVE(SYS_EFAULT);
+            IPC_LEAVE(SYS_OK);
+        }
+        case SYS_FIONREAD: {
+            IpcQueue* q = &pipe->queue[end->side];
+            int32_t ready = (int32_t)(q->bytes - q->head_used);
+            if (!ipc_plat_user_write(c->space, user_arg, &ready, sizeof(ready)))
+                IPC_LEAVE(SYS_EFAULT);
+            IPC_LEAVE(SYS_OK);
+        }
+    }
+    IPC_LEAVE(SYS_ENOTTY);
 }
 
 //

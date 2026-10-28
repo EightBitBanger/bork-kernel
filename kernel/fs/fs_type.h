@@ -58,9 +58,15 @@ typedef struct {
     uint64_t total_size;            // Bytes the volume covers
 } FsVolumeInfo;
 
+#define FS_MBR_TYPES_MAX        8
+
 struct FsType {
     const char* name;               // "basefs"; shown by device info
-    uint8_t     mbr_type;           // MBR partition type it lives in, 0 if none
+    const char* alias;              // Another name format accepts, NULL if none
+
+    // MBR partition types it lives in, 0-terminated (all 0: none). The
+    // first is the one new partitions and whole-disk tables get.
+    uint8_t     mbr_types[FS_MBR_TYPES_MAX];
 
     // True if a device's first sector (sector_size bytes) starts a volume of
     // this type. Decides which type a device is mounted with.
@@ -87,15 +93,30 @@ struct FsType {
     bool (*sync)(struct FsMount* m);
 
     bool     (*volume_info)(struct FsMount* m, FsVolumeInfo* out);
-    uint64_t (*used_bytes)(struct FsMount* m);
+
+    // Bytes in use. May take one bounded step of work and return false
+    // (not known yet: call again, the work carries on where it stopped), so
+    // the caller can let go of the VFS lock between steps; true with *out
+    // when known. 0 for a volume that isn't open. `percent` (may be NULL):
+    // how far the work has got.
+    bool     (*used_bytes)(struct FsMount* m, uint64_t* out, uint32_t* percent);
 
     // Formatting. max_capacity: the most a volume of this type can cover on
     // `device`. format_check: whether capacity / block_size are acceptable.
     // format: write an empty volume on m->device (detached state is the
     // caller's: it re-attaches afterwards).
     uint64_t (*max_capacity)(struct BlockDevice* device);
+    // Optional (NULL: 512). Block size format uses when none is asked for
+    // and the device does not already hold a volume of this type.
+    uint32_t (*default_block_size)(struct BlockDevice* device, uint64_t capacity);
     bool     (*format_check)(struct BlockDevice* device, uint64_t capacity, uint32_t block_size);
     bool     (*format)(struct FsMount* m, struct BlockDevice* device, uint64_t capacity, uint32_t block_size);
+
+    // Optional (NULL: no checker). Check the open volume, fixing what is
+    // found when `repair` is set and writing nothing otherwise (see
+    // vfs_device_check). The caller has made sure no file on it is open
+    // when repairing, and syncs afterwards.
+    VfsCheckResult (*check)(struct FsMount* m, bool repair, VfsCheckReport* report);
 
     //
     // Nodes (volume open)
@@ -153,7 +174,11 @@ struct FsType {
     uint64_t (*tell)(void* file);
 };
 
+// True if partitions of MBR type `mbr_type` belong to `type`
+bool fs_type_claims_mbr(const struct FsType* type, uint8_t mbr_type);
+
 // Built-in types (listed in vfs_mount.c)
 extern const struct FsType fs_type_basefs;
+extern const struct FsType fs_type_fat;
 
 #endif

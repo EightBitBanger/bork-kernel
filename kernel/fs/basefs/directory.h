@@ -3,6 +3,7 @@
 #define BASE_DIRECTORY_H
 
 #include <kernel/fs/fs.h>
+#include <kernel/fs/basefs/check.h>
 
 #include <stddef.h>
 
@@ -69,5 +70,15 @@ uint64_t fs_directory_find(struct FSDeviceContext* ctx, uint64_t directory_addre
 
 // Parent directory (FS_NULL for the partition root or on error)
 uint64_t fs_directory_get_parent(struct FSDeviceContext* ctx, uint64_t directory_address);
+
+// Consistency check (check.c). Walks every record of the directory, past
+// damaged ones, calling `entry` (may be NULL) for each live entry and
+// `extent` (may be NULL) for each extent before following the chain to it.
+// Damaged records, chain, back links and counts go into *out; with `repair`
+// they are rewritten and entries `entry` refused are removed. Without it
+// nothing is written. False if `directory` is not a directory.
+bool     fs_directory_check(struct FSDeviceContext* ctx, uint64_t directory, bool repair,
+                            fs_check_extent_fn extent, fs_check_entry_fn entry, void* user,
+                            FSDirCheck* out);
 
 #endif

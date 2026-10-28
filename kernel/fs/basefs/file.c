@@ -773,3 +773,90 @@ uint64_t fs_file_get_address(const FileHandle* file) {
     return file->address;
 }
 
+
+// ---------------------------------------------------------------------------
+// Consistency check
+// ---------------------------------------------------------------------------
+
+bool fs_file_check_chain(struct FSDeviceContext* ctx, uint64_t address, bool repair,
+                         fs_check_extent_fn extent_fn, void* user, FSFileCheck* out, uint64_t* size) {
+    memset(out, 0, sizeof(FSFileCheck));
+    if (size) *size = 0;
+
+    struct FSFileHeader file;
+    if (!fs_file_check(ctx, address))
+        return false;
+    fs_mem_read(ctx, address, &file, sizeof(struct FSFileHeader));
+    bool header_dirty = false;
+
+    uint64_t room = fs_file_part_capacity(ctx, address, sizeof(struct FSFileHeader), NULL);
+    if (file.inline_size > room) {
+        out->bad_size = true;
+        file.inline_size = room;
+        header_dirty = true;
+    }
+
+    uint64_t total    = file.inline_size;
+    uint64_t previous = address;            // The header, then each extent
+    uint64_t current  = file.extent.next;
+    uint64_t tail     = FS_NULL;
+    uint64_t guard    = fs_file_walk_limit(ctx);
+
+    while (current != FS_NULL) {
+        struct FSFileExtent extent;
+        if (guard-- == 0 || (extent_fn != NULL && !extent_fn(user, current)) ||
+            !fs_file_extent_read(ctx, current, &extent)) {
+            // Cut the file short in front of the bad extent
+            out->bad_chain = true;
+            if (previous == address) {
+                file.extent.next = FS_NULL;
+                header_dirty = true;
+            } else if (repair) {
+                struct FSFileExtent before;
+                if (fs_file_extent_read(ctx, previous, &before)) {
+                    before.extent.next = FS_NULL;
+                    fs_file_extent_write(ctx, previous, &before);
+                }
+            }
+            break;
+        }
+
+        bool dirty = false;
+        if (extent.extent.prev != previous) {
+            out->bad_links = true;
+            extent.extent.prev = previous;
+            dirty = true;
+        }
+        uint64_t capacity = fs_file_part_capacity(ctx, current, sizeof(struct FSFileExtent), NULL);
+        if (extent.extent_data_size > capacity) {
+            out->bad_size = true;
+            extent.extent_data_size = capacity;
+            dirty = true;
+        }
+        if (dirty && repair)
+            fs_file_extent_write(ctx, current, &extent);
+
+        total   += extent.extent_data_size;
+        tail     = current;
+        previous = current;
+        current  = extent.extent.next;
+    }
+
+    if (file.total_logical_size != total) {
+        out->bad_size = true;
+        file.total_logical_size = total;
+        header_dirty = true;
+    }
+
+    // The tail hint is checked before every use, so a stale one is no
+    // damage; it is only brought up to date along with real repairs
+    if (header_dirty && file.extent.prev != tail)
+        file.extent.prev = tail;
+
+    if (header_dirty && repair) {
+        file.block.chain_generation++;
+        fs_mem_write(ctx, address, &file, sizeof(struct FSFileHeader));
+    }
+    if (size) *size = total;
+    return true;
+}

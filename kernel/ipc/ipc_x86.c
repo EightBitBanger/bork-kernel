@@ -12,6 +12,8 @@
 #include <kernel/boot/x86/interrupt.h>
 #include <kernel/console/mouse.h>
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/scheduler/process.h>
+#include <kernel/security/elevate.h>
 #include <kernel/mutex.h>
 #include <kernel/util/string.h>
 #include <kernel/util/timer.h>
@@ -163,6 +165,10 @@ void ipc_plat_wake_all(void) {
     irq_restore(flags);
 }
 
+bool ipc_plat_cancelled(void) {
+    return process_current_kill_pending();
+}
+
 //
 // Input
 //
@@ -219,8 +225,11 @@ bool ipc_plat_input_pop(SysInputEvent* ev) {
     return false;
 }
 
+// An elevation request waiting for the desktop counts as input: the input
+// owner (the desktop, which is also the elevation agent) wakes from
+// SYS_IPC_WAIT for it, reads no events, and picks the request up
 bool ipc_plat_input_pending(void) {
-    return mouse_event_pending() || input_key_pending();
+    return mouse_event_pending() || input_key_pending() || elevate_agent_has_work();
 }
 
 void ipc_plat_input_flush(void) {

@@ -2,6 +2,7 @@
 #define BASE_FILE_H
 
 #include <kernel/fs/fs.h>
+#include <kernel/fs/basefs/check.h>
 
 // Files have no name of their own: the directory entry that links a file
 // holds its name (see directory.h). A file is addressed by its header.
@@ -71,6 +72,15 @@ bool fs_file_set_security_flag(struct FSDeviceContext* ctx, uint64_t address, ui
 uint64_t fs_file_seek(FileHandle* file, uint64_t position);
 uint64_t fs_file_tell(const FileHandle* file);
 uint64_t fs_file_get_address(const FileHandle* file);
+
+// Consistency check (check.c). Follows the file's data chain, calling
+// `extent` (may be NULL) before each extent, and checks the back links and
+// that the sizes add up. Findings go into *out; with `repair` the chain is
+// cut at a bad extent and links and sizes are rewritten to match the data
+// that is there. *size receives the file's size as the data gives it.
+// False if `address` is not a file.
+bool fs_file_check_chain(struct FSDeviceContext* ctx, uint64_t address, bool repair,
+                         fs_check_extent_fn extent, void* user, FSFileCheck* out, uint64_t* size);
 
 #endif
 

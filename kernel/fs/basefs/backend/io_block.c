@@ -117,6 +117,11 @@ void fs_writeb(struct FSDeviceContext* ctx, uint64_t address, uint8_t byte) {
     ctx->sector_dirty = true;
 }
 
+static inline bool fs_io_cached_in(struct FSDeviceContext* ctx, uint64_t first, uint32_t count) {
+    return ctx->sector_frame != FS_NO_SECTOR &&
+           ctx->sector_frame >= first && ctx->sector_frame - first < count;
+}
+
 #if FS_IO_DIRECT_TRANSFER
 // Number of whole sectors starting at `sector` that can bypass the window
 static uint32_t fs_io_burst_length(uint64_t size, uint32_t sector_size) {
@@ -125,12 +130,15 @@ static uint32_t fs_io_burst_length(uint64_t size, uint32_t sector_size) {
         count = FS_IO_MAX_BURST_SECTORS;
     return (uint32_t)count;
 }
-
-static inline bool fs_io_cached_in(struct FSDeviceContext* ctx, uint64_t first, uint32_t count) {
-    return ctx->sector_frame != FS_NO_SECTOR &&
-           ctx->sector_frame >= first && ctx->sector_frame - first < count;
-}
 #endif
+
+// Source of fs_mem_fill's whole-sector runs: a format fills the allocation
+// bitmap (megabytes on a large stick) through here, one write command per
+// FS_FILL_BYTES instead of one per sector. Static, so a DMA driver can map
+// it. 64 sectors of 512 bytes, the most a USB stick takes per command.
+#define FS_FILL_BYTES  (64U * 512U)
+static uint8_t fs_fill_buffer[FS_FILL_BYTES] __attribute__((aligned(16)));
+static int     fs_fill_byte = 0;    // What fs_fill_buffer holds now (BSS: zeros)
 
 void fs_mem_read(struct FSDeviceContext* ctx, uint64_t address, void* destination, uint32_t size) {
     if (!ctx || destination == NULL) return;
@@ -177,14 +185,37 @@ void fs_mem_read(struct FSDeviceContext* ctx, uint64_t address, void* destinatio
         memset(dest_ptr, 0, size);
 }
 
-// Shared body of fs_mem_write and fs_mem_zero (source == NULL writes zeros)
-static void fs_mem_store(struct FSDeviceContext* ctx, uint64_t address, const uint8_t* source, uint64_t size) {
+// Shared body of fs_mem_write and fs_mem_fill (source == NULL writes `fill`)
+static void fs_mem_store(struct FSDeviceContext* ctx, uint64_t address, const uint8_t* source,
+                         uint8_t fill, uint64_t size) {
     if (!fs_io_ready(ctx)) return;
     uint32_t sector_size = fs_io_sector_size(ctx);
 
     while (size > 0) {
         uint64_t sector = address / sector_size;
         uint32_t offset = (uint32_t)(address % sector_size);
+
+        // Whole sectors of one byte value go straight to the disk, many at once
+        if (source == NULL && offset == 0 && size >= sector_size && sector_size <= FS_FILL_BYTES) {
+            uint64_t count = size / sector_size;
+            if (count > FS_FILL_BYTES / sector_size)
+                count = FS_FILL_BYTES / sector_size;
+            if (fs_fill_byte != fill) {
+                memset(fs_fill_buffer, fill, FS_FILL_BYTES);
+                fs_fill_byte = fill;
+            }
+            if (!block_write(ctx->device, sector, (uint32_t)count, fs_fill_buffer))
+                return;
+            // Every byte of a cached sector in this range was just replaced
+            if (fs_io_cached_in(ctx, sector, (uint32_t)count)) {
+                ctx->sector_frame = FS_NO_SECTOR;
+                ctx->sector_dirty = false;
+            }
+            uint64_t bytes = count * sector_size;
+            address += bytes;
+            size    -= bytes;
+            continue;
+        }
 
 #if FS_IO_DIRECT_TRANSFER
         if (source != NULL && offset == 0 && size >= sector_size) {
@@ -217,7 +248,7 @@ static void fs_mem_store(struct FSDeviceContext* ctx, uint64_t address, const ui
             memcpy(fs_io_window(ctx) + offset, source, chunk);
             source += chunk;
         } else {
-            memset(fs_io_window(ctx) + offset, 0, chunk);
+            memset(fs_io_window(ctx) + offset, fill, chunk);
         }
         ctx->sector_dirty = true;
         address += chunk;
@@ -227,10 +258,15 @@ static void fs_mem_store(struct FSDeviceContext* ctx, uint64_t address, const ui
 
 void fs_mem_write(struct FSDeviceContext* ctx, uint64_t address, const void* source, uint32_t size) {
     if (!ctx || source == NULL) return;
-    fs_mem_store(ctx, address, (const uint8_t*)source, size);
+    fs_mem_store(ctx, address, (const uint8_t*)source, 0, size);
 }
 
 void fs_mem_zero(struct FSDeviceContext* ctx, uint64_t address, uint64_t size) {
     if (!ctx) return;
-    fs_mem_store(ctx, address, NULL, size);
+    fs_mem_store(ctx, address, NULL, 0x00, size);
+}
+
+void fs_mem_fill(struct FSDeviceContext* ctx, uint64_t address, uint8_t byte, uint64_t size) {
+    if (!ctx) return;
+    fs_mem_store(ctx, address, NULL, byte, size);
 }

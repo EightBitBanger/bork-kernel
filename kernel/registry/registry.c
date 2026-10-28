@@ -461,6 +461,12 @@ bool registry_hive_initiate(const char* path) {
     return ok;
 }
 
+const char* registry_hive_path(const struct RegistryHive* hive) {
+    if (hive == &hkey_root) return hkr_hive_path;
+    if (hive == &hkey_user) return hku_hive_path;
+    return "";
+}
+
 bool registry_hive_save_all(void) {
     // Never initiated: there is nothing loaded and no known file to write to
     if (hkr_hive_path[0] == '\0' || hku_hive_path[0] == '\0')

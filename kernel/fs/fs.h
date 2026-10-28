@@ -44,6 +44,11 @@ uint64_t fs_device_max_capacity(struct BlockDevice* device);
 // format version, the context comes back with is_open == false, but still
 // bound to the device and window.
 struct FSDeviceContext fs_device_open(struct BlockDevice* device, uint8_t* window_address, struct FSPartitionBlock* partition);
+// Bytes in use. fs_used_bytes_step counts a bounded piece of the bitmap per
+// call: false while counting (call again), true with *used once the count
+// is complete, and from then on at once. `percent` (may be NULL): how much
+// has been counted. fs_get_used_bytes runs it to the end.
+bool fs_used_bytes_step(struct FSDeviceContext* device_context, uint64_t* used, uint32_t* percent);
 uint64_t fs_get_used_bytes(struct FSDeviceContext* device_context);
 uint8_t fs_device_get_partition(struct FSDeviceContext* device_context, struct FSPartitionBlock* part);
 
