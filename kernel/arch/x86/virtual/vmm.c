@@ -176,6 +176,13 @@ static bool kernel_map_locked(uint32_t physical_addr, uint32_t virtual_addr, uin
 #define CR0_CD              (1U << 30)
 #define CR0_NW              (1U << 29)
 
+#define CR4_UMIP            (1U << 11)
+#define CR4_SMEP            (1U << 20)
+#define CR4_SMAP            (1U << 21)
+#define CPUID7_EBX_SMEP     (1U << 7)
+#define CPUID7_EBX_SMAP     (1U << 20)
+#define CPUID7_ECX_UMIP     (1U << 2)
+
 // Fallback when PAT is missing: uncached, the previous behavior
 static uint32_t vm_wc_flags = VM_PRESENT | VM_READWRITE | VM_PWT | VM_PCD;
 static bool     vm_wc_available = false;
@@ -223,6 +230,30 @@ static void vmm_pat_init(void) {
 
     vm_wc_flags     = VM_PRESENT | VM_READWRITE | VM_PWT;
     vm_wc_available = true;
+}
+
+// Turn on the CPU's supervisor protections where the CPU has them:
+//   SMEP: ring 0 may not execute user pages (blocks ret2usr exploits)
+//   SMAP: ring 0 may not read or write user pages. All user memory is reached
+//         through the scratch window (vmm_user_copy_*), never by user address,
+//         so nothing here needs STAC/CLAC.
+//   UMIP: ring 3 may not run SGDT/SIDT/SLDT/SMSW/STR (kernel address leaks)
+static void vmm_cpu_protect_init(void) {
+    uint32_t eax = 0, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    if (eax < 7)
+        return;
+
+    eax = 7;
+    ecx = 0;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+
+    uint32_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    if (ebx & CPUID7_EBX_SMEP) cr4 |= CR4_SMEP;
+    if (ebx & CPUID7_EBX_SMAP) cr4 |= CR4_SMAP;
+    if (ecx & CPUID7_ECX_UMIP) cr4 |= CR4_UMIP;
+    __asm__ volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
 }
 
 void vmm_init(struct MultibootInfo* mbi, uint32_t identity_map_size) {
@@ -287,6 +318,12 @@ void vmm_init(struct MultibootInfo* mbi, uint32_t identity_map_size) {
 
     // Enable write-combining memory type before anything maps the framebuffer
     vmm_pat_init();
+
+    vmm_cpu_protect_init();
+
+    // Leave page 0 unmapped so a NULL (or small-offset) kernel pointer
+    // faults instead of silently reading or writing low memory
+    vmm_unmap_page(0);
 }
 
 void* vmm_alloc_pages(size_t num_pages) {

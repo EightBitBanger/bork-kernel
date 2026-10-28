@@ -19,12 +19,21 @@
 //   usb_enum.c     addressing a device and reading its descriptors
 //   usb_hub.c      hub class: powering, resetting and scanning hub ports
 //   usb_prop.c     the /dev/usb tree
-//   hcd/uhci.c     USB 1.1 host controller (polled)
+//   hcd/uhci.c     USB 1.1 host controller, Intel / VIA (polled)
+//   hcd/ohci.c     USB 1.1 host controller, AMD / nVidia / SiS (polled)
 //   hcd/ehci.c     EHCI: takes it from the BIOS and routes its ports to the
 //                  companion controllers (no high-speed support)
 //   hcd/xhci.c     USB 3 host controller (polled), all speeds
+//   usb_hid.c      boot protocol keyboards and mice, fed into the PS/2 input path
+//   usb_storage.c  mass storage (bulk-only, SCSI): block devices mounted in /mnt
+//
+//   usb_hotplug.c  the "usb" thread: polls keyboards and mice, notices
+//                  devices plugged in or pulled out on root and hub ports
 //
 // Interrupts are not used: transfers are polled to completion.
+//
+// Messages are printed while booting only (usb_print); after that the
+// desktop owns the screen.
 //
 
 // Device speeds
@@ -36,6 +45,26 @@
 #define USB_MAX_DEVICES     64
 #define USB_MAX_HUB_DEPTH   5   // Hub tiers below the root hub (USB 2.0 11.1.2.1)
 #define USB_STRING_MAX      32
+#define USB_MAX_INTERFACES  4   // Interfaces remembered per device
+
+// One interface of the active configuration (alternate setting 0)
+struct UsbInterface {
+    uint8_t  number;
+    uint8_t  if_class;
+    uint8_t  if_subclass;
+    uint8_t  if_protocol;
+
+    // First interrupt IN endpoint, 0 if none
+    uint8_t  int_in_endpoint;           // Endpoint number (1-15)
+    uint8_t  int_in_interval;           // bInterval as the descriptor gives it
+    uint16_t int_in_max_packet;
+
+    // First bulk IN and bulk OUT endpoints, 0 if none
+    uint8_t  bulk_in_endpoint;
+    uint8_t  bulk_out_endpoint;
+    uint16_t bulk_in_max_packet;
+    uint16_t bulk_out_max_packet;
+};
 
 struct UsbController;
 struct PCIDeviceInfo;
@@ -62,9 +91,15 @@ struct UsbDevice {
     uint8_t  if_subclass;
     uint8_t  if_protocol;
 
+    // The first USB_MAX_INTERFACES interfaces in full
+    struct UsbInterface interfaces[USB_MAX_INTERFACES];
+    uint8_t  interfaces_known;
+
     char manufacturer[USB_STRING_MAX];
     char product[USB_STRING_MAX];
     char serial[USB_STRING_MAX];
+
+    char node_name[16];                 // Its /dev/usb entry (usb_prop.c)
 
     // Hub class
     bool     is_hub;
@@ -92,8 +127,12 @@ void usb_init(void);
 // Devices
 //
 
+// Devices are added and removed at run time (hot plug). Hold the list
+// lock while walking it and using what usb_get_device() returns.
 uint32_t usb_device_count(void);
 struct UsbDevice* usb_get_device(uint32_t index);
+void usb_device_list_lock(void);
+void usb_device_list_unlock(void);
 
 // Number of host controllers started
 uint32_t usb_controller_count(void);

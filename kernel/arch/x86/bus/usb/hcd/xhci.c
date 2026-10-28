@@ -16,6 +16,12 @@
 // The controller is 64-bit capable but this kernel has no PAE, so every
 // address handed to it is below 4 GB and the high halves are zero.
 //
+// Interrupt IN endpoints (keyboards, mice) get a transfer ring each with
+// one Normal TRB queued. Bulk endpoints (storage) get a ring each too, and
+// a transfer waits for its event. Their completions can turn up while a command or
+// a control transfer is reading the event ring, so every reader hands
+// events it does not want to xhci_pipe_event().
+//
 
 // Capability registers
 #define XHCI_CAPLENGTH      0x00
@@ -131,6 +137,11 @@
 #define XHCI_CMD_TIMEOUT    1000
 #define XHCI_XFER_TIMEOUT   1000
 #define XHCI_EP0            1           // Device context index of endpoint 0
+#define XHCI_MAX_PIPES      16
+#define XHCI_EP_BULK_OUT    2           // Endpoint context EP Type
+#define XHCI_EP_BULK_IN     6
+#define XHCI_EP_INTERRUPT_IN 7
+#define TRB_GET_EP(c)       (((c) >> 16) & 0x1F)
 
 struct __attribute__((packed, aligned(16))) XhciTrb {
     volatile uint32_t param_lo;
@@ -163,6 +174,18 @@ struct XhciDevice {
     struct XhciRing ep0;
 };
 
+struct XhciPipe {
+    uint8_t  slot;
+    uint8_t  dci;               // Device context index (endpoint * 2 + 1 for IN)
+    struct XhciRing ring;
+    uint8_t* buffer;
+    uint32_t buffer_phys;
+    uint32_t trb_phys;          // The Normal TRB queued
+    bool     done;              // Its transfer event came
+    uint32_t code;
+    uint32_t residual;
+};
+
 struct XhciState {
     volatile uint8_t* cap;
     volatile uint8_t* op;
@@ -189,6 +212,9 @@ struct XhciState {
 
     uint8_t  port_major[256];   // USB major revision per port (2, 3), 0 = unknown
     uint8_t  port_speed[256];   // PSI speed ID seen at the last port reset
+
+    struct XhciPipe* pipes[XHCI_MAX_PIPES];
+    uint32_t pipe_count;
 };
 
 //
@@ -313,6 +339,25 @@ static bool xhci_next_event(struct XhciState* st, struct XhciTrb* out) {
     return true;
 }
 
+// A transfer event for an interrupt pipe: note it there. Returns false if
+// no pipe owns it.
+static bool xhci_pipe_event(struct XhciState* st, const struct XhciTrb* ev) {
+    if (TRB_GET_TYPE(ev->control) != TRB_EV_TRANSFER)
+        return false;
+    uint8_t slot = (uint8_t)TRB_GET_SLOT(ev->control);
+    uint8_t dci  = (uint8_t)TRB_GET_EP(ev->control);
+    for (uint32_t i = 0; i < st->pipe_count; i++) {
+        struct XhciPipe* xp = st->pipes[i];
+        if (xp->slot == slot && xp->dci == dci) {
+            xp->done     = true;
+            xp->code     = TRB_GET_CODE(ev->status);
+            xp->residual = ev->status & 0x00FFFFFF;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Run one command and wait for its completion event.
 // Returns the completion code (0 on timeout); *slot_out gets the slot ID.
 static uint32_t xhci_command(struct XhciState* st, uint32_t param_lo, uint32_t control, uint8_t* slot_out) {
@@ -329,9 +374,10 @@ static uint32_t xhci_command(struct XhciState* st, uint32_t param_lo, uint32_t c
                 *slot_out = (uint8_t)TRB_GET_SLOT(ev.control);
             return TRB_GET_CODE(ev.status);
         }
-        // Port status changes and stray transfer events: nothing to do
+        // Interrupt pipe completions are kept, port status changes dropped
+        xhci_pipe_event(st, &ev);
     }
-    print("xHCI: command timed out\n");
+    usb_print("xHCI: command timed out\n");
     return 0;
 }
 
@@ -370,7 +416,7 @@ static void xhci_scan_extended_caps(struct XhciState* st) {
                 uint64_t start = usb_time_ms();
                 while (xhci_read(st->cap, offset) & XHCI_LEGACY_BIOS) {
                     if (usb_time_ms() - start > 1000) {
-                        print("xHCI: BIOS did not release the controller\n");
+                        usb_print("xHCI: BIOS did not release the controller\n");
                         break;
                     }
                 }
@@ -403,7 +449,7 @@ static bool xhci_start(struct UsbController* hc) {
     volatile uint8_t* cap = (volatile uint8_t*)pci_map_bar(pci->bus, pci->dev, pci->func, 0, mmio_size,
                                                            VM_PRESENT | VM_READWRITE | VM_PCD);
     if (cap == NULL) {
-        print("xHCI: registers not mappable (above 4 GB?)\n");
+        usb_print("xHCI: registers not mappable (above 4 GB?)\n");
         return false;
     }
 
@@ -438,13 +484,13 @@ static bool xhci_start(struct UsbController* hc) {
     xhci_write(st->op, XHCI_USBCMD, XHCI_CMD_HCRST);
     if (!xhci_wait(st->op, XHCI_USBCMD, XHCI_CMD_HCRST, 0, 1000) ||
         !xhci_wait(st->op, XHCI_USBSTS, XHCI_STS_CNR, 0, 1000)) {
-        print("xHCI: controller reset timed out\n");
+        usb_print("xHCI: controller reset timed out\n");
         goto fail;
     }
     usb_delay_ms(10);
 
     if (!(xhci_read(st->op, XHCI_PAGESIZE) & 0x1)) {
-        print("xHCI: controller does not support 4 KB pages\n");
+        usb_print("xHCI: controller does not support 4 KB pages\n");
         goto fail;
     }
 
@@ -495,7 +541,7 @@ static bool xhci_start(struct UsbController* hc) {
 
     xhci_write(st->op, XHCI_USBCMD, XHCI_CMD_RUN);
     if (!xhci_wait(st->op, XHCI_USBSTS, XHCI_STS_HCH, 0, 100)) {
-        print("xHCI: controller did not start\n");
+        usb_print("xHCI: controller did not start\n");
         goto fail;
     }
 
@@ -518,7 +564,7 @@ static bool xhci_start(struct UsbController* hc) {
 
 fail:
     // Pages handed to the controller are not reclaimed: it may still own them
-    print("xHCI: controller setup failed\n");
+    usb_print("xHCI: controller setup failed\n");
     free(st);
     return false;
 }
@@ -571,7 +617,7 @@ static uint8_t xhci_port_reset(struct UsbController* hc, uint8_t port) {
         uint64_t start = usb_time_ms();
         while (!(xhci_read(portsc, 0) & XHCI_PORT_PRC)) {
             if (usb_time_ms() - start > 500) {
-                print("xHCI: port reset timed out\n");
+                usb_print("xHCI: port reset timed out\n");
                 return 0;
             }
         }
@@ -655,7 +701,7 @@ static bool xhci_address_device(struct UsbController* hc, struct UsbDevice* dev)
     uint8_t slot = 0;
     uint32_t code = xhci_command(st, 0, TRB_TYPE(TRB_ENABLE_SLOT), &slot);
     if (code != XHCI_CC_SUCCESS || slot == 0 || slot > st->max_slots) {
-        print("xHCI: no free device slot\n");
+        usb_print("xHCI: no free device slot\n");
         goto fail;
     }
     xd->slot = slot;
@@ -684,9 +730,9 @@ static bool xhci_address_device(struct UsbController* hc, struct UsbDevice* dev)
 
     code = xhci_command(st, xd->input_phys, TRB_TYPE(TRB_ADDRESS_DEVICE) | TRB_SLOT(slot), NULL);
     if (code != XHCI_CC_SUCCESS) {
-        print("xHCI: address device failed, code ");
-        print_int((int32_t)code);
-        print("\n");
+        usb_print("xHCI: address device failed, code ");
+        usb_print_int((int32_t)code);
+        usb_print("\n");
         goto fail;
     }
 
@@ -736,7 +782,7 @@ static void xhci_hub_configured(struct UsbController* hc, struct UsbDevice* dev)
     slot_ctx[3] = 0;
 
     if (xhci_command(st, xd->input_phys, TRB_TYPE(TRB_CONFIGURE_EP) | TRB_SLOT(xd->slot), NULL) != XHCI_CC_SUCCESS)
-        print("xHCI: could not mark a hub, devices behind it may not work\n");
+        usb_print("xHCI: could not mark a hub, devices behind it may not work\n");
 }
 
 // After a stall or a timeout: halt endpoint 0 if needed and move its
@@ -790,8 +836,11 @@ static int xhci_control(struct UsbController* hc, struct UsbDevice* dev,
         struct XhciTrb ev;
         if (!xhci_next_event(st, &ev))
             continue;
-        if (TRB_GET_TYPE(ev.control) != TRB_EV_TRANSFER || TRB_GET_SLOT(ev.control) != xd->slot)
+        if (TRB_GET_TYPE(ev.control) != TRB_EV_TRANSFER || TRB_GET_SLOT(ev.control) != xd->slot ||
+            TRB_GET_EP(ev.control) != XHCI_EP0) {
+            xhci_pipe_event(st, &ev);
             continue;
+        }
 
         uint32_t code = TRB_GET_CODE(ev.status);
         if (code == XHCI_CC_SHORT && ev.param_lo == data_trb) {
@@ -820,6 +869,220 @@ static int xhci_control(struct UsbController* hc, struct UsbDevice* dev,
     return (int)moved;
 }
 
+//
+// Interrupt IN endpoints
+//
+
+static void xhci_pipe_queue(struct XhciState* st, struct XhciPipe* xp, uint16_t length) {
+    xp->done = false;
+    xp->trb_phys = xhci_ring_push(&xp->ring, xp->buffer_phys, 0, length,
+                                  TRB_TYPE(TRB_NORMAL) | TRB_ISP | TRB_IOC);
+    xhci_doorbell(st, xp->slot, xp->dci);
+}
+
+// Endpoint context Interval: 2^n units of 125 us
+static uint32_t xhci_ep_interval(uint8_t speed, uint8_t interval) {
+    if (speed == USB_SPEED_LOW || speed == USB_SPEED_FULL) {
+        // bInterval in frames (1 ms = 8 units)
+        uint32_t units = (uint32_t)(interval ? interval : 1) * 8;
+        uint32_t n = 0;
+        while ((2U << n) <= units && n < 10) n++;
+        return n < 3 ? 3 : n;
+    }
+    // High and SuperSpeed: bInterval is already 2^(bInterval-1) units
+    uint32_t n = interval ? interval - 1U : 0;
+    return n > 15 ? 15 : n;
+}
+
+// Add an endpoint to a configured device: input control, slot context
+// (Context Entries raised to cover it) and the endpoint context, with a
+// transfer ring and a one-page buffer of its own
+static struct XhciPipe* xhci_open_endpoint(struct XhciState* st, struct UsbDevice* dev, uint8_t endpoint,
+                                           bool in, uint32_t ep_type, uint16_t max_packet, uint8_t interval) {
+    struct XhciDevice* xd = (struct XhciDevice*)dev->hcd_data;
+    if (xd == NULL || st->pipe_count >= XHCI_MAX_PIPES)
+        return NULL;
+
+    struct XhciPipe* xp = (struct XhciPipe*)malloc(sizeof(struct XhciPipe));
+    if (xp == NULL) return NULL;
+    memset(xp, 0, sizeof(*xp));
+    xp->slot = xd->slot;
+    xp->dci  = (uint8_t)(endpoint * 2 + (in ? 1 : 0));
+    xp->buffer = (uint8_t*)usb_dma_page(&xp->buffer_phys);
+    if (xp->buffer == NULL || !xhci_ring_init(&xp->ring)) {
+        usb_dma_page_free(xp->buffer);
+        free(xp);
+        return NULL;
+    }
+
+    uint32_t* icc = xhci_input_control(st, xd);
+    icc[0] = 0;
+    icc[1] = (1U << 0) | (1U << xp->dci);
+
+    uint32_t* slot_ctx = xhci_input_slot(st, xd);
+    memcpy(slot_ctx, xhci_output_slot(st, xd), st->ctx_size);
+    uint32_t entries = slot_ctx[0] >> 27;
+    if (entries < xp->dci) entries = xp->dci;
+    slot_ctx[0] = (slot_ctx[0] & 0x07FFFFFFU) | (entries << 27);
+    slot_ctx[3] = 0;
+
+    uint32_t mps = max_packet ? max_packet : 8;
+    bool periodic = ep_type == XHCI_EP_INTERRUPT_IN;
+    uint32_t* ep = xhci_input_ep(st, xd, xp->dci);
+    memset(ep, 0, st->ctx_size);
+    ep[0] = periodic ? xhci_ep_interval(dev->speed, interval) << 16 : 0;
+    ep[1] = (3U << 1) | (ep_type << 3) | (mps << 16);
+    ep[2] = xhci_ring_dequeue_ptr(&xp->ring);
+    ep[3] = 0;
+    ep[4] = periodic ? (mps | (mps << 16)) : 1024;  // Average TRB length (and max ESIT payload)
+
+    if (xhci_command(st, xd->input_phys, TRB_TYPE(TRB_CONFIGURE_EP) | TRB_SLOT(xd->slot), NULL) != XHCI_CC_SUCCESS) {
+        usb_print("xHCI: could not configure an endpoint\n");
+        usb_dma_page_free(xp->buffer);
+        usb_dma_page_free(xp->ring.trbs);
+        free(xp);
+        return NULL;
+    }
+
+    st->pipes[st->pipe_count++] = xp;
+    return xp;
+}
+
+static void xhci_close_endpoint(struct XhciState* st, struct XhciPipe* xp) {
+    for (uint32_t i = 0; i < st->pipe_count; i++) {
+        if (st->pipes[i] != xp) continue;
+        for (; i + 1 < st->pipe_count; i++)
+            st->pipes[i] = st->pipes[i + 1];
+        st->pipe_count--;
+        break;
+    }
+
+    // The endpoint stops with it; its ring is not touched after that
+    xhci_command(st, 0, TRB_TYPE(TRB_STOP_EP) | TRB_SLOT(xp->slot) | TRB_EP(xp->dci), NULL);
+    usb_dma_page_free(xp->buffer);
+    usb_dma_page_free(xp->ring.trbs);
+    free(xp);
+}
+
+// After a halt (or a stop): restart the endpoint past whatever is left on
+// its ring
+static void xhci_recover_endpoint(struct XhciState* st, struct XhciPipe* xp, bool halted) {
+    xhci_command(st, 0, TRB_TYPE(halted ? TRB_RESET_EP : TRB_STOP_EP) | TRB_SLOT(xp->slot) | TRB_EP(xp->dci), NULL);
+    xhci_command(st, xhci_ring_dequeue_ptr(&xp->ring),
+                 TRB_TYPE(TRB_SET_TR_DEQUEUE) | TRB_SLOT(xp->slot) | TRB_EP(xp->dci), NULL);
+}
+
+static bool xhci_int_open(struct UsbController* hc, struct UsbIntPipe* pipe) {
+    struct XhciState* st = (struct XhciState*)hc->priv;
+    struct XhciPipe* xp = xhci_open_endpoint(st, pipe->dev, pipe->endpoint, true, XHCI_EP_INTERRUPT_IN,
+                                             pipe->max_packet, pipe->interval);
+    if (xp == NULL)
+        return false;
+    xhci_pipe_queue(st, xp, pipe->length);
+    pipe->hcd = xp;
+    return true;
+}
+
+static int xhci_int_poll(struct UsbController* hc, struct UsbIntPipe* pipe, void* buf) {
+    struct XhciState* st = (struct XhciState*)hc->priv;
+    struct XhciPipe* xp = (struct XhciPipe*)pipe->hcd;
+    if (xp == NULL) return USB_ERR_PARAM;
+
+    struct XhciTrb ev;
+    while (xhci_next_event(st, &ev))
+        xhci_pipe_event(st, &ev);
+    if (!xp->done)
+        return 0;
+
+    int result;
+    if (xp->code == XHCI_CC_SUCCESS || xp->code == XHCI_CC_SHORT) {
+        uint32_t moved = xp->residual > pipe->length ? 0 : pipe->length - xp->residual;
+        memcpy(buf, xp->buffer, moved);
+        result = (int)moved;
+    } else {
+        // The endpoint halted: reset it and move past the failed TRB
+        result = xp->code == XHCI_CC_STALL ? USB_ERR_STALL : USB_ERR_IO;
+        xhci_recover_endpoint(st, xp, true);
+    }
+
+    xhci_pipe_queue(st, xp, pipe->length);
+    return result;
+}
+
+static void xhci_int_close(struct UsbController* hc, struct UsbIntPipe* pipe) {
+    struct XhciPipe* xp = (struct XhciPipe*)pipe->hcd;
+    if (xp == NULL) return;
+    xhci_close_endpoint((struct XhciState*)hc->priv, xp);
+    pipe->hcd = NULL;
+}
+
+//
+// Bulk endpoints
+//
+
+static bool xhci_bulk_open(struct UsbController* hc, struct UsbBulkPipe* pipe) {
+    struct XhciPipe* xp = xhci_open_endpoint((struct XhciState*)hc->priv, pipe->dev, pipe->endpoint, pipe->in,
+                                             pipe->in ? XHCI_EP_BULK_IN : XHCI_EP_BULK_OUT, pipe->max_packet, 0);
+    pipe->hcd = xp;
+    return xp != NULL;
+}
+
+static int xhci_bulk_transfer(struct UsbController* hc, struct UsbBulkPipe* pipe, void* data,
+                              uint32_t length, uint32_t timeout_ms) {
+    struct XhciState* st = (struct XhciState*)hc->priv;
+    struct XhciPipe* xp = (struct XhciPipe*)pipe->hcd;
+    if (xp == NULL || length > USB_BULK_MAX) return USB_ERR_PARAM;
+
+    if (!pipe->in && length > 0)
+        memcpy(xp->buffer, data, length);
+    xhci_pipe_queue(st, xp, (uint16_t)length);
+
+    uint64_t start = usb_time_ms();
+    while (!xp->done && usb_time_ms() - start < timeout_ms) {
+        struct XhciTrb ev;
+        if (xhci_next_event(st, &ev))
+            xhci_pipe_event(st, &ev);
+    }
+
+    if (!xp->done) {
+        xhci_recover_endpoint(st, xp, false);
+        return USB_ERR_TIMEOUT;
+    }
+    if (xp->code != XHCI_CC_SUCCESS && xp->code != XHCI_CC_SHORT) {
+        // The host side restarts here; bulk_reset has nothing left to do
+        xhci_recover_endpoint(st, xp, true);
+        return xp->code == XHCI_CC_STALL ? USB_ERR_STALL : USB_ERR_IO;
+    }
+
+    uint32_t moved = xp->residual > length ? 0 : length - xp->residual;
+    if (pipe->in && moved > 0)
+        memcpy(data, xp->buffer, moved);
+    return (int)moved;
+}
+
+static void xhci_bulk_reset(struct UsbController* hc, struct UsbBulkPipe* pipe) {
+    (void)hc;
+    (void)pipe;     // A stall already reset the endpoint in xhci_bulk_transfer
+}
+
+static void xhci_bulk_close(struct UsbController* hc, struct UsbBulkPipe* pipe) {
+    struct XhciPipe* xp = (struct XhciPipe*)pipe->hcd;
+    if (xp == NULL) return;
+    xhci_close_endpoint((struct XhciState*)hc->priv, xp);
+    pipe->hcd = NULL;
+}
+
+static bool xhci_port_changed(struct UsbController* hc, uint8_t port, bool* connected) {
+    struct XhciState* st = (struct XhciState*)hc->priv;
+    volatile uint8_t* portsc = xhci_portsc(st, port);
+    uint32_t v = xhci_read(portsc, 0);
+    *connected = (v & XHCI_PORT_CCS) != 0;
+    if (!(v & XHCI_PORT_CSC))
+        return false;
+    xhci_write(portsc, 0, xhci_port_neutral(v) | (v & XHCI_PORT_CHANGES));
+    return true;
+}
+
 const struct UsbHcdOps xhci_ops = {
     .name               = "xhci",
     .start              = xhci_start,
@@ -829,4 +1092,12 @@ const struct UsbHcdOps xhci_ops = {
     .control            = xhci_control,
     .hub_configured     = xhci_hub_configured,
     .release_device     = xhci_release_device,
+    .int_open           = xhci_int_open,
+    .int_poll           = xhci_int_poll,
+    .int_close          = xhci_int_close,
+    .port_changed       = xhci_port_changed,
+    .bulk_open          = xhci_bulk_open,
+    .bulk_transfer      = xhci_bulk_transfer,
+    .bulk_reset         = xhci_bulk_reset,
+    .bulk_close         = xhci_bulk_close,
 };

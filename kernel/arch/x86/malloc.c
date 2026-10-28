@@ -8,6 +8,11 @@
 
 #define SLAB_MAX_SIZE 512
 
+// Largest request malloc/realloc accept. Anything bigger could not be mapped
+// anyway, and size + PAGE_SIZE below would wrap to a tiny block that the
+// caller then overruns.
+#define MALLOC_MAX_SIZE (0x80000000U)
+
 static struct SlabCache malloc_caches[] = {
     { .object_size = 16,             .page_list = NULL },
     { .object_size = 32,             .page_list = NULL },
@@ -23,7 +28,7 @@ struct LargeAllocHeader {
 };
 
 static void* malloc_unlocked(size_t size) {
-    if (size == 0) return NULL;
+    if (size == 0 || size > MALLOC_MAX_SIZE) return NULL;
     
     // Find a suitable slab
     if (size <= SLAB_MAX_SIZE) {
@@ -81,6 +86,8 @@ static void* realloc_unlocked(void* ptr, size_t size) {
         free_unlocked(ptr);
         return NULL;
     }
+    if (size > MALLOC_MAX_SIZE)
+        return NULL;    // Original block left as it is
     
     size_t old_size = 0;
     bool is_large_alloc = (((uint32_t)ptr & (PAGE_SIZE - 1)) == 0);

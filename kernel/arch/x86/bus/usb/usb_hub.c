@@ -8,6 +8,10 @@
 #define USB_HUB_DEBOUNCE_MS         100     // Connect debounce (USB 2.0 7.1.7.3)
 #define USB_HUB_RESET_RECOVERY_MS   10      // TRSTRCY
 
+// Ports scanned per hub. bNbrPorts is the device's word and goes up to 255;
+// real hubs have a handful (Linux stops at 31 too)
+#define USB_HUB_PORTS_MAX   31
+
 #define USB_HUB_PORT_REQ    (USB_TYPE_CLASS | USB_RECIP_OTHER)
 
 // Hub ports are polled with GET_STATUS; the hub's interrupt endpoint is not
@@ -25,7 +29,7 @@ static bool usb_hub_port_status(struct UsbDevice* hub, uint8_t port, struct UsbP
 
 // Reset one port and wait for it to come back enabled.
 // Returns the attached device's USB_SPEED_*, or 0.
-static uint8_t usb_hub_reset_port(struct UsbDevice* hub, uint8_t port) {
+uint8_t usb_hub_reset_port(struct UsbDevice* hub, uint8_t port) {
     struct UsbPortStatus st;
 
     if (usb_hub_port_feature(hub, USB_REQ_SET_FEATURE, USB_PORT_FEAT_RESET, port) < 0)
@@ -62,7 +66,7 @@ bool usb_hub_init(struct UsbDevice* hub) {
         // A USB 3 hub also shows up as a USB 2 hub on a USB 2 port, where
         // its low/full/high speed devices are found. Its SuperSpeed ports
         // need the USB 3 hub protocol, which is not implemented.
-        print("USB: SuperSpeed hub ports not scanned\n");
+        usb_print("USB: SuperSpeed hub ports not scanned\n");
         return false;
     }
 
@@ -70,24 +74,28 @@ bool usb_hub_init(struct UsbDevice* hub) {
     int length = usb_control_locked(hub, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_DEVICE,
                                     USB_REQ_GET_DESCRIPTOR, USB_DESC_HUB << 8, 0, buf, sizeof(buf));
     if (length < 7 || buf[1] != USB_DESC_HUB) {
-        print("USB: could not read a hub descriptor\n");
+        usb_print("USB: could not read a hub descriptor\n");
         return false;
     }
 
     const struct UsbHubDescriptor* desc = (const struct UsbHubDescriptor*)buf;
-    hub->hub_ports      = desc->port_count;
+    if (desc->port_count > USB_HUB_PORTS_MAX)
+        usb_print("USB: hub reports too many ports, only the first ones are scanned\n");
+    hub->hub_ports      = desc->port_count > USB_HUB_PORTS_MAX ? USB_HUB_PORTS_MAX : desc->port_count;
     hub->hub_think_time = (uint8_t)((desc->characteristics >> 5) & 0x03);
     hub->hub_multi_tt   = hub->speed == USB_SPEED_HIGH && hub->descriptor.device_protocol == 2;
 
     if (hub->hc->ops->hub_configured != NULL)
         hub->hc->ops->hub_configured(hub->hc, hub);
 
-    for (uint8_t port = 1; port <= hub->hub_ports; port++)
-        usb_hub_port_feature(hub, USB_REQ_SET_FEATURE, USB_PORT_FEAT_POWER, port);
+    // uint32_t: with a uint8_t counter, 255 ports would never end the loop
+    for (uint32_t port = 1; port <= hub->hub_ports; port++)
+        usb_hub_port_feature(hub, USB_REQ_SET_FEATURE, USB_PORT_FEAT_POWER, (uint8_t)port);
 
     usb_delay_ms((uint32_t)desc->power_on_to_good * 2 + USB_HUB_DEBOUNCE_MS);
 
-    for (uint8_t port = 1; port <= hub->hub_ports; port++) {
+    for (uint32_t loop = 1; loop <= hub->hub_ports; loop++) {
+        uint8_t port = (uint8_t)loop;
         struct UsbPortStatus st;
         if (!usb_hub_port_status(hub, port, &st))
             continue;
@@ -106,5 +114,30 @@ bool usb_hub_init(struct UsbDevice* hub) {
         if (usb_enumerate_device(hub->hc, hub, port, speed) == NULL)
             usb_hub_port_feature(hub, USB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_ENABLE, port);
     }
+
+    // Devices plugged in or pulled out later show up on its status change
+    // endpoint
+    usb_hotplug_watch_hub(hub);
     return true;
+}
+
+// A port's status, with every change bit it reports acknowledged.
+// false if the hub did not answer.
+bool usb_hub_port_status_ack(struct UsbDevice* hub, uint8_t port, struct UsbPortStatus* out) {
+    if (!usb_hub_port_status(hub, port, out))
+        return false;
+
+    static const uint16_t features[] = {
+        USB_PORT_FEAT_C_CONNECTION, USB_PORT_FEAT_C_ENABLE, USB_PORT_FEAT_C_SUSPEND,
+        USB_PORT_FEAT_C_OVER_CURRENT, USB_PORT_FEAT_C_RESET,
+    };
+    for (uint32_t i = 0; i < sizeof(features) / sizeof(features[0]); i++) {
+        if (out->change & (1U << (features[i] - USB_PORT_FEAT_C_CONNECTION)))
+            usb_hub_port_feature(hub, USB_REQ_CLEAR_FEATURE, features[i], port);
+    }
+    return true;
+}
+
+void usb_hub_disable_port(struct UsbDevice* hub, uint8_t port) {
+    usb_hub_port_feature(hub, USB_REQ_CLEAR_FEATURE, USB_PORT_FEAT_ENABLE, port);
 }

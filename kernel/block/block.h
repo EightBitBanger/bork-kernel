@@ -50,6 +50,11 @@ struct BlockDevice* block_register(const char* prefix, const struct BlockDeviceO
 struct BlockDevice* block_register_named(const char* name, const struct BlockDeviceOps* ops,
                                          void* driver_data, uint32_t sector_size, uint64_t sector_count);
 
+// Take a device out (its disk was unplugged). Unregister its partitions
+// (block_partition_remove_all) and detach its mounts first: the
+// BlockDevice is reused for the next device registered.
+void block_unregister(struct BlockDevice* dev);
+
 uint32_t            block_device_count(void);
 struct BlockDevice* block_get(uint32_t index);
 struct BlockDevice* block_find(const char* name);
@@ -62,5 +67,10 @@ bool block_write(struct BlockDevice* dev, uint64_t lba, uint32_t count, const vo
 bool block_flush(struct BlockDevice* dev);
 
 uint64_t block_capacity_bytes(const struct BlockDevice* dev);
+
+// Write zeroes to `count` sectors from `lba`. `progress`, if not NULL, is
+// called with 1..100 as the run goes. Bounds-checked like block_write.
+bool block_zero(struct BlockDevice* dev, uint64_t lba, uint64_t count,
+                void (*progress)(uint32_t percent));
 
 #endif

@@ -62,7 +62,7 @@ static void ehci_bios_handoff(const struct PCIDeviceInfo* pci, uint8_t eecp) {
                 uint64_t start = usb_time_ms();
                 while (pci_config_read(pci->bus, pci->dev, pci->func, eecp) & EHCI_LEGSUP_BIOS_OWNED) {
                     if (usb_time_ms() - start > 1000) {
-                        print("EHCI: BIOS did not release the controller\n");
+                        usb_print("EHCI: BIOS did not release the controller\n");
                         break;
                     }
                 }

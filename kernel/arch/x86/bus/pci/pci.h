@@ -85,6 +85,25 @@ void pci_init(void);
 // itself), using the same rules as the boot-time scan
 struct BlockDevice;
 void pci_mount_storage(struct BlockDevice* disk);
+// Same, printing nothing: for a disk rewritten while the desktop owns the
+// screen (SYS_FORMAT), where kernel console text would land on top of it
+void pci_mount_storage_quiet(struct BlockDevice* disk);
+// Same for a removable (USB) disk, printing nothing when `quiet` (plugged in
+// at run time). A disk whose partitions are all of unknown filesystems (a FAT
+// stick) is mounted whole as unformatted, so it shows up and can be formatted.
+void pci_mount_removable(struct BlockDevice* disk, bool quiet);
+
+// What the loader booted from, as far as the disks pci_init() mounted can
+// tell. The boot disk is found by its disk signature (see pci_storage.c).
+enum PciBootMedia {
+    PCI_BOOT_UNKNOWN,       // No boot area to compare with (booted by another loader)
+    PCI_BOOT_SYSTEM_DISK,   // A fixed (ATA / AHCI) disk, and home's /sys is on it
+    PCI_BOOT_MEDIA,         // A USB disk, a disk without the system on it (a stick
+                            // from build-image.sh, an install disk), or one the
+                            // kernel cannot reach
+};
+
+enum PciBootMedia pci_boot_media(void);
 
 //
 // Configuration space

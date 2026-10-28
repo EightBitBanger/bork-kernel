@@ -218,11 +218,6 @@ void mouse_event_handler(void) {
             return;
         }
         
-        // Extract button states
-        mouse_left_clicked   = (mouse_packet[0] & 0x01) ? true : false;
-        mouse_right_clicked  = (mouse_packet[0] & 0x02) ? true : false;
-        mouse_middle_clicked = (mouse_packet[0] & 0x04) ? true : false;
-        
         // Parse relative byte values
         int16_t rel_x = (uint8_t)mouse_packet[1];
         int16_t rel_y = (uint8_t)mouse_packet[2];
@@ -231,26 +226,38 @@ void mouse_event_handler(void) {
         if (mouse_packet[0] & 0x10) rel_x |= 0xFF00; // Bit 4 = X Sign
         if (mouse_packet[0] & 0x20) rel_y |= 0xFF00; // Bit 5 = Y Sign
         
-        // Update coordinates smoothly (1 pixel = 1 << 8 = 256 sub-pixel units)
-        // Multiplier scaling factor for speed tuning (1 = standard 1:1 mouse speed)
-        int32_t speed = 1; 
-        fixed_mouse_x += ((int32_t)rel_x * speed) << 8;
-        fixed_mouse_y -= ((int32_t)rel_y * speed) << 8; // Y axis is inverted in screen space
-        
-        // Screen boundary clamping
-        int32_t max_x = ((int32_t)display_get_width() << 8) - 1;
-        int32_t max_y = ((int32_t)display_get_height() << 8) - 1;
-        
-        if (fixed_mouse_x < 0) fixed_mouse_x = 0;
-        if (fixed_mouse_y < 0) fixed_mouse_y = 0;
-        if (fixed_mouse_x > max_x) fixed_mouse_x = max_x;
-        if (fixed_mouse_y > max_y) fixed_mouse_y = max_y;
-        
-        mouse_x = fixed_mouse_x >> 8;
-        mouse_y = fixed_mouse_y >> 8;
-        
-        mouse_enqueue_event(mouse_x, mouse_y, mouse_left_clicked, mouse_right_clicked, mouse_middle_clicked);
+        // Y axis is inverted in screen space
+        mouse_motion(rel_x, -(int32_t)rel_y, mouse_packet[0] & 0x07);
     }
+}
+
+// Relative motion in screen directions (+y down) and the button bits
+// (1 left, 2 right, 4 middle), from the PS/2 packet above or a USB mouse
+// report (usb_hid.c, which calls it with interrupts off)
+void mouse_motion(int32_t rel_x, int32_t rel_y, uint8_t buttons) {
+    mouse_left_clicked   = (buttons & 0x01) ? true : false;
+    mouse_right_clicked  = (buttons & 0x02) ? true : false;
+    mouse_middle_clicked = (buttons & 0x04) ? true : false;
+    
+    // Update coordinates smoothly (1 pixel = 1 << 8 = 256 sub-pixel units)
+    // Multiplier scaling factor for speed tuning (1 = standard 1:1 mouse speed)
+    int32_t speed = 1; 
+    fixed_mouse_x += (rel_x * speed) << 8;
+    fixed_mouse_y += (rel_y * speed) << 8;
+    
+    // Screen boundary clamping
+    int32_t max_x = ((int32_t)display_get_width() << 8) - 1;
+    int32_t max_y = ((int32_t)display_get_height() << 8) - 1;
+    
+    if (fixed_mouse_x < 0) fixed_mouse_x = 0;
+    if (fixed_mouse_y < 0) fixed_mouse_y = 0;
+    if (fixed_mouse_x > max_x) fixed_mouse_x = max_x;
+    if (fixed_mouse_y > max_y) fixed_mouse_y = max_y;
+    
+    mouse_x = fixed_mouse_x >> 8;
+    mouse_y = fixed_mouse_y >> 8;
+    
+    mouse_enqueue_event(mouse_x, mouse_y, mouse_left_clicked, mouse_right_clicked, mouse_middle_clicked);
 }
 
 

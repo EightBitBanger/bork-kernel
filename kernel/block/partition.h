@@ -77,12 +77,43 @@ bool block_mbr_write_single(struct BlockDevice* disk, uint8_t type, uint64_t sta
 bool block_install_boot_area(struct BlockDevice* disk, const uint8_t* image, uint32_t image_sectors,
                              uint8_t type, uint64_t data_start);
 
+// Write a partition table to `disk` holding exactly `entries` (`count` of
+// them, each placed in slot entry.number). Fails without writing anything
+// if a number is outside 1..4 or used twice, a type is empty, an entry
+// starts at sector 0, runs past the disk (or past what 32-bit MBR fields
+// hold) or overlaps another, or more than one is active.
+//
+// With `keep_code`, the boot code in front of the table is kept when sector
+// 0 already holds an MBR; otherwise it is zeroed. The disk keeps its own
+// signature, or gets a fresh one when it has none. Partition devices and
+// mounts on the disk are not touched: release them first and rescan after
+// when ranges change (fdisk).
+bool block_mbr_write(struct BlockDevice* disk, const struct MbrPartition* entries, uint8_t count,
+                     bool keep_code);
+
+// Give `disk` a fresh signature if its MBR has none or has `avoid` (the
+// boot disk's, for a disk that is about to become a copy of it). True if
+// the signature is fine as it is or was rewritten.
+bool block_mbr_renew_signature(struct BlockDevice* disk, uint32_t avoid);
+
 // Register a partition of `parent` as its own BlockDevice, named
 // "<parent>p<number>" ("ata0p1", "ahci0p2"). Calling it again for the same
-// range returns the existing device. Returns NULL if the range does not fit
-// the parent, starts at sector 0, or the parent is itself a partition.
+// number returns the existing device, moved to the new range if the table
+// changed (block devices are never unregistered, so a repartitioned disk
+// reuses them). Returns NULL if the range does not fit the parent, starts
+// at sector 0, or the parent is itself a partition.
 struct BlockDevice* block_partition_create(struct BlockDevice* parent, uint8_t number,
                                            uint64_t start, uint64_t count);
+
+// Cut every partition device of `disk` down to zero sectors, so all I/O on
+// them fails until a rescan (block_scan_disk) brings back the ones the new
+// table still has. For after the disk was wiped or repartitioned; release
+// their mounts first (vfs_device_release_disk).
+void block_partition_drop_all(struct BlockDevice* disk);
+
+// The disk is gone (unplugged): unregister every partition device on it.
+// Detach their mounts first (vfs_device_remove_disk).
+void block_partition_remove_all(struct BlockDevice* disk);
 
 // The disk a partition lives on, or NULL if `dev` is not a partition
 struct BlockDevice* block_partition_parent(const struct BlockDevice* dev);
@@ -99,16 +130,17 @@ uint64_t block_partition_start(const struct BlockDevice* dev);
 //   2. Sector 0 holds an MBR: one partition device per usable entry whose
 //      type accepts() takes, never the disk itself, so nothing mounted can overwrite the
 //      table or the boot code and kernel in front of the first partition.
-//   3. Anything else (blank, unformatted, unreadable): the disk itself, so
-//      it can be formatted as a whole-disk volume, exactly as before.
+//   3. Anything else (blank, unformatted, unreadable, or an MBR with no
+//      entries at all): the disk itself, so it can be formatted as a
+//      whole-disk volume or partitioned again.
 //
 // mount() is called once per device to mount, in that order.
 
 typedef enum {
     BLOCK_SCAN_WHOLE_VOLUME,    // Case 1: disk mounted whole, it holds a volume
-    BLOCK_SCAN_WHOLE_BLANK,     // Case 3: disk mounted whole, nothing recognized
+    BLOCK_SCAN_WHOLE_BLANK,     // Case 3: disk mounted whole, nothing recognized or an empty table
     BLOCK_SCAN_PARTITIONS,      // Case 2: at least one partition mounted
-    BLOCK_SCAN_NO_PARTITIONS,   // Case 2, but no usable accepted entry: nothing mounted
+    BLOCK_SCAN_NO_PARTITIONS,   // Case 2, entries but no usable accepted one: nothing mounted
     BLOCK_SCAN_ERROR            // Bad arguments, or partition devices could not be registered
 } BlockScanResult;
 

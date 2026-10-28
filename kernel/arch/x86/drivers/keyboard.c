@@ -122,8 +122,14 @@ uint16_t kb_getc(void) {
     }
     
     // Read the scan code byte from the PS/2 Data Port (Port 0x60)
-    uint8_t scancode = inb(0x60);
-    
+    return kb_decode_scancode(inb(0x60));
+}
+
+// One Scan Code Set 1 byte, from the PS/2 port or translated from a USB
+// keyboard report (usb_hid.c). Prefix bytes are remembered between calls,
+// so the bytes of one key must not interleave with another source's: USB
+// feeds its keys with interrupts off.
+uint16_t kb_decode_scancode(uint8_t scancode) {
     // Pause sends E1 1D 45 E1 9D C5 and nothing on release. Swallow it, so
     // its 1D / 9D don't press and release Left Ctrl.
     if (kb_e1_skip > 0) {
@@ -174,6 +180,10 @@ uint16_t kb_getc(void) {
     
     if (is_break) {
         current_character = 0x00;
+        // The last Alt key let go: reported (SYS_KEY_ALT_UP, Alt's scancode
+        // << 8 like the other keys), so the desktop can end an Alt+Tab
+        if (scancode == 0x38 && !kb_alt_down())
+            return (uint16_t)(0x38 << 8);
         return 0;
     }
     

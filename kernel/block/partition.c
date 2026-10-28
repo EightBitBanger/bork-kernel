@@ -26,6 +26,7 @@ struct BlockPartition {
     struct BlockDevice* parent;
     uint64_t start;
     uint64_t count;
+    uint8_t  number;    // Table slot, also the name suffix
     bool     used;
 };
 
@@ -102,12 +103,20 @@ struct BlockDevice* block_partition_create(struct BlockDevice* parent, uint8_t n
     if (start == 0 || count == 0 || start >= parent->sector_count || count > parent->sector_count - start)
         return NULL;    // Sector 0 holds the table; the rest must fit the disk
 
-    // Same range again (a second bus scan): hand back the existing device
+    // Same slot again (a second scan, or the table was rewritten): hand back
+    // the existing device, moved to the range the table has now
     struct BlockPartition* slot = NULL;
     for (uint32_t i = 0; i < BLOCK_DEVICE_MAX; i++) {
         struct BlockPartition* p = &partitions[i];
-        if (p->used && p->parent == parent && p->start == start && p->count == count)
-            return block_find_driver(p);
+        if (p->used && p->parent == parent && p->number == number) {
+            struct BlockDevice* dev = block_find_driver(p);
+            if (dev == NULL)
+                return NULL;
+            p->start          = start;
+            p->count          = count;
+            dev->sector_count = count;
+            return dev;
+        }
         if (!p->used && slot == NULL)
             slot = p;
     }
@@ -121,6 +130,7 @@ struct BlockDevice* block_partition_create(struct BlockDevice* parent, uint8_t n
     slot->parent = parent;
     slot->start  = start;
     slot->count  = count;
+    slot->number = number;
     slot->used   = true;
 
     struct BlockDevice* dev = block_register_named(name, &partition_ops, slot,
@@ -128,6 +138,31 @@ struct BlockDevice* block_partition_create(struct BlockDevice* parent, uint8_t n
     if (dev == NULL)
         slot->used = false;
     return dev;
+}
+
+void block_partition_drop_all(struct BlockDevice* disk) {
+    for (uint32_t i = 0; i < BLOCK_DEVICE_MAX; i++) {
+        struct BlockPartition* p = &partitions[i];
+        if (!p->used || p->parent != disk)
+            continue;
+        struct BlockDevice* dev = block_find_driver(p);
+        p->count = 0;
+        if (dev != NULL)
+            dev->sector_count = 0;
+    }
+}
+
+void block_partition_remove_all(struct BlockDevice* disk) {
+    for (uint32_t i = 0; i < BLOCK_DEVICE_MAX; i++) {
+        struct BlockPartition* p = &partitions[i];
+        if (!p->used || p->parent != disk)
+            continue;
+        struct BlockDevice* dev = block_find_driver(p);
+        if (dev != NULL)
+            block_unregister(dev);
+        p->used = false;
+        p->parent = NULL;
+    }
 }
 
 //
@@ -275,6 +310,81 @@ bool block_mbr_write_single(struct BlockDevice* disk, uint8_t type, uint64_t sta
     return block_write(disk, 0, 1, scan_buffer) && block_flush(disk);
 }
 
+bool block_mbr_write(struct BlockDevice* disk, const struct MbrPartition* entries, uint8_t count,
+                     bool keep_code) {
+    if (disk == NULL || block_partition_parent(disk) != NULL || disk->sector_size != MBR_SECTOR_SIZE)
+        return false;
+    if (count > MBR_PARTITION_COUNT || (count > 0 && entries == NULL))
+        return false;
+
+    uint8_t active = 0;
+    for (uint8_t a = 0; a < count; a++) {
+        const struct MbrPartition* e = &entries[a];
+        if (e->number < 1 || e->number > MBR_PARTITION_COUNT || e->type == MBR_TYPE_EMPTY)
+            return false;
+        if (e->start == 0 || e->count == 0 || e->start >= disk->sector_count ||
+            e->count > disk->sector_count - e->start ||
+            e->start > 0xFFFFFFFFULL || e->count > 0xFFFFFFFFULL)
+            return false;
+        if (e->active)
+            active++;
+        for (uint8_t b = 0; b < a; b++) {
+            const struct MbrPartition* f = &entries[b];
+            if (f->number == e->number)
+                return false;
+            if (e->start < f->start + f->count && f->start < e->start + e->count)
+                return false;
+        }
+    }
+    if (active > 1)
+        return false;
+
+    struct MbrPartition old[MBR_PARTITION_COUNT];
+    uint8_t old_count;
+    if (!block_read(disk, 0, 1, scan_buffer))
+        return false;
+    bool is_mbr = block_mbr_parse(scan_buffer, disk->sector_count, old, &old_count);
+    uint32_t signature = is_mbr ? block_mbr_signature(scan_buffer) : 0;
+    if (signature == 0)
+        signature = mbr_new_signature(disk, scan_buffer, 0);
+    if (!is_mbr || !keep_code) {
+        for (uint32_t i = 0; i < MBR_SECTOR_SIZE; i++)
+            scan_buffer[i] = 0;
+    }
+
+    for (uint32_t i = MBR_TABLE_OFFSET; i < 510; i++)
+        scan_buffer[i] = 0;
+    mbr_put_le32(scan_buffer + MBR_SIGNATURE_OFFSET, signature);
+    for (uint8_t a = 0; a < count; a++) {
+        const struct MbrPartition* p = &entries[a];
+        uint8_t* e = &scan_buffer[MBR_TABLE_OFFSET + (p->number - 1) * MBR_ENTRY_SIZE];
+        e[0] = p->active ? MBR_STATUS_ACTIVE : 0x00;
+        e[1] = 0xFE; e[2] = 0xFF; e[3] = 0xFF;      // CHS start: "use LBA"
+        e[4] = p->type;
+        e[5] = 0xFE; e[6] = 0xFF; e[7] = 0xFF;      // CHS end: "use LBA"
+        mbr_put_le32(e + 8,  (uint32_t)p->start);
+        mbr_put_le32(e + 12, (uint32_t)p->count);
+    }
+    scan_buffer[510] = 0x55;
+    scan_buffer[511] = 0xAA;
+
+    return block_write(disk, 0, 1, scan_buffer) && block_flush(disk);
+}
+
+bool block_mbr_renew_signature(struct BlockDevice* disk, uint32_t avoid) {
+    if (disk == NULL || disk->sector_size != MBR_SECTOR_SIZE || !block_read(disk, 0, 1, scan_buffer))
+        return false;
+    if (scan_buffer[510] != 0x55 || scan_buffer[511] != 0xAA)
+        return false;
+
+    uint32_t signature = block_mbr_signature(scan_buffer);
+    if (signature != 0 && signature != avoid)
+        return true;
+
+    mbr_put_le32(scan_buffer + MBR_SIGNATURE_OFFSET, mbr_new_signature(disk, scan_buffer, avoid));
+    return block_write(disk, 0, 1, scan_buffer) && block_flush(disk);
+}
+
 #define INSTALL_CHUNK_SECTORS  64
 
 bool block_install_boot_area(struct BlockDevice* disk, const uint8_t* image, uint32_t image_sectors,
@@ -369,12 +479,18 @@ struct BlockScanReport block_scan_disk(struct BlockDevice* disk, block_type_fn a
 
         if (report.mounted > 0)
             report.result = BLOCK_SCAN_PARTITIONS;
-        else
-            report.result = registration_failed ? BLOCK_SCAN_ERROR : BLOCK_SCAN_NO_PARTITIONS;
-        return report;
+        else if (registration_failed)
+            report.result = BLOCK_SCAN_ERROR;
+        else if (entries > 0)
+            report.result = BLOCK_SCAN_NO_PARTITIONS;
+        if (entries > 0 || registration_failed)
+            return report;
+        // An empty table (every partition deleted): fall through and mount
+        // the blank disk, so it still shows in /mnt
     }
 
-    // 3. Blank, unformatted or unreadable: the whole disk, so it can be formatted
+    // 3. Blank, unformatted, unreadable or an empty table: the whole disk,
+    //    so it can be formatted or partitioned
     mount(disk, arg);
     report.result  = BLOCK_SCAN_WHOLE_BLANK;
     report.mounted = 1;

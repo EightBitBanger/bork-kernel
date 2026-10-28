@@ -32,6 +32,23 @@ static bool storage_mounting_boot_disk = false;
 // First disk found with the boot disk's signature
 static struct BlockDevice* storage_boot_disk = NULL;
 
+// Whether that disk was mounted as a removable one (USB)
+static bool storage_boot_disk_removable = false;
+
+// Set while mounting a disk plugged in at run time, when the desktop may
+// own the screen: nothing is printed then
+static bool storage_quiet = false;
+
+// Set while mounting a removable disk (USB): one whose partitions are all of
+// filesystems the VFS doesn't know (an NTFS or exFAT stick) is mounted
+// whole, as unformatted, so it still shows in /mnt and can be formatted. A
+// fixed disk like that (another OS) stays out of /mnt.
+static bool storage_removable = false;
+
+static void storage_print(const char* text) {
+    if (!storage_quiet) print(text);
+}
+
 // Sector 0 of a disk being checked. Static, so DMA drivers can reach it.
 static uint8_t storage_sector0[4096] __attribute__((aligned(16)));
 
@@ -78,27 +95,31 @@ static void pci_mount_block_device(struct BlockDevice* device, void* mnt_dir, st
     bool remounted = false;
     struct FsMount* mount = vfs_mount_device(device, mnt_dir, &remounted);
     if (mount == NULL) {
-        print("Storage Error: out of memory mounting ");
-        print(device->name);
-        print("\n");
+        storage_print("Storage Error: out of memory mounting ");
+        storage_print(device->name);
+        storage_print("\n");
         return;
     }
 
     vfs_lock();
     bool open = mount->is_open;
+    // Home and the program path only on a filesystem that keeps security
+    // masks: on one that cannot (FAT) the system files would be open to
+    // every program, and any stick with a bin folder could take over the path
+    bool system_capable = mount->type->set_security != NULL;
     vfs_unlock();
 
     // An unformatted disk still mounts (so it can be formatted), but has no
     // bin or sys folders to offer
-    if (open)
+    if (open && system_capable)
         pci_setup_storage_paths(device->name, fs_paths);
 
     if (remounted)
-        print(open ? "Remounted " : "Remounted (unformatted) ");
+        storage_print(open ? "Remounted " : "Remounted (unformatted) ");
     else
-        print(open ? "Mounted " : "Mounted (unformatted) ");
-    print(device->name);
-    print("\n");
+        storage_print(open ? "Mounted " : "Mounted (unformatted) ");
+    storage_print(device->name);
+    storage_print("\n");
 }
 
 struct PciMountArgs {
@@ -157,11 +178,12 @@ static void pci_mount_disk(struct BlockDevice* disk, void* mnt_dir, struct Local
     if (is_boot_disk) {
         if (storage_boot_disk == NULL) {
             storage_boot_disk = disk;
+            storage_boot_disk_removable = storage_removable;
         } else if (storage_boot_disk != disk) {
-            print(disk->name);
-            print(": same disk signature as ");
-            print(storage_boot_disk->name);
-            print(", not used as the boot disk\n");
+            storage_print(disk->name);
+            storage_print(": same disk signature as ");
+            storage_print(storage_boot_disk->name);
+            storage_print(", not used as the boot disk\n");
             is_boot_disk = false;
         }
     }
@@ -174,19 +196,23 @@ static void pci_mount_disk(struct BlockDevice* disk, void* mnt_dir, struct Local
 
     switch (report.result) {
         case BLOCK_SCAN_NO_PARTITIONS:
-            print(disk->name);
-            print(": partition table has no partitions of a known filesystem, not mounted\n");
+            if (storage_removable) {
+                pci_mount_block_device(disk, mnt_dir, fs_paths);
+                break;
+            }
+            storage_print(disk->name);
+            storage_print(": partition table has no partitions of a known filesystem, not mounted\n");
             break;
         case BLOCK_SCAN_ERROR:
-            print(disk->name);
-            print(": could not register its partitions\n");
+            storage_print(disk->name);
+            storage_print(": could not register its partitions\n");
             break;
         default:
             break;
     }
     if (report.skipped > 0) {
-        print(disk->name);
-        print(": skipped a partition that does not fit the disk\n");
+        storage_print(disk->name);
+        storage_print(": skipped a partition that does not fit the disk\n");
     }
 }
 
@@ -233,7 +259,7 @@ void pci_storage_probe_ide(const struct PCIDeviceInfo* info, struct PCIScanConte
     for (uint8_t i = first_new; i < total; i++) {
         struct BlockDevice* device = ata_create_block_device(ata_get_device(i));
         if (device == NULL) {
-            print("ATA Error: could not register disk\n");
+            storage_print("ATA Error: could not register disk\n");
             continue;
         }
         pci_mount_disk(device, ctx->mnt_dir, ctx->fs_paths);
@@ -268,8 +294,9 @@ void pci_storage_probe_ahci(const struct PCIDeviceInfo* info, struct PCIScanCont
     }
 }
 
-// Mount whatever `disk` holds now, from a running kernel (after "boot
-// install" rewrote it). Same rules as the boot-time scan.
+// Mount whatever `disk` holds now, from a running kernel (after fdisk,
+// format or "boot install" rewrote it). Same rules as the boot-time scan;
+// mounts of the disk the scan did not bring back are removed from /mnt.
 void pci_mount_storage(struct BlockDevice* disk) {
     void* mnt_directory = knode_find_by_name(knode_get_root(), "mnt");
     if (disk == NULL || mnt_directory == NULL)
@@ -278,5 +305,30 @@ void pci_mount_storage(struct BlockDevice* disk) {
     struct LocalPaths fs_paths;
     kernel_get_local_paths(&fs_paths);
     pci_mount_disk(disk, mnt_directory, &fs_paths);
+    vfs_device_prune_disk(disk);
     kernel_set_local_paths(&fs_paths);
+}
+
+void pci_mount_storage_quiet(struct BlockDevice* disk) {
+    storage_quiet = true;
+    pci_mount_storage(disk);
+    storage_quiet = false;
+}
+
+void pci_mount_removable(struct BlockDevice* disk, bool quiet) {
+    storage_quiet = quiet;
+    storage_removable = true;
+    pci_mount_storage(disk);
+    storage_removable = false;
+    storage_quiet = false;
+}
+
+// Rank 3 is only ever given to a device of the boot disk, so it says home's
+// /sys is on that disk. Hotplugged disks never reach rank 3 ahead of it.
+enum PciBootMedia pci_boot_media(void) {
+    if (pci_boot_disk_signature() == 0)
+        return PCI_BOOT_UNKNOWN;
+    if (storage_boot_disk == NULL || storage_boot_disk_removable || storage_home_rank != 3)
+        return PCI_BOOT_MEDIA;
+    return PCI_BOOT_SYSTEM_DISK;
 }

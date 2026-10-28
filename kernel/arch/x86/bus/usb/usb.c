@@ -13,6 +13,28 @@ static uint32_t controllers_started = 0;
 
 static struct UsbDevice* devices[USB_MAX_DEVICES];
 static uint32_t device_total = 0;
+static mutex_t device_list_lock;            // devices[] against lsusb while hot plugging
+static bool device_list_ready = false;
+
+// Messages go to the boot console only. Once the desktop runs, text printed
+// to the screen would land on top of it.
+static bool usb_quiet = false;
+
+void usb_print(const char* text) {
+    if (!usb_quiet) print(text);
+}
+
+void usb_print_hex16(uint16_t value) {
+    if (!usb_quiet) print_hex16(value);
+}
+
+void usb_print_int(int32_t value) {
+    if (!usb_quiet) print_int(value);
+}
+
+bool usb_is_quiet(void) {
+    return usb_quiet;
+}
 
 //
 // Helpers
@@ -90,17 +112,15 @@ void usb_pci_probe(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx)
     const struct UsbHcdOps* ops = NULL;
     switch (info->prog_if) {
         case PCI_USB_UHCI: ops = &uhci_ops; break;
+        case PCI_USB_OHCI: ops = &ohci_ops; break;
         case PCI_USB_XHCI: ops = &xhci_ops; break;
         case PCI_USB_EHCI: break;   // Handled in usb_init()
-        case PCI_USB_OHCI:
-            print("USB: OHCI controller not supported, skipped\n");
-            return;
         default:
             return;     // USB device side, or not a host controller
     }
 
     if (controller_slots >= USB_MAX_CONTROLLERS) {
-        print("USB: too many host controllers, one skipped\n");
+        usb_print("USB: too many host controllers, one skipped\n");
         return;
     }
 
@@ -130,9 +150,9 @@ static void usb_start_controller(struct UsbController* hc) {
 
     if (!hc->ops->start(hc)) {
         mutex_unlock(&hc->lock);
-        print("USB: ");
-        print(hc->ops->name);
-        print(" controller did not start\n");
+        usb_print("USB: ");
+        usb_print(hc->ops->name);
+        usb_print(" controller did not start\n");
         return;
     }
     hc->started = true;
@@ -144,11 +164,30 @@ static void usb_start_controller(struct UsbController* hc) {
             usb_enumerate_device(hc, NULL, port, speed);
     }
 
+    // Start hot plug tracking from here: connect changes so far are the
+    // devices just enumerated
+    for (uint8_t port = 1; port <= hc->port_count; port++) {
+        bool connected;
+        hc->ops->port_changed(hc, port, &connected);
+    }
+
     mutex_unlock(&hc->lock);
 }
 
 void usb_init(void) {
-    uint32_t devices_before = device_total;
+    if (!device_list_ready) {
+        mutex_init(&device_list_lock);
+        device_list_ready = true;
+    }
+
+    // A blank line between the storage messages of the PCI scan and the
+    // USB ones, when there is something new to start
+    for (uint32_t i = 0; i < controller_slots; i++) {
+        if (!controllers[i].started) {
+            usb_print("\n");
+            break;
+        }
+    }
 
     // EHCI first: until its ports are routed to the companion controllers,
     // high-speed capable ports are invisible to them
@@ -166,13 +205,23 @@ void usb_init(void) {
             usb_start_controller(hc);
     }
 
-    if (device_total != devices_before) {
-        char count[12];
-        utos(device_total - devices_before, count);
-        print("USB: ");
-        print(count);
-        print(device_total - devices_before == 1 ? " device found\n" : " devices found\n");
+    // Disks found above get their /mnt entries (with no controller locked)
+    usb_storage_service();
+
+    // From here on devices come and go at run time: quietly
+    if (controllers_started > 0) {
+        usb_quiet = true;
+        usb_hotplug_start();
     }
+}
+
+struct UsbController* usb_get_controller(uint32_t index) {
+    for (uint32_t i = 0; i < controller_slots; i++) {
+        struct UsbController* hc = &controllers[i];
+        if (hc->ops != NULL && hc->started && hc->index == index)
+            return hc;
+    }
+    return NULL;
 }
 
 //
@@ -180,11 +229,37 @@ void usb_init(void) {
 //
 
 bool usb_register_device(struct UsbDevice* dev) {
-    if (device_total >= USB_MAX_DEVICES)
+    usb_device_list_lock();
+    if (device_total >= USB_MAX_DEVICES) {
+        usb_device_list_unlock();
         return false;
+    }
     devices[device_total++] = dev;
+    usb_device_list_unlock();
+
     usb_export_device(dev);
     return true;
+}
+
+void usb_unregister_device(struct UsbDevice* dev) {
+    usb_device_list_lock();
+    for (uint32_t i = 0; i < device_total; i++) {
+        if (devices[i] != dev)
+            continue;
+        for (; i + 1 < device_total; i++)
+            devices[i] = devices[i + 1];
+        devices[--device_total] = NULL;
+        break;
+    }
+    usb_device_list_unlock();
+}
+
+void usb_device_list_lock(void) {
+    if (device_list_ready) mutex_lock(&device_list_lock);
+}
+
+void usb_device_list_unlock(void) {
+    if (device_list_ready) mutex_unlock(&device_list_lock);
 }
 
 uint32_t usb_device_count(void) {
