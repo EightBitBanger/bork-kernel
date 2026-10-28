@@ -26,6 +26,7 @@ int console_cmd_help(int arg_count, char** args) {
         }
         print("\n");
     }
+    console_command_end();
     return 0;
 }
 

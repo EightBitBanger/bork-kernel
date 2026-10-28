@@ -80,6 +80,15 @@ static inline uint32_t align_page_up(uint32_t value);
 // memory map. Physical addresses; works with paging off.
 static bool boot_memory_usable(struct MultibootInfo* mbi, uint32_t start, uint32_t size);
 
+// The first Multiboot module called `name` (see boot_module_named), or NULL
+static struct MultibootModule* boot_find_module(struct MultibootInfo* mbi, const char* name);
+
+// Move `module` to *end and advance *end past it (page aligned). Returns
+// the new address, or 0 if it is empty or there is no usable RAM there.
+static uint32_t boot_keep_module(struct MultibootInfo* mbi, struct MultibootModule* module, uint32_t* end);
+
+static bool boot_ranges_overlap(uint32_t a, uint32_t a_size, uint32_t b, uint32_t b_size);
+
 
 void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC)
@@ -119,19 +128,42 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     
     uint32_t _kernel_memory_end      = align_page_up(back_buffer + back_buffer_bytes);
     
-    // Keep the boot area module from stage 2 (MBR, stage 2, kernel file) for
-    // "boot install". Where the loader left it, the back buffer or the PMM
-    // may reuse it, so move it right after everything reserved above and
-    // reserve it too. Paging is still off: all of this is physical memory.
+    // Keep the modules the loader handed over. Where the loader left them,
+    // the back buffer or the PMM may reuse them, so move them right after
+    // everything reserved above and reserve them too. Paging is still off:
+    // all of this is physical memory.
+    //
+    //   "bootarea"  from stage 2: MBR, stage 2, kernel file and asset archive
+    //               as read off the boot disk, for "boot install"
+    //   "assets"    the asset archive "boot install" / "boot repair" extract.
+    //               From stage 2 it lies inside the boot area and moves with
+    //               it; from GRUB it is a file of its own
     if ((mbi->flags & MULTIBOOT_INFO_MODS) && mbi->mods_count > 0) {
-        struct MultibootModule* module = (struct MultibootModule*)mbi->mods_addr;
-        uint32_t size = module->mod_end - module->mod_start;
-        uint32_t copy = _kernel_memory_end;
+        struct MultibootModule* area   = boot_find_module(mbi, "bootarea");
+        struct MultibootModule* assets = boot_find_module(mbi, "assets");
         
-        if (module->mod_end > module->mod_start && boot_memory_usable(mbi, copy, size)) {
-            memmove((void*)copy, (const void*)module->mod_start, size);   // Ranges may overlap
-            boot_image_set(copy, size);
-            _kernel_memory_end = align_page_up(copy + size);
+        uint32_t area_copy = 0;
+        if (area != NULL) {
+            area_copy = boot_keep_module(mbi, area, &_kernel_memory_end);
+            if (area_copy != 0)
+                boot_image_set(area_copy, area->mod_end - area->mod_start);
+        }
+        
+        if (assets != NULL && assets->mod_end > assets->mod_start) {
+            uint32_t size = assets->mod_end - assets->mod_start;
+            bool inside = (area != NULL && assets->mod_start >= area->mod_start &&
+                           assets->mod_end <= area->mod_end);
+            
+            if (inside) {
+                if (area_copy != 0)
+                    boot_assets_set(area_copy + (assets->mod_start - area->mod_start), size);
+            } else if (area_copy == 0 || !boot_ranges_overlap(assets->mod_start, size, area_copy,
+                                                              area->mod_end - area->mod_start)) {
+                // (A separate archive the boot area copy landed on is lost)
+                uint32_t copy = boot_keep_module(mbi, assets, &_kernel_memory_end);
+                if (copy != 0)
+                    boot_assets_set(copy, size);
+            }
         }
     }
     
@@ -259,6 +291,12 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     kernel_get_local_paths(&paths);
     kernel_set_working_directory(paths.home);
     
+    // Booted from a USB stick or an install disk: stay on the console (to
+    // install or repair a system), the desktop only starts from the system
+    // disk. Without a boot area (another loader) there is nothing to tell
+    // them apart, and the desktop starts as before.
+    bool start_desktop = (pci_boot_media() != PCI_BOOT_MEDIA);
+    
     //
     // Load the registry
     
@@ -275,23 +313,25 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
         // Load registry hives
         registry_hive_initiate(sys_path);
         
-        // Launch the dwm with executive level permissions (admin + file)
-        strncat(sys_path, "/dwm", sizeof(sys_path));
-        char* args[] = { sys_path, NULL };
-        
-        uint32_t proc_sec = SYS_SEC_FILE_RW | SYS_SEC_ADMIN | SYS_SEC_CONSOLE | 
-                            SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | 
-                            SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_EXEC;
-        
-        // Ctrl+C belongs to the desktop's programs (Copy), so it must not
-        // kill the dwm the way it kills a program typed at the prompt
-        console_cmd_execute(1, args, proc_sec, CONSOLE_THREAD_BLOCK | CONSOLE_THREAD_NO_BREAK);
+        // Launch the dwm with executive level permissions (admin + file).
+        // SYS_SEC_ELEVATE is only there to be handed down: programs started
+        // from the desktop may ask the user for admin, and the dwm is the
+        // one that shows them the prompt (SYS_ELEVATE_AGENT).
+        if (start_desktop) {
+            strncat(sys_path, "/dwm", sizeof(sys_path) - strlen(sys_path) - 1);
+            char* args[] = { sys_path, NULL };
+            
+            uint32_t proc_sec = SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
+                                SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | 
+                                SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_EXEC |
+                                SYS_SEC_ELEVATE;
+            
+            console_cmd_execute(1, args, proc_sec, CONSOLE_THREAD_BLOCK | CONSOLE_THREAD_NO_BREAK);
+        }
     }
     
     //
     // TODOs
-    
-    // TODO scalable vector font or MSDF
     
     // TODO key combination binding
     
@@ -330,6 +370,67 @@ static bool boot_memory_usable(struct MultibootInfo* mbi, uint32_t start, uint32
         addr += e->size + sizeof(e->size);
     }
     return false;
+}
+
+// A module's string is its command line: stage 2 passes "bootarea" and
+// "assets", GRUB the path and any words after it ("/boot/assets.tar" or
+// "/boot/assets.tar assets"). Any word equal to `name`, or a path whose
+// file name is "<name>.tar", matches.
+static bool boot_module_named(const char* string, const char* name) {
+    size_t name_len = strlen(name);
+    const char* p = string;
+    
+    while (*p != '\0') {
+        while (*p == ' ')
+            p++;
+        const char* word = p;
+        while (*p != '\0' && *p != ' ')
+            p++;
+        size_t len = (size_t)(p - word);
+        if (len == 0)
+            break;
+        
+        if (len == name_len && strncmp(word, name, name_len) == 0)
+            return true;
+        
+        // File name of a path
+        const char* file = word;
+        for (const char* c = word; c < p; c++) {
+            if (*c == '/')
+                file = c + 1;
+        }
+        size_t file_len = (size_t)(p - file);
+        if (file_len == name_len + 4 && strncmp(file, name, name_len) == 0 &&
+            strncmp(file + name_len, ".tar", 4) == 0)
+            return true;
+    }
+    return false;
+}
+
+static struct MultibootModule* boot_find_module(struct MultibootInfo* mbi, const char* name) {
+    struct MultibootModule* modules = (struct MultibootModule*)mbi->mods_addr;
+    for (uint32_t i = 0; i < mbi->mods_count; i++) {
+        if (modules[i].string != 0 && boot_module_named((const char*)modules[i].string, name))
+            return &modules[i];
+    }
+    return NULL;
+}
+
+static uint32_t boot_keep_module(struct MultibootInfo* mbi, struct MultibootModule* module, uint32_t* end) {
+    if (module->mod_end <= module->mod_start)
+        return 0;
+    uint32_t size = module->mod_end - module->mod_start;
+    uint32_t copy = *end;
+    if (!boot_memory_usable(mbi, copy, size))
+        return 0;
+    
+    memmove((void*)copy, (const void*)module->mod_start, size);   // Ranges may overlap
+    *end = align_page_up(copy + size);
+    return copy;
+}
+
+static bool boot_ranges_overlap(uint32_t a, uint32_t a_size, uint32_t b, uint32_t b_size) {
+    return (uint64_t)a < (uint64_t)b + b_size && (uint64_t)b < (uint64_t)a + a_size;
 }
 
 static inline uint32_t align_page_up(uint32_t value) {

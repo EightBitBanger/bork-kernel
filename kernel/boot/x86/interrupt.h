@@ -33,6 +33,10 @@ void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags);
 // Signaled by the keyboard and mouse IRQs whenever new input arrives
 extern Event input_event;
 
+// Queue a key code for the consumers. IRQ handlers, or a thread with
+// interrupts off (the queue has one producer at a time).
+void input_key_push(uint16_t key);
+
 // Pop one queued key code (as returned by kb_getc). Thread context only;
 // safe with several consumer threads. Returns false when the queue is empty.
 bool input_key_pop(uint16_t* key);

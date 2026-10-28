@@ -16,6 +16,11 @@
 //
 // Return 0 on success, anything else on failure.
 //
+// Output style: a command ends its output with one blank line before the
+// prompt comes back, by calling console_command_end() on every way out
+// (cls excepted: it leaves a clear screen). The console adds no line
+// breaks of its own after a command.
+//
 // Adding a command: write console/commands/<name>.h, include it in
 // console/command.c, add an id below (before CONSOLE_CMD_COUNT) and a row
 // to the table there.
@@ -40,11 +45,20 @@ typedef enum {
     CONSOLE_CMD_REMOVE,
     CONSOLE_CMD_RENAME,
     CONSOLE_CMD_COPY,
+    CONSOLE_CMD_CHMOD,
     CONSOLE_CMD_TYPE,
+    CONSOLE_CMD_CAT,
+    CONSOLE_CMD_GREP,
+    CONSOLE_CMD_WC,
+    CONSOLE_CMD_ECHO,
     CONSOLE_CMD_FORMAT,
+    CONSOLE_CMD_FDISK,
     CONSOLE_CMD_CHKDSK,
     CONSOLE_CMD_BOOT,
     CONSOLE_CMD_LSUSB,
+    CONSOLE_CMD_LSBLK,
+    CONSOLE_CMD_PS,
+    CONSOLE_CMD_KILL,
 
     CONSOLE_CMD_COUNT
 } ConsoleCommandId;
@@ -76,5 +90,9 @@ const ConsoleCommand* console_command_get(uint32_t index);
 // CONSOLE_CMD_EXECUTE starts the program as a process and blocks until it
 // ends (Ctrl+C kills it), so call it from the console thread only.
 int console_command_run(ConsoleCommandId id, char** args);
+
+// End a command's output: finish the last line if it was left open, then
+// one blank line before the prompt
+void console_command_end(void);
 
 #endif

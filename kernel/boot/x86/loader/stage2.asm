@@ -11,6 +11,9 @@
 %ifndef KERNEL_SECTORS
   %error "KERNEL_SECTORS must be defined"
 %endif
+%ifndef ASSETS_SECTORS
+  %define ASSETS_SECTORS 0      ; No asset archive behind the kernel
+%endif
 
 ;
 ; Low memory layout. Everything the kernel reads (the info structure, the
@@ -28,10 +31,13 @@ BOUNCE_SEG      equ 0x2000      ; Disk bounce buffer: 0x20000 - 0x27FFF
 BOUNCE_LINEAR   equ 0x20000
 CHUNK_SECTORS   equ 64          ; 32 KB per read, never crosses a 64 KB boundary
 
-STAGING         equ 0x01000000  ; Boot area (LBA 0 .. end of kernel) is staged here
+STAGING         equ 0x01000000  ; Boot area (LBA 0 .. end of the asset archive) is staged here
 KERNEL_IMAGE    equ STAGING + KERNEL_LBA * 512  ; The kernel file inside it
-BOOT_AREA_BYTES equ (KERNEL_LBA + KERNEL_SECTORS) * 512
-MODS            equ 0x1D00      ; One multiboot_module entry (16 bytes)
+ASSETS_LBA      equ KERNEL_LBA + KERNEL_SECTORS ; Asset archive (ustar), right behind the kernel
+ASSETS_IMAGE    equ STAGING + ASSETS_LBA * 512
+BOOT_AREA_BYTES equ (ASSETS_LBA + ASSETS_SECTORS) * 512
+MODS            equ 0x1D00      ; Two multiboot_module entries (16 bytes each)
+MODS_MAX        equ 2
 HEADER_SEARCH   equ 8192        ; Multiboot header must lie in the first 8 KB
 
 ; Multiboot info offsets (Multiboot 1 spec, section 3.3)
@@ -88,14 +94,14 @@ stage2_entry:
 
     ; Clear the info structure and the memory map
     mov     di, MBI
-    mov     cx, (MODS + 16 - MBI) / 2
+    mov     cx, (MODS + MODS_MAX * 16 - MBI) / 2
     xor     ax, ax
     rep     stosw
 
     call    enable_a20
     call    detect_memory
     call    check_staging_fits
-    call    load_kernel_file
+    call    load_boot_area
 
     ; Place the kernel image (32-bit code, run through protected mode)
     mov     dword [pm_target], place_kernel32
@@ -118,14 +124,25 @@ stage2_entry:
     mov     [MBI + MBI_BOOT_DEVICE], eax
     mov     dword [MBI + MBI_LOADER_NAME], loader_name
 
-    ; Module 0: the raw boot area (MBR, stage 2, kernel file) as read from
-    ; this disk, so a running kernel can install itself onto another one
+    ; Module 0: the raw boot area (MBR, stage 2, kernel file, asset archive)
+    ; as read from this disk, so a running kernel can install itself onto
+    ; another one. This is also how the archive reaches memory when booting
+    ; from a USB stick: the BIOS reads the stick here (INT 13h emulates it
+    ; as a hard disk), the kernel never has to.
     mov     dword [MODS + 0], STAGING
     mov     dword [MODS + 4], STAGING + BOOT_AREA_BYTES
     mov     dword [MODS + 8], module_name
     mov     dword [MODS + 12], 0
     mov     dword [MBI + MBI_MODS_COUNT], 1
     mov     dword [MBI + MBI_MODS_ADDR], MODS
+%if ASSETS_SECTORS > 0
+    ; Module 1: the asset archive, a slice of module 0
+    mov     dword [MODS + 16], ASSETS_IMAGE
+    mov     dword [MODS + 20], ASSETS_IMAGE + ASSETS_SECTORS * 512
+    mov     dword [MODS + 24], assets_name
+    mov     dword [MODS + 28], 0
+    mov     dword [MBI + MBI_MODS_COUNT], 2
+%endif
 
     jmp     enter_kernel
 
@@ -442,11 +459,12 @@ check_staging_fits:
     ret
 
 ; -----------------------------------------------------------------------------
-; Read the kernel file into the staging area
+; Read the boot area (MBR, stage 2, kernel file, asset archive) into the
+; staging area
 ; -----------------------------------------------------------------------------
-load_kernel_file:
+load_boot_area:
     mov     dword [read_lba], 0
-    mov     dword [read_left], KERNEL_LBA + KERNEL_SECTORS
+    mov     dword [read_left], ASSETS_LBA + ASSETS_SECTORS
     mov     dword [read_dest], STAGING
 
 .chunk:
@@ -999,13 +1017,14 @@ place_errors:
 
 loader_name     db "stage2 boot loader", 0
 module_name     db "bootarea", 0
+assets_name     db "assets", 0
 
 msg_error       db 13, 10, "stage2 error: ", 0
 msg_a20         db "could not enable the A20 line", 0
 msg_memory      db "BIOS reports no memory map", 0
-msg_low_memory  db "not enough memory to stage the kernel at 16 MB", 0
+msg_low_memory  db "not enough memory to stage the boot area at 16 MB", 0
 msg_disk        db 13, 10, "disk read failed, BIOS status 0x", 0
-msg_disk_fatal  db "cannot read the kernel", 0
+msg_disk_fatal  db "cannot read the boot area", 0
 msg_no_header   db "no Multiboot header in the first 8 KB of the kernel", 0
 msg_not_elf     db "kernel is not an i386 ELF32 executable", 0
 msg_bad_image   db "kernel file is truncated or malformed", 0

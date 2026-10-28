@@ -154,7 +154,7 @@ static volatile uint32_t key_queue_tail = 0;
 
 Event input_event = EVENT_INITIALIZER;
 
-static void input_key_push(uint16_t key) {
+void input_key_push(uint16_t key) {
     uint32_t head = key_queue_head;
     uint32_t next = (head + 1) & (INPUT_KEY_QUEUE_SIZE - 1);
     if (next == key_queue_tail)

@@ -6,7 +6,7 @@
 #include <kernel/console/console.h>
 #include <kernel/console/commands/path_util.h>
 
-int console_cmd_lsdir(int arg_count, char** args) {
+static int cmd_lsdir_run(int arg_count, char** args) {
     char path[VFS_PATH_MAX];
     if (!command_resolve_directory_arg(arg_count, args, path, sizeof(path)))
         return 1;
@@ -15,8 +15,13 @@ int console_cmd_lsdir(int arg_count, char** args) {
         print(msg_dir_invalid);
         return 1;
     }
-    print("\n");
     return 0;
+}
+
+int console_cmd_lsdir(int arg_count, char** args) {
+    int result = cmd_lsdir_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

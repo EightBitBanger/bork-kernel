@@ -84,7 +84,9 @@
 // Per-process heap limit, so one process cannot take all user memory. Across
 // processes, user pages come from pmm_alloc_user_frame(), which leaves a
 // reserve of frames for the kernel; past that, sbrk fails with SYS_ENOMEM.
-#define PROCESS_HEAP_MAX          (64u * 1024u * 1024u)
+// Pages are mapped only as the break reaches them, so a high limit costs
+// nothing until a program uses it (lm training on a 20 MB text needs ~450 MB).
+#define PROCESS_HEAP_MAX          (1024u * 1024u * 1024u)
 
 typedef int32_t ProcessId;
 
@@ -92,10 +94,11 @@ typedef int32_t ProcessId;
 typedef uint32_t ProcessSecurity;
 
 // What CreateProcess / CreateProcessIn / CreateProcessFromImage grant: files,
-// the console, graphics, IPC and starting other programs. Not the screen,
-// input or admin.
+// the console, graphics, IPC, starting other programs and asking the user
+// for admin (SYS_ELEVATE). Not the screen, input or admin itself.
 #ifndef PROCESS_SECURITY_DEFAULT
-#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC | SYS_SEC_EXEC)
+#define PROCESS_SECURITY_DEFAULT  (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | SYS_SEC_GFX | SYS_SEC_IPC | \
+                                   SYS_SEC_EXEC | SYS_SEC_ELEVATE)
 #endif
 
 // Every clearance, administration included (a trusted shell or launcher)
@@ -216,6 +219,8 @@ typedef struct {
     ProcessSecurity    security;    // SYS_SEC_* mask
     uint32_t           argc;        // 0: argv = { image_path }
     const char* const* argv;        // argc strings (kernel memory), copied onto the new stack
+    bool               elevated;    // Admin handed down from an elevated process (sys_spawn)
+    void*              tty;         // Pipe end for descriptors 0-2 (sys_spawn_tty), or NULL
 } ProcessLaunch;
 
 // Load and start an ELF executable with arguments. Same rules and errors as
@@ -228,8 +233,17 @@ ProcessId CreateProcessLaunch(const ProcessLaunch* launch);
 // takes the VFS lock and may wait (up to SYS_FILES_EXIT_WAIT_MS) for one of
 // its threads to finish a file call. Safe to call on the calling thread's
 // own process (does not return then).
+//
+// If a thread of the process is inside a syscall (and so may hold kernel
+// locks), the kill is deferred instead: the process is marked, its sleeps
+// and IPC waits are cut short, and it ends itself with PROCESS_EXIT_KILLED
+// as that syscall returns. PROCESS_OK then means "will end"; the slot is
+// freed once it has (ProcessGetInfo() starts failing).
 // Returns PROCESS_OK or a PROCESS_ERR_* code.
 int DestroyProcess(ProcessId pid);
+
+// Exit code of a process ended by a deferred DestroyProcess()
+#define PROCESS_EXIT_KILLED  137
 
 // Fill *info for a live process. Returns false if pid is not valid.
 bool ProcessGetInfo(ProcessId pid, ProcessInfo* info);
@@ -245,6 +259,21 @@ bool ProcessGetSecurity(ProcessId pid, ProcessSecurity* security);
 // PROCESS_ERR_NOT_FOUND (pid not running).
 int ProcessSetSecurity(ProcessId pid, ProcessSecurity security, ProcessSecurity* previous);
 
+// Add `bits` to a running process's mask (kernel side, NO permission check),
+// read and written under one lock. `elevated` also marks the process as
+// elevated: SYS_ELEVATE's grant, after the user said yes. Logged on COM1.
+// PROCESS_OK, PROCESS_ERR_INVALID_ARG or PROCESS_ERR_NOT_FOUND.
+int ProcessGrantSecurity(ProcessId pid, ProcessSecurity bits, bool elevated);
+
+// True when the process holds admin through SYS_ELEVATE (or a parent that
+// did). False for a pid that is not live.
+bool ProcessIsElevated(ProcessId pid);
+
+// The kernel's own record of a running process: its name (the executable's
+// file name) and the absolute path it was loaded from. Never the program's
+// say. False if pid is not running.
+bool ProcessGetImage(ProcessId pid, char name[PROCESS_NAME_MAX], char path[PROCESS_PATH_MAX]);
+
 // Number of live (creating or running) processes
 uint32_t process_get_count(void);
 
@@ -258,9 +287,17 @@ const char* process_error_string(int code);
 // PROCESS_INVALID_ID for a kernel thread
 ProcessId process_current_id(void);
 
+// DestroyProcess() was asked for the calling thread's process while it was
+// inside the kernel (see DestroyProcess). Long waits in a syscall should
+// give up when this is true; syscall_dispatch() then ends the process.
+bool process_current_kill_pending(void);
+
 // Security mask of the calling thread's process. SYS_SEC_NONE for a kernel
 // thread or a process that is being destroyed.
 ProcessSecurity process_current_security(void);
+
+// ProcessIsElevated() for the calling thread's process (false: kernel thread)
+bool process_current_elevated(void);
 
 // File-system clearance of the calling thread (the VFS's clearance source,
 // installed by syscall_init): VFS_CLEARANCE_ALL (every bit) for a kernel

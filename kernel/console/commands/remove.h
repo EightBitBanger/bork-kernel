@@ -9,7 +9,7 @@
 // rm <path>   remove a file, or a directory with everything in it. Removing
 // the working directory (or one above it) is fine: the prompt falls back
 // to the nearest directory that still exists.
-int console_cmd_rm(int arg_count, char** args) {
+static int cmd_rm_run(int arg_count, char** args) {
     if (arg_count == 0) 
         return 1;
     
@@ -24,6 +24,12 @@ int console_cmd_rm(int arg_count, char** args) {
         return 5;
     
     return 0;
+}
+
+int console_cmd_rm(int arg_count, char** args) {
+    int result = cmd_rm_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

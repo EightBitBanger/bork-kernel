@@ -1,9 +1,6 @@
 #ifndef CONSOLE_CMD_BOOT_H
 #define CONSOLE_CMD_BOOT_H
 
-#define ADD_IMAGE_LIB
-#define ADD_BINARY_LIB
-
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -13,31 +10,48 @@
 #include <kernel/block/block.h>
 #include <kernel/block/partition.h>
 #include <kernel/fs/fs.h>
+#include <kernel/fs/fs_type.h>
 #include <kernel/vfs/vfs.h>
+#include <kernel/fs/format.h>
 
 #include <kernel/boot/x86/boot_image.h>
 #include <kernel/arch/x86/bus/pci/pci.h>
 
-#include <kernel/resources/resource_manager.h>
-
-// Compiled-in assets ("boot install" / "boot repair" write these to disk)
+// Assets ("boot install" / "boot repair" write these to disk): the archive
+// stage 2 loaded
 #include <kernel/console/commands/boot_assets.h>
+#include <kernel/console/commands/boot_registry.h>
 
 // Initial system setup / installation
 //
-//   boot install <disk>          format the disk to a blank BaseFS file system and install the kernel
-//   boot repair <disk> [force]   recreate missing system folders and system files (DWM images),
-//                                fix their permissions, and check the boot area
+//   boot install <disk>          install the boot loader and kernel in front of the disk's
+//                                partitions and the system onto its boot partition, which
+//                                is formatted. The table comes from fdisk; <disk> may also
+//                                be a partition ("ata1p2") to install onto that one
+//   boot repair <disk> [-f]      recreate missing system folders and system files (programs, DWM images),
+//                                fix their permissions, add missing registry defaults (the desktop's
+//                                context menus, boot_registry.h), and check the boot area
 //   boot update <disk>           replace the boot loader and kernel only, keeping the
 //                                partition table and everything in the partition
 //
-// <disk> may be given as "ata1" or "/mnt/ata1". repair and update also take
-// a partition ("ata1p1"): repair works on that partition, update on the
-// disk it belongs to. A whole disk given to repair means its first partition.
+// <disk> may be given as "ata1" or "/mnt/ata1". All three also take a
+// partition ("ata1p1"): install and repair work on that partition, update
+// on the disk it belongs to. A whole disk given to install means its active
+// basefs partition (else the first basefs one), to repair its first
+// partition.
+//
+// Setting up a new boot disk:
+//
+//   format ata1 -q       erase it all, boot sector and partition table included
+//   fdisk ata1 new       one basefs partition, with room for the boot area
+//   boot install ata1    boot sector, stage 2 and kernel, then the system
 //
 // The install / update source is the boot area stage 2 loaded this kernel
 // from (see boot_image.h), so it works when booted from a USB stick the
-// kernel itself cannot read.
+// kernel itself cannot read. The asset archive the system files are
+// extracted from is part of that boot area (behind the kernel file), so an
+// installed disk carries it too and "boot repair" works when booted from
+// it, and "boot update" refreshes it along with the kernel.
 //
 // Everything here runs on the console thread, one command at a time, so
 // the static sector buffers below are never shared.
@@ -52,21 +66,19 @@
 #define BOOT_MBR_ENTRIES        4
 #define BOOT_MBR_SIGNATURE      0x1FE   // 0x55 0xAA
 
-// Sectors read per request when comparing the boot area
-#define BOOT_IO_SECTORS         8
+// Sectors read (and, where they differ, written) per request when syncing
+// the boot area. 64 is the most a USB stick takes per command.
+#define BOOT_IO_SECTORS         64
 
 // Static: mapped, physically stable memory a DMA driver (AHCI) can use
 static uint8_t boot_io_buffer[BOOT_IO_SECTORS * MBR_SECTOR_SIZE] __attribute__((aligned(16)));
 static uint8_t boot_mbr[MBR_SECTOR_SIZE] __attribute__((aligned(16)));
 
 // System folders, relative to a device root. Parents come before children.
+// Only folders no asset lands in: the folders the archive's files go into
+// (sys, bin, fonts, ...) are made as the files are dropped (boot_assets.h).
 static const char* const boot_system_directories[] = {
-    "/bin",
-    "/sys",
     "/usr",
-    
-    "/sys/images",
-    "/sys/fonts",
     "/usr/desktop"
 };
 
@@ -163,70 +175,21 @@ typedef struct {
     uint32_t failed;
 } BootExportStats;
 
-// Write the compiled-in sprite images to <image_dir>/<name>.
-//
-// `image_dir` is "<root>/sys/images". The sprite table and the drop itself
-// live in boot_assets.h; this adapts its BootAssetStats to BootExportStats
-// and pulls the root back out of the image directory it was handed.
-//
-// Without `overwrite`, files that already exist are left alone, so an image
-// edited on disk is never replaced by the built-in copy. With it, existing
-// files are removed and written again (repair force). A failed save is not
-// fatal: the DWM falls back to the built-in copy.
-static void boot_export_images_to(const char* image_dir, bool overwrite, BootExportStats* stats) {
+// Extract the asset archive (ELF executables, e.g. the DWM, maps, fonts,
+// images)
+// to <root>/<path>, making any missing folders on the way. `stats` may be
+// NULL. False if there is no archive (*missing set) or anything failed.
+static bool boot_export_files(const char* root, bool overwrite, BootExportStats* stats, bool* missing) {
     BootExportStats local = { 0, 0, 0 };
     if (stats == NULL)
         stats = &local;
 
-#ifdef ADD_IMAGE_LIB
-    // image_dir is "<root>/sys/images"; strip the suffix to recover <root>,
-    // which is what boot_drop_sprite_assets wants (it re-appends /sys/images).
-    char root[192];
-    size_t dir_len = strlen(image_dir);
-    const char* suffix = "/sys/images";
-    size_t suffix_len = strlen(suffix);
-
-    if (dir_len >= suffix_len &&
-        strcmp(image_dir + dir_len - suffix_len, suffix) == 0 &&
-        dir_len - suffix_len < sizeof(root)) {
-        memcpy(root, image_dir, dir_len - suffix_len);
-        root[dir_len - suffix_len] = '\0';
-    } else {
-        // Not the shape we expected; nothing we can safely drop
-        stats->failed++;
-        return;
-    }
-
     BootAssetStats a = { 0, 0, 0 };
-    boot_drop_sprite_assets(root, overwrite, &a);
+    *missing = !boot_drop_archive(root, overwrite, &a);
     stats->written += a.written;
     stats->kept    += a.kept;
     stats->failed  += a.failed;
-#else
-    (void)image_dir;
-    (void)overwrite;
-#endif
-}
-
-// Drop the compiled-in byte assets (ELF executables, e.g. the DWM) into
-// <root>/sys. The /sys folder is created by boot_make_layout (it is in
-// boot_system_directories), so the files have a parent to live in. `stats`
-// may be NULL. Returns true only if every asset was written or kept.
-static bool boot_export_programs(const char* root, bool overwrite, BootExportStats* stats) {
-    BootExportStats local = { 0, 0, 0 };
-    if (stats == NULL)
-        stats = &local;
-
-#ifdef ADD_BINARY_LIB
-    BootAssetStats a = { 0, 0, 0 };
-    boot_drop_byte_assets(root, overwrite, &a);
-    stats->written += a.written;
-    stats->kept    += a.kept;
-    stats->failed  += a.failed;
-    return a.failed == 0;
-#endif
-
-    return 0;
+    return !*missing && a.failed == 0;
 }
 
 //
@@ -285,7 +248,7 @@ static bool boot_make_layout(const char* root, bool force, BootLayoutStats* stat
 
         if (vfs_exists(dir)) {
             if (!force) {
-                boot_print_problem("file in the way (use force): ", dir);
+                boot_print_problem("file in the way (use -f): ", dir);
                 stats->failed++;
                 continue;
             }
@@ -382,13 +345,23 @@ static BootAreaResult boot_area_sync(struct BlockDevice* disk, const uint8_t* im
         if (!block_read(disk, lba, count, boot_io_buffer))
             return BOOT_AREA_IO_ERROR;
 
-        for (uint32_t s = 0; s < count; s++) {
+        // Each run of differing sectors goes out in one write: on a blank
+        // disk that is the whole chunk, not one command per sector
+        for (uint32_t s = 0; s < count; ) {
             const uint8_t* want = image + (size_t)(lba + s) * MBR_SECTOR_SIZE;
-            if (memcmp(boot_io_buffer + s * MBR_SECTOR_SIZE, want, MBR_SECTOR_SIZE) == 0)
+            if (memcmp(boot_io_buffer + s * MBR_SECTOR_SIZE, want, MBR_SECTOR_SIZE) == 0) {
+                s++;
                 continue;
-            (*changed)++;
-            if (write && !block_write(disk, lba + s, 1, want))
+            }
+            uint32_t run = 1;
+            while (s + run < count &&
+                   memcmp(boot_io_buffer + (s + run) * MBR_SECTOR_SIZE,
+                          want + run * MBR_SECTOR_SIZE, MBR_SECTOR_SIZE) != 0)
+                run++;
+            *changed += run;
+            if (write && !block_write(disk, lba + s, run, want))
                 return BOOT_AREA_IO_ERROR;
+            s += run;
         }
         lba += count;
     }
@@ -411,6 +384,36 @@ static BootAreaResult boot_area_sync(struct BlockDevice* disk, const uint8_t* im
 // boot install
 //
 
+// Find the partition of the table on `disk` to install onto: the one at
+// `start` when the user named a partition (start != 0), else the active
+// basefs partition, else the first basefs one. NULL if there is none.
+static const struct MbrPartition* boot_pick_partition(const struct MbrPartition* table, uint8_t count,
+                                                      uint64_t start) {
+    const struct MbrPartition* first = NULL;
+    for (uint8_t i = 0; i < count; i++) {
+        const struct MbrPartition* p = &table[i];
+        if (start != 0) {
+            if (p->start == start)
+                return p;
+            continue;
+        }
+        if (p->type != MBR_TYPE_BASEFS)
+            continue;
+        if (p->active)
+            return p;
+        if (first == NULL)
+            first = p;
+    }
+    return first;
+}
+
+static void boot_print_no_table(const struct BlockDevice* disk) {
+    print(disk->name);
+    print(" has no basefs partition. Set one up first:\n  fdisk ");
+    print(disk->name);
+    print(" new\n");
+}
+
 static int boot_install(const char* disk_name) {
     uint32_t image_sectors = 0;
     const uint8_t* image = boot_get_image(&image_sectors);
@@ -418,30 +421,76 @@ static int boot_install(const char* disk_name) {
         print("No boot image (kernel not started by the boot loader)\n");
         return 1;
     }
-    uint64_t data_start = VFS_PARTITION_START_BOOT;
 
-    struct BlockDevice* disk = boot_find_device(disk_name);
-    if (disk == NULL)
+    struct BlockDevice* device = boot_find_device(disk_name);
+    if (device == NULL)
         return 2;
-    if (block_partition_parent(disk) != NULL) {
-        print("Need a whole disk (ata1, not ata1p1)\n");
-        return 2;
-    }
+
+    // "ata1p2" means that partition of ata1
+    struct BlockDevice* disk = block_partition_parent(device);
+    uint64_t wanted_start = 0;
+    if (disk != NULL)
+        wanted_start = block_partition_start(device);
+    else
+        disk = device;
+
     if (disk->sector_size != MBR_SECTOR_SIZE) {
         print("Only 512-byte sectors are supported\n");
         return 2;
     }
-    if (image_sectors > data_start) {
-        print("Kernel too large for the boot area\n");
+
+    // The partition table fdisk wrote
+    struct MbrPartition table[MBR_PARTITION_COUNT];
+    uint8_t entries = 0;
+    if (!block_read(disk, 0, 1, boot_mbr)) {
+        print("Cannot read ");
+        print(disk->name);
+        print("\n");
+        return 4;
+    }
+    if (!block_mbr_parse(boot_mbr, disk->sector_count, table, &entries) ||
+        vfs_fs_probe(boot_mbr, disk->sector_size)) {
+        boot_print_no_table(disk);
         return 2;
     }
-    if (disk->sector_count < data_start + 2048) {
-        print("Disk too small (5 MB minimum)\n");
+
+    const struct MbrPartition* target = boot_pick_partition(table, entries, wanted_start);
+    if (target == NULL) {
+        boot_print_no_table(disk);
+        return 2;
+    }
+    if (target->type != MBR_TYPE_BASEFS || !target->usable) {
+        print("Partition ");
+        print_int(target->number);
+        print(target->usable ? " is not a basefs partition\n" : " does not fit the disk\n");
+        return 2;
+    }
+
+    // Stage 2 and the kernel go in front of the first partition
+    uint64_t first_start = target->start;
+    for (uint8_t i = 0; i < entries; i++) {
+        if (table[i].start < first_start)
+            first_start = table[i].start;
+    }
+    if ((uint64_t)image_sectors > first_start) {
+        print("Kernel too large for the boot area: it needs ");
+        print_int(image_sectors);
+        print(" sectors, the first partition starts at sector ");
+        print_int((uint32_t)first_start);
+        print("\nMake room: delete the partitions below it (fdisk ");
+        print(disk->name);
+        print(" del <n>), then fdisk ");
+        print(disk->name);
+        print(" new\n");
         return 2;
     }
 
     char part_name[BLOCK_NAME_MAX];
-    boot_path(part_name, sizeof(part_name), disk->name, "p1");
+    char number[4] = { 'p', (char)('0' + target->number), '\0', '\0' };
+    if (!boot_path(part_name, sizeof(part_name), disk->name, number)) {
+        print("Disk name too long\n");
+        return 2;
+    }
 
     // Header
     print("Install onto ");
@@ -455,33 +504,57 @@ static int boot_install(const char* disk_name) {
     print(" KB\n");
 
     boot_print_label(part_name);
-    boot_print_mb(disk->sector_count - data_start);
+    boot_print_mb(target->count);
     print(", basefs\n\n");
 
     print("Erasing all data on ");
-    print(disk->name);
+    print(part_name);
     print("\n\n");
 
-    // Nothing may stay mounted from this disk while it is rewritten
-    VfsFormatResult result = vfs_device_release_disk(disk);
-    if (result == VFS_FORMAT_BUSY) {
-        print("Files on ");
-        print(disk->name);
-        print(" are open, close them first\n");
-        return 3;
+    // The installed disk must never pass for the disk this kernel booted
+    // from (a clone has the same signature), or for a disk without one
+    if (!block_mbr_renew_signature(disk, block_mbr_signature(image))) {
+        print("Write failed, disk is not bootable\n");
+        return 4;
     }
 
-    // Boot area and partition table
+    // Stage 1 does not look at the boot flag, but other loaders and tools do
+    if (!target->active) {
+        for (uint8_t i = 0; i < entries; i++)
+            table[i].active = (&table[i] == target);
+        if (!block_mbr_write(disk, table, entries, true)) {
+            print("Write failed, disk is not bootable\n");
+            return 4;
+        }
+    }
+
+    // Boot code into sector 0 (the table stays), stage 2 and the kernel
+    // behind it. Only sectors in front of the first partition are written,
+    // so mounts on the disk do not have to be released for this.
     print("Writing boot area...\n");
-    if (!block_install_boot_area(disk, image, image_sectors, MBR_TYPE_BASEFS, data_start)) {
+    uint32_t changed = 0;
+    if (boot_area_sync(disk, image, image_sectors, true, &changed) != BOOT_AREA_OK) {
         print("\nWrite failed, disk is not bootable\n");
         return 4;
     }
 
-    // Mount the new partition and format it
-    pci_mount_storage(disk);
+    // The partition as a mounted device, in step with the table. A table
+    // written by something else than fdisk has not been scanned yet.
     struct BlockDevice* part = block_find(part_name);
-    if (part == NULL) {
+    if (part == NULL || block_partition_start(part) != target->start ||
+        part->sector_count != target->count || vfs_device_context(part) == NULL) {
+        if (vfs_device_release_disk(disk) == VFS_FORMAT_BUSY) {
+            print("Files on ");
+            print(disk->name);
+            print(" are open, close them first\n");
+            return 3;
+        }
+        block_partition_drop_all(disk);
+        pci_mount_storage(disk);
+        part = block_find(part_name);
+    }
+    struct FsMount* mount = (part != NULL) ? vfs_device_context(part) : NULL;
+    if (mount == NULL) {
         print("\nPartition did not appear\n");
         return 4;
     }
@@ -489,10 +562,18 @@ static int boot_install(const char* disk_name) {
     print("Formatting ");
     print(part_name);
     print("...\n");
-    struct FsMount* mount = vfs_device_context(part);
-    if (mount == NULL ||
-        vfs_device_format_context(mount, vfs_device_max_capacity(mount), FS_MIN_SECTOR_SIZE,
-                                false, NULL) != VFS_FORMAT_OK) {
+    // basefs whatever the partition was driven as (a FAT volume left in a
+    // basefs entry): the system folders need its security masks
+    VfsFormatResult result = vfs_device_format_as(mount, &fs_type_basefs,
+                                                  fs_type_basefs.max_capacity(part),
+                                                  FS_MIN_SECTOR_SIZE, false, NULL);
+    if (result == VFS_FORMAT_BUSY) {
+        print("\nFiles on ");
+        print(part_name);
+        print(" are open, close them first\n");
+        return 3;
+    }
+    if (result != VFS_FORMAT_OK) {
         print("\nFormat failed\n");
         return 4;
     }
@@ -509,18 +590,21 @@ static int boot_install(const char* disk_name) {
         return 5;
     }
 
-    char image_dir[128];
-    boot_path(image_dir, sizeof(image_dir), root, "/sys/images");
-    boot_export_images_to(image_dir, false, NULL);
+    // The asset archive (its folders are made as files are dropped)
+    bool missing = false;
+    if (!boot_export_files(root, false, NULL, &missing))
+        print(missing ? "  ! no asset archive on the boot media, system files not installed\n"
+                      : "  ! some system files missing\n");
+
+    // Registry defaults (the desktop's context menus) into the new sys/hkr
+    BootRegistryStats reg;
+    if (!boot_registry_defaults(root, false, &reg))
+        print("  ! registry defaults not written\n");
 
     if (!vfs_sync_all())
         print("  ! disk flush failed\n");
 
-    // Byte assets (the /sys folder was just made by boot_make_layout)
-    if (!boot_export_programs(root, false, NULL))
-        print("  ! some system files missing from /sys\n");
-
-    print("\nInstalled. Remove the boot media and restart.\n");
+    print("\nInstallation complete. Remove the boot media and restart.\n");
     return 0;
 }
 
@@ -563,11 +647,11 @@ static int boot_update(const char* disk_name) {
 
     switch (result) {
         case BOOT_AREA_NO_TABLE:
-            print("No system partition table, use boot install\n");
+            print("No system partition table, use fdisk and boot install\n");
             return 3;
         case BOOT_AREA_TOO_SMALL:
             print("Kernel too large for the boot area\n");
-            print("(boot install makes room, but erases the disk)\n");
+            print("(fdisk new and boot install make room, but erase the disk)\n");
             return 3;
         case BOOT_AREA_IO_ERROR:
             print("Disk I/O failed\n");
@@ -664,40 +748,32 @@ static int boot_repair(const char* name, bool force) {
 
     print("Repairing ");
     print(root);
-    print(force ? " (force)\n\n" : "\n\n");
+    print(force ? " (-f)\n\n" : "\n\n");
 
-    // Folders first: the images go into one of them
+    // Folders no asset lands in (the asset folders are made by the drops)
     BootLayoutStats layout;
     boot_make_layout(root, force, &layout);
     boot_print_stats("folders", layout.created, " created",
                      layout.fixed, " fixed", layout.failed);
 
-    // System files
-    BootExportStats images = { 0, 0, 0 };
-#ifdef ADD_IMAGE_LIB
-    char image_dir[128];
-    boot_path(image_dir, sizeof(image_dir), root, "/sys/images");
-    if (vfs_directory_check(image_dir)) {
-        boot_export_images_to(image_dir, force, &images);
-        boot_print_stats("images", images.written, " written",
-                         images.kept, " kept", images.failed);
+    // System files: the asset archive (ELF executables, e.g. the DWM, their
+    // data files, fonts and images)
+    BootExportStats files = { 0, 0, 0 };
+    bool missing = false;
+    bool files_ok = boot_export_files(root, force, &files, &missing);
+    if (missing) {
+        boot_print_label("files");
+        print("not checked (no asset archive)\n");
     } else {
-        boot_print_label("images");
-        print("skipped (no images folder)\n");
-        images.failed = 1;
+        boot_print_stats("files", files.written, " written",
+                         files.kept, " kept", files.failed);
     }
-#else
-    boot_print_label("images");
-    print("skipped (no image library)\n");
-#endif
 
-    // Byte assets (ELF executables, e.g. the DWM) into /sys
-
-#ifdef ADD_BINARY_LIB
-    BootExportStats programs = { 0, 0, 0 };
-    bool programs_ok = boot_export_programs(root, force, &programs);
-    boot_print_stats("programs", programs.written, " written",
-                     programs.kept, " kept", programs.failed);
+    // Registry defaults: menus that are missing or empty (all of them with -f)
+    BootRegistryStats reg;
+    bool reg_ok = boot_registry_defaults(root, force, &reg);
+    boot_print_stats("registry", reg.written, " written",
+                     reg.kept, " kept", reg.failed);
 
     // Report only: the disk may intentionally hold another kernel version
     boot_repair_check_area(disk);
@@ -706,16 +782,12 @@ static int boot_repair(const char* name, bool force) {
     if (!synced)
         print("  ! disk flush failed\n");
 
-    if (layout.failed > 0 || images.failed > 0 || !programs_ok || !synced) {
+    if (layout.failed > 0 || !files_ok || !reg_ok || !synced) {
         print("\nRepair incomplete\n");
         return 5;
     }
-#else
-    boot_print_label("binary");
-    print("skipped (no binary library)\n");
-#endif
 
-    print("\nRepaired\n");
+    print("\nRepair complete\n");
     return 0;
 }
 
@@ -725,12 +797,13 @@ static int boot_repair(const char* name, bool force) {
 
 static const char* msg_boot_usage =
     "Usage:\n"
-    "  boot install <disk>          erase <disk> and install the system\n"
-    "  boot repair <disk> [force]   restore system folders and files\n"
-    "                               (force replaces existing ones)\n"
+    "  boot install <disk>          install the boot sector and kernel, then format\n"
+    "                               the boot partition (fdisk) and install the system\n"
+    "  boot repair <disk> [-f]      restore system folders, files and registry\n"
+    "                               defaults (-f replaces existing ones)\n"
     "  boot update <disk>           update the boot loader and kernel only\n";
 
-int console_cmd_boot(int arg_count, char** args) {
+static int cmd_boot_run(int arg_count, char** args) {
     if (arg_count < 1) {
         print(msg_boot_usage);
         return 1;
@@ -745,13 +818,26 @@ int console_cmd_boot(int arg_count, char** args) {
     if (strcmp(args[0], "repair") == 0) {
         if (arg_count == 2)
             return boot_repair(args[1], false);
-        if (arg_count == 3 && strcmp(args[2], "force") == 0)
+        if (arg_count == 3 && strcmp(args[2], "-f") == 0)
             return boot_repair(args[1], true);
     }
 
     // TODO "boot registry": initiate the registry as well
     print(msg_boot_usage);
     return 1;
+}
+
+int console_cmd_boot(int arg_count, char** args) {
+    // Never while a program formats a disk (SYS_FORMAT), or the reverse
+    if (!format_lock_try()) {
+        print("Another format is running, try again when it is done\n");
+        console_command_end();
+        return 5;
+    }
+    int result = cmd_boot_run(arg_count, args);
+    format_lock_release();
+    console_command_end();
+    return result;
 }
 
 #endif

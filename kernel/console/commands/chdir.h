@@ -18,7 +18,7 @@
 // normalize the argument and check that a directory is there. Everything
 // else (entering and leaving devices, ".." out of a device root) is the
 // VFS's path resolution, the same rules every other command gets.
-int console_cmd_chdir(int arg_count, char** args) {
+static int cmd_chdir_run(int arg_count, char** args) {
     if (arg_count < 1 || strcmp(args[0], ".") == 0) {
         char cwd[VFS_PATH_MAX];
         kernel_get_working_directory(cwd, sizeof(cwd));
@@ -39,6 +39,12 @@ int console_cmd_chdir(int arg_count, char** args) {
     kernel_set_working_directory(target);
     console_prompt_refresh();
     return 0;
+}
+
+int console_cmd_chdir(int arg_count, char** args) {
+    int result = cmd_chdir_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

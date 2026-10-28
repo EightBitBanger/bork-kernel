@@ -11,22 +11,19 @@
 //   type <file>                  Print text file to console
 //   type <file> > <dest>         Clear/overwrite destination file with source data
 //   type <file> >> <dest>        Append source data to destination file
-int console_cmd_type(int arg_count, char** args) {
+static int cmd_type_run(int arg_count, char** args) {
     if (arg_count == 0) {
-        print("\n");
         return 1;
     }
     
     // Resolve source file path
     char src_path[VFS_PATH_MAX];
     if (!command_resolve_path(args[0], src_path, sizeof(src_path))) {
-        print("\n");
         return 3;
     }
     
     File src_file = vfs_open(src_path, VFS_OPEN_READ);
     if (src_file == VFS_INVALID_FILE) {
-        print("\n");
         return 2;
     }
     
@@ -44,7 +41,6 @@ int console_cmd_type(int arg_count, char** args) {
         if (redirect_mode > 0) {
             if (!command_resolve_path(args[2], dest_path, sizeof(dest_path))) {
                 vfs_close(src_file);
-                print("\n");
                 return 4;
             }
         }
@@ -62,7 +58,6 @@ int console_cmd_type(int arg_count, char** args) {
     
     if (redirect_mode > 0 && dest_file == VFS_INVALID_FILE) {
         vfs_close(src_file);
-        print("\n");
         return 5;
     }
     
@@ -101,8 +96,13 @@ int console_cmd_type(int arg_count, char** args) {
         vfs_close(dest_file);
     }
     
-    print("\n");
     return 0;
+}
+
+int console_cmd_type(int arg_count, char** args) {
+    int result = cmd_type_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

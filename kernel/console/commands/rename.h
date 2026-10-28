@@ -7,7 +7,7 @@
 #include <kernel/console/commands/path_util.h>
 
 // rn <path> <new name>   the new name is a name, not a path (no '/')
-int console_cmd_rename(int arg_count, char** args) {
+static int cmd_rename_run(int arg_count, char** args) {
     if (arg_count < 2) 
         return 1;
     
@@ -22,6 +22,12 @@ int console_cmd_rename(int arg_count, char** args) {
         return 2;
     
     return 0;
+}
+
+int console_cmd_rename(int arg_count, char** args) {
+    int result = cmd_rename_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

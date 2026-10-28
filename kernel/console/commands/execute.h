@@ -67,7 +67,7 @@ int console_cmd_execute(int arg_count, char** args, uint32_t security, uint8_t f
     // A file by that name exists: say why it can't run instead of
     if (!(stats.permissions & VFS_PERMISSION_EXECUTE)) {
         print(path);
-        print(": not marked executable\n\n");
+        print(": not marked executable\n");
         return 2;
     }
 
@@ -75,7 +75,7 @@ int console_cmd_execute(int arg_count, char** args, uint32_t security, uint8_t f
     // anyway
     if ((security & ~SYS_SEC_VALID) != 0) {
         print(path);
-        print(": invalid security mask\n\n");
+        print(": invalid security mask\n");
         return 4;
     }
 
@@ -90,7 +90,7 @@ int console_cmd_execute(int arg_count, char** args, uint32_t security, uint8_t f
         print(path);
         print(": ");
         print(process_error_string(PROCESS_ERR_TOO_BIG));
-        print("\n\n");
+        print("\n");
         return 5;
     }
 
@@ -115,7 +115,7 @@ int console_cmd_execute(int arg_count, char** args, uint32_t security, uint8_t f
         print(path);
         print(": ");
         print(process_error_string(pid));
-        print("\n\n");
+        print("\n");
         return 3;
     }
     */
@@ -135,7 +135,12 @@ int console_cmd_execute_default(int arg_count, char** args) {
 #else
     uint32_t security = PROCESS_SECURITY_DEFAULT;
 #endif
-    return console_cmd_execute(arg_count, args, security, CONSOLE_THREAD_BLOCK);
+    int result = console_cmd_execute(arg_count, args, security, CONSOLE_THREAD_BLOCK);
+
+    // Not found: the console tries the next place, nothing was printed
+    if (result != CONSOLE_CMD_NOT_FOUND)
+        console_command_end();
+    return result;
 }
 
 #endif

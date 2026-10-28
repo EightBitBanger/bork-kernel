@@ -36,7 +36,7 @@ static inline bool command_resolve_path(const char* arg, char* out, size_t out_s
 }
 
 // The directory a command works on: its first argument if given, the
-// working directory otherwise ("ls", "ls bin", "chkdsk /mnt/ata1")
+// working directory otherwise ("ls", "ls bin")
 static inline bool command_resolve_directory_arg(int arg_count, char** args, char* out, size_t out_size) {
     if (arg_count >= 1)
         return command_resolve_path(args[0], out, out_size);

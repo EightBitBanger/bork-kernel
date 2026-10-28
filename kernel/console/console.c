@@ -293,9 +293,8 @@ static void console_input_enter(void) {
         // Saved first: parsing the command cuts the buffer into words
         history_add(keyboard_string, keyboard_length);
         
+        // Each command ends its own output (console_command_end)
         console_process_command(keyboard_string);
-        if (display_cursor_get_position() != 0)
-            print("\n");
     }
     
     keyboard_length = 0;
@@ -607,11 +606,15 @@ void console_process_command(char* keyboard_str) {
         result = console_run_program(arg_count, args);
     }
     
-    // Then each PATH entry, until one has the program. A name with a '/'
-    // in it is a path, never searched for. Relative PATH entries are
-    // skipped: what they named would change with the working directory.
-    // A program that was found but failed to start (or exited with an
-    // error) stops the search: its message is already printed.
+    // Then each PATH entry, until one has the program, then the home
+    // disk's program folders, <home>/sys and <home>/bin (the order the
+    // desktop uses, os_programpath() in libc). Home is looked at now, not
+    // at mount: "boot install" can make those folders after the disk was
+    // mounted. A name with a '/' in it is a path, never searched for.
+    // Relative PATH entries are skipped: what they named would change with
+    // the working directory. A program that was found but failed to start
+    // (or exited with an error) stops the search: its message is already
+    // printed.
     if (result == CONSOLE_CMD_NOT_FOUND && strchr(command, '/') == NULL) {
         struct LocalPaths paths;
         kernel_get_local_paths(&paths);
@@ -627,13 +630,26 @@ void console_process_command(char* keyboard_str) {
             args[0] = program;
             result = console_run_program(arg_count, args);
         }
+        
+        static const char* const home_dirs[] = { "sys", "bin" };
+        for (size_t i = 0; i < sizeof(home_dirs) / sizeof(home_dirs[0]) && result == CONSOLE_CMD_NOT_FOUND; i++) {
+            char dir[VFS_PATH_MAX];
+            if (paths.home[0] != '/' || !vfs_path_normalize(paths.home, home_dirs[i], dir, sizeof(dir)))
+                break;
+            if (!vfs_directory_check(dir))
+                continue;
+            if (!vfs_path_normalize(dir, command, program, sizeof(program)))
+                continue;
+            args[0] = program;
+            result = console_run_program(arg_count, args);
+        }
     }
     
     args[0] = command;
-    if (result == CONSOLE_CMD_NOT_FOUND)
+    if (result == CONSOLE_CMD_NOT_FOUND) {
         print(msg_bad_command);
-    
-    print("\n");
+        print("\n");
+    }
 }
 
 //
@@ -681,10 +697,6 @@ static void console_print_listing_line(const char* permissions, const char* name
     display_end_update();
 }
 
-// Kernel folders and storage devices are listed the same way, through the
-// VFS. Each step takes the VFS lock on its own and nothing is printed while
-// it is held (printing may reach the DWM). An entry added or removed while
-// listing can shift the rest by one, as it always could.
 bool console_list_directory(const char* path) {
     if (path == NULL || !vfs_directory_check(path))
         return false;

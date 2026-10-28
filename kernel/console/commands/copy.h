@@ -14,7 +14,7 @@
 // Built on vfs_copy(): it sizes the destination before writing, carries
 // permissions over, refuses whole devices and copying a directory into
 // itself, and leaves nothing behind when it fails.
-int console_cmd_copy(int arg_count, char** args) {
+static int cmd_copy_run(int arg_count, char** args) {
     if (arg_count < 2) 
         return 1;
     
@@ -45,6 +45,12 @@ int console_cmd_copy(int arg_count, char** args) {
         return 6;
     
     return 0;
+}
+
+int console_cmd_copy(int arg_count, char** args) {
+    int result = cmd_copy_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

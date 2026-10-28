@@ -58,6 +58,12 @@ typedef struct ThreadBlockType {
     uint32_t kernel_stack_top;          // TSS esp0 while this thread runs (0: boot thread)
     int32_t process_id;                 // Owning ProcessId, 0 for a kernel thread
     bool user_mode;                     // Started in ring 3
+
+    // Inside the kernel on the process's behalf (a syscall, or ending after
+    // a fault). DestroyProcess() from another thread never kills a thread
+    // in this state, which may hold kernel locks; it marks the process and
+    // the thread ends itself on the way out (see syscall_dispatch).
+    volatile bool in_syscall;
 } ThreadBlock;
 
 // Auto-reset event: event_signal() wakes every thread currently waiting. If nobody is waiting,

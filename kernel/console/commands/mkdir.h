@@ -7,7 +7,7 @@
 #include <kernel/console/commands/path_util.h>
 
 // mkdir <dir>
-int console_cmd_mkdir(int arg_count, char** args) {
+static int cmd_mkdir_run(int arg_count, char** args) {
     if (arg_count == 0) 
         return 1;
     
@@ -19,6 +19,12 @@ int console_cmd_mkdir(int arg_count, char** args) {
         return 4;
     
     return 0;
+}
+
+int console_cmd_mkdir(int arg_count, char** args) {
+    int result = cmd_mkdir_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

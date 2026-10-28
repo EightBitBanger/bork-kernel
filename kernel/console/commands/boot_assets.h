@@ -1,58 +1,54 @@
 #ifndef CONSOLE_CMD_BOOT_ASSETS_H
 #define CONSOLE_CMD_BOOT_ASSETS_H
 
-// Compiled-in assets that "boot install" / "boot repair" write to disk.
+// Assets that "boot install" / "boot repair" write to disk.
 //
-// Two kinds, two tables:
+// All of them come from the asset archive: a ustar file (bin/assets.tar,
+// built by build-assets.sh from assets.txt) that stage 2 reads off the boot
+// disk behind the kernel and hands over in memory (boot_assets_get). Every
+// file in it is written verbatim: ELF executables, maps, fonts, and the
+// images, which the build already turned into resource files (16-byte
+// "RSRC" header, build-sprites.sh) so resource_sprite_load() reads them.
 //
-//   BootByteAsset     raw bytes written verbatim (ELF executables and the
-//                     like). Dropped into <root>/sys.
-//   BootSpriteAsset   a struct Sprite, written through the resource manager
-//                     so it gets the 16-byte "RSRC" header and can be read
-//                     back with resource_sprite_load(). Dropped into
-//                     <root>/sys/images.
+// Every path is relative to the home root ("sys/dwm",
+// "games/flight/maps/gulf.map"). `root` is the device root the command is
+// working on: "/mnt/<part>" during install, "/mnt/<device>" during repair.
+// Once that device is the home device "bin/calc" ends up at
+// /mnt/<home>/bin/calc.
 //
-// `root` is the device root the command is working on: "/mnt/<part>" during
-// install, "/mnt/<device>" during repair. Once that device is the home
-// device the effective paths are /mnt/<home>/sys and /mnt/<home>/sys/images.
+// Adding a file to the archive is one line in assets.txt, no kernel change.
+// Folders are not pre-created: the drop walks each file's path and makes
+// any parent folder that is missing (mkdir -p), so a new subdirectory needs
+// no other change. Folder entries in the archive are made too (empty ones
+// included). A file is executable on disk when its archive mode has an
+// execute bit.
 //
-// Adding an asset is one new row (and its #include). The subdirectories are
-// created by boot_make_layout() (they are in boot_system_directories), so
-// the drop only writes files.
-//
-// Overwrite policy (same as boot_export_images_to's contract):
+// Overwrite policy:
 //   overwrite == false  a file that already exists is kept, so a copy edited
-//                        on disk is never clobbered by the built-in one.
-//   overwrite == true   an existing file is removed and written again
-//                        (repair force).
+//                        on disk is never clobbered by the archive's one. A
+//                        file standing where a folder belongs is left alone
+//                        and the asset fails.
+//   overwrite == true   an existing file is removed and written again, and a
+//                        file in the way of a folder is removed (boot repair -f).
 
 #include <stdint.h>
 #include <stdbool.h>
 
 #include <kernel/vfs/vfs.h>
 #include <kernel/util/string.h>
+#include <kernel/util/tar.h>
+#include <kernel/boot/x86/boot_image.h>
 
 #include <kernel/console/print.h>
 
-#include <kernel/resources/classes/sprite.h>
-#include <kernel/resources/classes/image.h>
 
-// The embedded assets
-#ifdef ADD_IMAGE_LIB
- #include <kernel/boot_images.h>
-#endif
-#ifdef ADD_BINARY_LIB
- #include <kernel/boot_cabinate.h>
-#endif
-
-
-// Write `bytes` to `path` as an executable, creating it if missing.
+// Write `bytes` to `path`, creating it if missing.
 //
 // Create it, then size it before writing: writes don't reliably extend a
 // file, so the file is truncated to `size` first (same sequence the resource
 // manager and dwm_desktop_layout_save use). On success the file is left with
-// read, write and execute permission.
-static inline bool boot_write_executable(const char* path, const uint8_t* bytes, uint32_t size) {
+// read and write permission, and execute with `executable`.
+static inline bool boot_write_file(const char* path, const uint8_t* bytes, uint32_t size, bool executable) {
     File file = vfs_open(path, VFS_OPEN_CREATE | VFS_OPEN_READ | VFS_OPEN_WRITE);
     if (file == VFS_INVALID_FILE) return false;
     vfs_close(file);
@@ -72,7 +68,10 @@ static inline bool boot_write_executable(const char* path, const uint8_t* bytes,
     vfs_close(file);
     if (done != size) return false;
 
-    return vfs_set_permissions(path, VFS_PERMISSION_READ | VFS_PERMISSION_WRITE | VFS_PERMISSION_EXECUTE);
+    uint8_t perm = VFS_PERMISSION_READ | VFS_PERMISSION_WRITE;
+    if (executable)
+        perm |= VFS_PERMISSION_EXECUTE;
+    return vfs_set_permissions(path, perm);
 }
 
 // "<dir>/<name>" into out, with exactly one separator. False if it does not
@@ -97,88 +96,6 @@ static inline bool boot_join_path(char* out, uint32_t cap, const char* dir, cons
 }
 
 //
-// Asset tables
-//
-
-// A raw byte blob and the name it is saved under in <root>/sys
-typedef struct {
-    const char*    name;        // File name within the sys directory
-    const uint8_t* bytes;
-    uint32_t       size;
-} BootByteAsset;
-
-// A sprite and the name it is saved under in <root>/sys/images
-typedef struct {
-    const char*          name;  // File name within the images directory
-    const struct Sprite* sprite;
-} BootSpriteAsset;
-
-// Byte assets, dropped into /sys.
-//
-// sizeof(array), not the xxd-generated <name>_len: the length symbol is a
-// plain global variable, so reading it is not a constant expression and a
-// static initializer rejects it. sizeof is a compile-time constant and
-// equals the same byte count (the array's full definition is visible here
-// through boot_cabinate.h).
-static const BootByteAsset boot_byte_assets[] = {
-    
-#ifdef ADD_BINARY_LIB
-    
-    // OS core
-    
-    { "dwm",            dwm,             (uint32_t)sizeof(dwm) },
-    { "prop",           properties,      (uint32_t)sizeof(properties) },
-    { "fileop",         fileop,          (uint32_t)sizeof(fileop) },
-    
-    { "paint",          paint,           (uint32_t)sizeof(paint) },
-    { "hexedit",        hexedit,         (uint32_t)sizeof(hexedit) },
-    
-    { "calc",           calc,            (uint32_t)sizeof(calc) },
-    { "charmap",        charmap,         (uint32_t)sizeof(charmap) },
-    { "minesweeper",    minesweeper,     (uint32_t)sizeof(minesweeper) },
-    
-    //{ "gd.ttf",         gd_ttf,          (uint32_t)sizeof(gd_ttf) },
-    
-    // Programs
-    
-    { "explorer",       explorer,        (uint32_t)sizeof(explorer) },
-    { "notepad",        notepad,         (uint32_t)sizeof(notepad) },
-    
-#endif
-};
-
-#define BOOT_BYTE_ASSET_COUNT \
-    (sizeof(boot_byte_assets) / sizeof(boot_byte_assets[0]))
-
-// Sprite assets, dropped into /sys/images
-static const BootSpriteAsset boot_sprite_assets[] = {
-    
-#ifdef ADD_IMAGE_LIB
-    
-    { "ui_back",             &rc_back },
-    { "ui_new",              &rc_new },
-    { "ui_close",            &rc_close },
-    { "ui_minimize",         &rc_minimize },
-    
-    { "cur_corner",          &rc_angle },
-    { "cur_edge",            &rc_edge },
-    { "cur_pointer",         &rc_pointer },
-    
-    { "icon_document",       &rc_document },
-    { "icon_error",          &rc_error },
-    { "icon_file",           &rc_file },
-    { "icon_folder",         &rc_folder },
-    { "icon_storage",        &rc_storage },
-    { "icon_storage_hdd",    &rc_storage_hdd },
-    { "icon_system",         &rc_system },
-    
-#endif
-};
-
-#define BOOT_SPRITE_ASSET_COUNT \
-    (sizeof(boot_sprite_assets) / sizeof(boot_sprite_assets[0]))
-
-//
 // Dropping
 //
 
@@ -190,13 +107,72 @@ typedef struct {
     uint32_t failed;
 } BootAssetStats;
 
-// "<root><subdir>/<name>" into out. False (out empty) if it does not fit.
+// Make `dir` a folder the system can read and write. An existing folder
+// only gets its permissions fixed. A file standing in the way is removed
+// with `overwrite`, otherwise the folder cannot be made and this fails.
+static bool boot_asset_make_dir(const char* dir, bool overwrite) {
+    if (vfs_directory_check(dir)) {
+        uint8_t perm = 0;
+        if (!vfs_get_permissions(dir, &perm))
+            return false;
+        uint8_t want = (uint8_t)(perm | VFS_PERMISSION_READ | VFS_PERMISSION_WRITE);
+        if (want != perm && !vfs_set_permissions(dir, want))
+            return false;
+        return true;
+    }
+
+    if (vfs_exists(dir)) {
+        if (!overwrite) {
+            print("  ! file in the way (use force): ");
+            print(dir);
+            print("\n");
+            return false;
+        }
+        if (!vfs_remove(dir))
+            return false;
+    }
+
+    return vfs_mkdir(dir);
+}
+
+// mkdir -p for the parent folders of `path`, leaving its first `skip`
+// characters (the device root, which already exists) alone. "<root>/a/b/f"
+// makes <root>/a and <root>/a/b. `path` is modified while walking and
+// restored before returning.
+static bool boot_asset_make_dirs(char* path, uint32_t skip, bool overwrite) {
+    uint32_t len = (uint32_t)strlen(path);
+    for (uint32_t i = skip + 1; i < len; i++) {
+        if (path[i] != '/')
+            continue;
+        path[i] = '\0';
+        bool ok = boot_asset_make_dir(path, overwrite);
+        path[i] = '/';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+// "<root>/<rel>" into out, with every folder above the file created. A
+// leading '/' on `rel` is ignored. False (out empty) if it does not fit or
+// a parent folder could not be made.
 static bool boot_asset_path(char* out, uint32_t cap, const char* root,
-                            const char* subdir, const char* name) {
-    char dir[192];
-    if (!boot_join_path(dir, sizeof(dir), root, subdir))
+                            const char* rel, bool overwrite) {
+    out[0] = '\0';
+    while (*rel == '/')
+        rel++;
+    if (!boot_join_path(out, cap, root, rel))
         return false;
-    return boot_join_path(out, cap, dir, name);
+
+    // Start the walk at the separator joined in after the root
+    uint32_t skip = (uint32_t)strlen(root);
+    if (skip > 0 && root[skip - 1] == '/')
+        skip--;
+    if (!boot_asset_make_dirs(out, skip, overwrite)) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 // If `path` exists: keep it (return true, *kept) unless overwriting, in which
@@ -213,42 +189,43 @@ static bool boot_asset_prepare(const char* path, bool overwrite, bool* kept) {
     return vfs_remove(path);
 }
 
-// Write every byte asset into <root>/sys
-static void boot_drop_byte_assets(const char* root, bool overwrite, BootAssetStats* stats) {
-    for (uint32_t i = 0; i < BOOT_BYTE_ASSET_COUNT; i++) {
-        const BootByteAsset* asset = &boot_byte_assets[i];
-
-        char path[256];
-        if (!boot_asset_path(path, sizeof(path), root, "/sys", asset->name)) {
-            stats->failed++;
-            continue;
-        }
-
-        bool kept = false;
-        if (!boot_asset_prepare(path, overwrite, &kept)) {
-            stats->failed++;
-            continue;
-        }
-        if (kept) {
-            stats->kept++;
-            continue;
-        }
-
-        if (boot_write_executable(path, asset->bytes, asset->size))
-            stats->written++;
-        else
-            stats->failed++;
-    }
+// The asset archive stage 2 loaded, or NULL (*size = its length)
+static inline const uint8_t* boot_archive_get(uint32_t* size) {
+    const uint8_t* archive = boot_assets_get(size);
+    if (archive == NULL || !tar_check(archive, *size))
+        return NULL;
+    return archive;
 }
 
-// Write every sprite asset into <root>/sys/images
-static void boot_drop_sprite_assets(const char* root, bool overwrite, BootAssetStats* stats) {
-    for (uint32_t i = 0; i < BOOT_SPRITE_ASSET_COUNT; i++) {
-        const BootSpriteAsset* asset = &boot_sprite_assets[i];
+// Extract every file and folder of the asset archive to <root>/<path>.
+// Files count in `stats`, folders only when they fail. A damaged archive
+// stops the walk at the damage (one failure); what came before stays.
+// False if there is no archive at all.
+static bool boot_drop_archive(const char* root, bool overwrite, BootAssetStats* stats) {
+    uint32_t size = 0;
+    const uint8_t* archive = boot_archive_get(&size);
+    if (archive == NULL)
+        return false;
+
+    TarReader reader;
+    tar_open(&reader, archive, size);
+
+    // Static, like boot.h's sector buffers: commands run one at a time
+    static struct TarEntry entry;
+    TarResult result;
+    while ((result = tar_next(&reader, &entry)) == TAR_ENTRY) {
+        if (entry.type != TAR_TYPE_FILE && entry.type != TAR_TYPE_DIR)
+            continue;   // Links, devices, ...: nothing the system uses
 
         char path[256];
-        if (!boot_asset_path(path, sizeof(path), root, "/sys/images", asset->name)) {
+        if (!boot_asset_path(path, sizeof(path), root, entry.name, overwrite)) {
             stats->failed++;
+            continue;
+        }
+
+        if (entry.type == TAR_TYPE_DIR) {
+            if (!boot_asset_make_dir(path, overwrite))
+                stats->failed++;
             continue;
         }
 
@@ -262,11 +239,17 @@ static void boot_drop_sprite_assets(const char* root, bool overwrite, BootAssetS
             continue;
         }
 
-        if (resource_sprite_save(path, asset->sprite))
+        if (boot_write_file(path, entry.data, entry.size, (entry.mode & TAR_MODE_EXEC) != 0))
             stats->written++;
         else
             stats->failed++;
     }
+
+    if (result == TAR_BROKEN) {
+        print("  ! asset archive is damaged, extraction stopped\n");
+        stats->failed++;
+    }
+    return true;
 }
 
 #endif

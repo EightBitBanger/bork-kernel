@@ -16,12 +16,15 @@ static void console_lsusb_pad(size_t used, size_t width) {
         print(" ");
 }
 
-int console_cmd_lsusb(int arg_count, char** args) {
+static int cmd_lsusb_run(int arg_count, char** args) {
     (void)arg_count;
     (void)args;
 
+    // Devices come and go while this runs: hold the list
+    usb_device_list_lock();
     uint32_t count = usb_device_count();
     if (count == 0) {
+        usb_device_list_unlock();
         print(usb_controller_count() == 0 ? "No USB host controllers\n" : "No USB devices\n");
         return 0;
     }
@@ -75,7 +78,14 @@ int console_cmd_lsusb(int arg_count, char** args) {
         print(dev->product);
         print("\n");
     }
+    usb_device_list_unlock();
     return 0;
+}
+
+int console_cmd_lsusb(int arg_count, char** args) {
+    int result = cmd_lsusb_run(arg_count, args);
+    console_command_end();
+    return result;
 }
 
 #endif

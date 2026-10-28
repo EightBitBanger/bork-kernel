@@ -57,6 +57,8 @@ typedef struct {
 
     ThreadPriority priority;
     ProcessSecurity security;   // SYS_SEC_* mask, checked by every syscall
+    bool elevated;              // SYS_SEC_ADMIN came from the user's yes (SYS_ELEVATE),
+                                // or from a parent that had it that way
     char name[PROCESS_NAME_MAX];
     char image_path[PROCESS_PATH_MAX];
 
@@ -83,6 +85,11 @@ typedef struct {
     // Kernel node of /proc/<pid> (NULL: none). Set and cleared with the VFS
     // lock held, which also guards the knode tree.
     void* proc_node;
+
+    // DestroyProcess() from another thread found one of our threads inside
+    // the kernel: it ends the process itself when it leaves (interrupts off
+    // to touch)
+    bool kill_pending;
 } Process;
 
 // Fills in p->image, p->entry and the byte counts, mapping the image into
@@ -213,6 +220,32 @@ static void thread_detach_from_event(ThreadBlock* t) {
     }
     t->wait_event = NULL;
     t->wait_next = NULL;
+}
+
+// A thread of `p` is inside the kernel on its behalf. Interrupts off.
+static bool process_in_kernel(const Process* p) {
+    for (struct list_node* n = p->threads_head; n != NULL; n = n->next) {
+        const ThreadBlock* t = (const ThreadBlock*)n->data;
+        if (t->in_syscall)
+            return true;
+    }
+    return false;
+}
+
+// Cut short the waits of `p`'s threads inside the kernel, so a pending kill
+// is not held up by a long sleep or an IPC wait. Mutex waits are left alone:
+// the lock comes, the call finishes and the thread ends. Interrupts off.
+static void process_interrupt_waits(Process* p) {
+    for (struct list_node* n = p->threads_head; n != NULL; n = n->next) {
+        ThreadBlock* t = (ThreadBlock*)n->data;
+        if (!t->in_syscall || t->wait_mutex != NULL)
+            continue;
+        if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
+            thread_detach_from_event(t);
+            t->wait_signaled = false;   // To event_wait() this looks like a timeout
+            t->state = THREAD_READY;
+        }
+    }
 }
 
 // Caller must hold the lock
@@ -540,8 +573,8 @@ _Static_assert(PROCESS_ARG_BYTES + (PROCESS_ARG_MAX + 3) * 4 + 64 < PROCESS_STAC
 // then add the heap, the stack (with argc / argv on it), the file table
 // (working directory `cwd`) and the main thread.
 static ProcessId process_build(const char* name, const char* path, const char* cwd,
-                               ThreadPriority priority, ProcessSecurity security,
-                               uint32_t argc, const char* const* argv,
+                               ThreadPriority priority, ProcessSecurity security, bool elevated,
+                               uint32_t argc, const char* const* argv, void* tty,
                                ProcessLoadFn load, void* ctx) {
     if (priority < PRIORITY_IDLE || priority > PRIORITY_REALTIME)
         return PROCESS_ERR_INVALID_ARG;
@@ -560,6 +593,7 @@ static ProcessId process_build(const char* name, const char* path, const char* c
     uint32_t irq;
     p->priority = priority;
     p->security = security;         // Before the main thread exists: its first syscall is checked
+    p->elevated = elevated;         // ... and so is this (sys_spawn, SYS_ELEVATE_AGENT)
     copy_string(p->name, (name && name[0]) ? name : "process", PROCESS_NAME_MAX);
     copy_string(p->image_path, path, PROCESS_PATH_MAX);
 
@@ -596,11 +630,11 @@ static ProcessId process_build(const char* name, const char* path, const char* c
     if (error != PROCESS_OK)
         goto fail;
 
-    // Descriptor table and working directory. In place before the main
-    // thread exists, so its very first file call already resolves relative
-    // paths against `cwd`. (Interrupts on: this checks the directory
-    // through the VFS.)
-    if (!syscall_process_start((uint32_t)p->pid, p->space, cwd)) {
+    // Descriptor table, working directory and terminal. In place before the
+    // main thread exists, so its very first file call already resolves
+    // relative paths against `cwd`. (Interrupts on: this checks the
+    // directory through the VFS.)
+    if (!syscall_process_start((uint32_t)p->pid, p->space, cwd, tty)) {
         error = PROCESS_ERR_NO_MEMORY;
         goto fail;
     }
@@ -673,7 +707,7 @@ ProcessId CreateProcessFromImageWithSecurity(const char* name, const ProcessImag
 
     // No file to be next to: start at the top. argv = { name }.
     const char* arg0 = (name && name[0]) ? name : "process";
-    return process_build(name, "<memory>", "/", priority, security, 1, &arg0,
+    return process_build(name, "<memory>", "/", priority, security, false, 1, &arg0, NULL,
                          process_load_flat, (void*)image);
 }
 
@@ -683,7 +717,7 @@ ProcessId CreateProcessIn(const char* image_path, const char* cwd, ThreadPriorit
 
 ProcessId CreateProcessWithSecurity(const char* image_path, const char* cwd, ThreadPriority priority,
                                     ProcessSecurity security) {
-    ProcessLaunch launch = { image_path, cwd, priority, security, 0, NULL };
+    ProcessLaunch launch = { image_path, cwd, priority, security, 0, NULL, false, NULL };
     return CreateProcessLaunch(&launch);
 }
 
@@ -745,8 +779,8 @@ ProcessId CreateProcessLaunch(const ProcessLaunch* launch) {
     const char* name = strrchr(image_path, '/');
     name = (name != NULL) ? name + 1 : image_path;
 
-    ProcessId pid = process_build(name, image_path, cwd, priority, security, argc, argv,
-                                  process_load_elf, &source);
+    ProcessId pid = process_build(name, image_path, cwd, priority, security, launch->elevated, argc, argv,
+                                  launch->tty, process_load_elf, &source);
 
     vfs_close(file);
     return pid;
@@ -764,6 +798,18 @@ int DestroyProcess(ProcessId pid) {
         irq_restore(irq);
         return PROCESS_ERR_NOT_FOUND;
     }
+    // Another thread asking while one of ours is inside the kernel: that
+    // thread may hold a kernel lock (VFS, IPC, a descriptor table...), and a
+    // thread killed holding one leaves it locked for good. Let it finish the
+    // call and end the process itself on the way out (syscall_dispatch).
+    bool self = current_thread != NULL && current_thread->process_id == pid;
+    if (!self && process_in_kernel(p)) {
+        p->kill_pending = true;
+        process_interrupt_waits(p);
+        irq_restore(irq);
+        return PROCESS_OK;
+    }
+
     // DYING first: from here on process_current_space() returns NULL for this
     // pid, so its threads cannot start a new file call (sys_files_acquire
     // fails) and a second DestroyProcess() returns NOT_FOUND
@@ -790,7 +836,6 @@ int DestroyProcess(ProcessId pid) {
     }
 
     // Destroying our own process: get off its page directory before freeing it
-    bool self = current_thread != NULL && current_thread->process_id == pid;
     if (self)
         write_cr3(vmm_kernel_directory_phys());
 
@@ -886,6 +931,61 @@ int ProcessSetSecurity(ProcessId pid, ProcessSecurity security, ProcessSecurity*
     return PROCESS_OK;
 }
 
+int ProcessGrantSecurity(ProcessId pid, ProcessSecurity bits, bool elevated) {
+    if ((bits & ~SYS_SEC_VALID) != 0)
+        return PROCESS_ERR_INVALID_ARG;
+
+    // Read and write under one lock: a SYS_SEC_SET landing at the same time
+    // is either fully before or fully after, never half overwritten
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    if (p == NULL || p->state != PROCESS_STATE_RUNNING) {
+        irq_restore(irq);
+        return PROCESS_ERR_NOT_FOUND;
+    }
+    ProcessSecurity old = p->security;
+    p->security = old | bits;
+    if (elevated)
+        p->elevated = true;
+    ProcessSecurity now = p->security;
+    irq_restore(irq);
+
+    process_log_prefix(pid);
+    serial_puts("security ");
+    serial_put_hex(old);
+    serial_puts(" -> ");
+    serial_put_hex(now);
+    serial_puts(elevated ? " granted by the user\n" : " granted by the kernel\n");
+
+    if (old != now)
+        proc_refresh(pid);
+    return PROCESS_OK;
+}
+
+bool ProcessIsElevated(ProcessId pid) {
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    bool elevated = p != NULL && p->elevated;
+    irq_restore(irq);
+    return elevated;
+}
+
+bool ProcessGetImage(ProcessId pid, char name[PROCESS_NAME_MAX], char path[PROCESS_PATH_MAX]) {
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    bool found = p != NULL && p->state == PROCESS_STATE_RUNNING;
+    if (found) {
+        memcpy(name, p->name, PROCESS_NAME_MAX);
+        memcpy(path, p->image_path, PROCESS_PATH_MAX);
+    }
+    irq_restore(irq);
+    if (found) {
+        name[PROCESS_NAME_MAX - 1] = '\0';
+        path[PROCESS_PATH_MAX - 1] = '\0';
+    }
+    return found;
+}
+
 uint32_t process_get_count(void) {
     return process_count;
 }
@@ -928,6 +1028,23 @@ ProcessSecurity process_current_security(void) {
     ProcessSecurity security = (p != NULL && p->state == PROCESS_STATE_RUNNING) ? p->security : SYS_SEC_NONE;
     irq_restore(irq);
     return security;
+}
+
+bool process_current_kill_pending(void) {
+    ProcessId pid = process_current_id();
+    if (pid == PROCESS_INVALID_ID)
+        return false;
+
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    bool pending = p != NULL && p->kill_pending;
+    irq_restore(irq);
+    return pending;
+}
+
+bool process_current_elevated(void) {
+    ProcessId pid = process_current_id();
+    return pid != PROCESS_INVALID_ID && ProcessIsElevated(pid);
 }
 
 uint32_t process_current_clearance(void) {
@@ -1075,7 +1192,10 @@ void process_user_fault(uint32_t vector, uint32_t error_code, uint32_t eip,
     // The fault came from ring 3, so this thread holds no kernel lock and
     // was running with interrupts on (IOPL 0: user code cannot cli). The
     // exception gate turned them off; turn them back on, because closing
-    // the process's files takes mutexes and may sleep.
+    // the process's files takes mutexes and may sleep. From here on it is
+    // in the kernel for good: a kill from elsewhere must leave it to finish.
+    if (current_thread != NULL)
+        current_thread->in_syscall = true;
     __asm__ volatile("sti" : : : "memory");
 
     process_exit_current((int32_t)(128 + vector));

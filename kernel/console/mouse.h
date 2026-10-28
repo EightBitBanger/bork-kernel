@@ -36,6 +36,10 @@ void mouse_set_cursor_acceleration(int32_t acceleration);
 
 void mouse_event_handler(void);
 
+// Relative motion (+y down) and buttons (1 left, 2 right, 4 middle) from
+// any pointing device. Interrupts off.
+void mouse_motion(int32_t rel_x, int32_t rel_y, uint8_t buttons);
+
 void mouse_set_position(uint32_t x, uint32_t y);
 Point mouse_get_position(void);
 
