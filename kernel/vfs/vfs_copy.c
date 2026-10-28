@@ -43,14 +43,17 @@ static bool copy_join(char* out, size_t size, const char* dir, const char* name)
     return true;
 }
 
-// The copy is at least as protected as the original and as its new directory
-static void copy_security(const char* src, const char* dest) {
+// The copy is at least as protected as the original and as its new directory.
+// False if it cannot be: the destination's filesystem stores no mask (FAT),
+// and the copy must then not exist at all, or anyone could read it.
+static bool copy_security(const char* src, const char* dest) {
     uint32_t from = 0, to = 0;
     if (!vfs_get_security(src, &from) || from == VFS_SECURITY_NONE)
-        return;
+        return true;
     vfs_get_security(dest, &to);
-    if ((to | from) != to)
-        vfs_set_security(dest, to | from);
+    if ((to | from) == to)
+        return true;
+    return vfs_set_security(dest, to | from);
 }
 
 static bool copy_file(const char* src, const char* dest) {
@@ -109,7 +112,10 @@ static bool copy_file(const char* src, const char* dest) {
         uint8_t perm = 0;
         if (vfs_get_permissions(src, &perm))
             vfs_set_permissions(dest, perm);
-        copy_security(src, dest);
+        if (!copy_security(src, dest)) {
+            vfs_remove(dest);
+            ok = false;
+        }
     }
 
     return ok;
@@ -157,7 +163,10 @@ static bool copy_directory(const char* src, const char* dest, uint32_t depth) {
         uint8_t perm = 0;
         if (vfs_get_permissions(src, &perm))
             vfs_set_permissions(dest, perm);
-        copy_security(src, dest);
+        if (!copy_security(src, dest)) {
+            vfs_remove(dest);
+            ok = false;
+        }
     }
 
     return ok;

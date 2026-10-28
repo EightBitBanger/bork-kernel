@@ -20,6 +20,7 @@
 #include <kernel/mutex.h>
 #include <kernel/util/string.h>
 #include <kernel/util/timer.h>
+#include <kernel/util/nospec.h>
 
 //
 // Graphics calls: gfx_info, gfx_create, gfx_destroy, gfx_submit, gfx_write,
@@ -230,7 +231,7 @@ static void sys_gfx_process_exit(uint32_t process_id) {
 static SysGfxSurface* sys_gfx_get(SysGfxProcess* t, uint32_t handle) {
     if (handle == 0 || handle > t->surface_cap)
         return NULL;
-    return t->surfaces[handle - 1];
+    return t->surfaces[array_index_nospec(handle - 1, t->surface_cap)];     // Spectre v1
 }
 
 //
@@ -256,7 +257,7 @@ static SysGfxSurface* sys_gfx_env_lookup(void* ctx, uint32_t handle) {
 static SysGfxResource* sys_gfx_get_resource(SysGfxProcess* t, uint32_t handle) {
     if (handle == 0 || handle > SYS_RES_MAX)
         return NULL;
-    return t->resources[handle - 1];
+    return t->resources[array_index_nospec(handle - 1, SYS_RES_MAX)];
 }
 
 static const SysGfxResource* sys_gfx_env_resource(void* ctx, uint32_t handle) {

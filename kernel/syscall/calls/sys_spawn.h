@@ -11,6 +11,7 @@
 #include <kernel/scheduler/process.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/vfs/vfs.h>
+#include <kernel/ipc/ipc.h>
 #include <kernel/malloc.h>
 #include <kernel/util/string.h>
 
@@ -89,20 +90,26 @@ static int32_t sys_spawn_error(ProcessId code) {
     }
 }
 
-static int32_t sys_spawn(const SyscallArgs* args) {
+// spawn and spawn_tty: `tty` is the child's terminal (ipc_tty_take), or NULL
+static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
     AddressSpace* space = process_current_space();
     if (space == NULL)
         return SYS_EFAULT;
 
     // The child's clearance: the caller's, or a part of it. Never more.
+    // Admin the user granted (SYS_ELEVATE) is not passed on by default: a
+    // child of an elevated process gets it only when the mask says so, and
+    // is then elevated too.
     ProcessSecurity mine = process_current_security();
     ProcessSecurity mask = (ProcessSecurity)args->arg4;
+    bool elevated = process_current_elevated();
     if (mask == SYS_SPAWN_INHERIT)
-        mask = mine;
+        mask = elevated ? (mine & ~SYS_SEC_ADMIN) : mine;
     else if ((mask & ~SYS_SEC_VALID) != 0)
         return SYS_EINVAL;
     else if ((mask & ~mine) != 0)
         return SYS_EPERM;
+    elevated = elevated && (mask & SYS_SEC_ADMIN) != 0;
 
     // The child runs at the caller's base priority
     ProcessInfo self;
@@ -162,12 +169,38 @@ static int32_t sys_spawn(const SyscallArgs* args) {
             .security   = mask,
             .argc       = q->argc,      // 0: argv = { path }
             .argv       = q->argv,
+            .elevated   = elevated,
+            .tty        = tty,
         };
         ProcessId pid = CreateProcessLaunch(&launch);
         result = (pid > 0) ? (int32_t)pid : sys_spawn_error(pid);
     }
 
     free(q);
+    return result;
+}
+
+static int32_t sys_spawn(const SyscallArgs* args) {
+    return sys_spawn_launch(args, NULL);
+}
+
+// spawn_tty(path, argv, cwd, mask, pipe): spawn, with the child's
+// descriptors 0-2 on `pipe` (see "Terminals" in syscall.h)
+static int32_t sys_spawn_tty(const SyscallArgs* args) {
+    IpcCaller c = {
+        .pid      = (uint32_t)process_current_id(),
+        .space    = process_current_space(),
+        .security = process_current_security(),
+    };
+    if (c.space == NULL)
+        return SYS_EFAULT;
+
+    void* tty = NULL;
+    int32_t result = ipc_tty_take(&c, args->arg5, &tty);
+    if (result != SYS_OK)
+        return result;
+    result = sys_spawn_launch(args, tty);
+    ipc_tty_drop(tty);      // The child holds its own reference
     return result;
 }
 

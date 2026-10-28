@@ -18,6 +18,7 @@
 #include <kernel/mutex.h>
 #include <kernel/util/string.h>
 #include <kernel/util/timer.h>
+#include <kernel/util/nospec.h>
 
 //
 // Per-process file state: descriptor table and working directory
@@ -260,7 +261,7 @@ static int32_t sys_fd_alloc(SysProcessFiles* t) {
 static SysFile* sys_fd_get(SysProcessFiles* t, uint32_t fd) {
     if (fd < SYS_FD_FIRST || fd >= SYS_FD_MAX)
         return NULL;
-    SysFile* f = &t->files[fd];
+    SysFile* f = &t->files[array_index_nospec(fd, SYS_FD_MAX)];
     return (f->path != NULL) ? f : NULL;
 }
 

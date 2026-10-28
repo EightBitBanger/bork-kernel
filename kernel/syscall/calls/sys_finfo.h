@@ -27,7 +27,8 @@ _Static_assert(sizeof(SysFileInfo) == 32, "SysFileInfo is part of the user ABI")
 //
 //   vfs_set_permissions(path, uint8_t)       VFS_PERMISSION_* bits (the
 //                                            kernel properties window used it)
-//   vfs_device_get_used / _capacity(path)    a device root's usage (same)
+//   vfs_device_get_used / _capacity(path)    a device root's usage (same);
+//                                            _used counts in steps, see vfs.h
 //   vfs_get_security(path, uint32_t*)        the file's basefs `security`
 //                                            mask, the bits vfs_check_access
 //                                            compares against the clearance
@@ -41,9 +42,24 @@ static inline bool sys_finfo_set_permissions(const char* path, uint8_t permissio
     return vfs_set_permissions(path, permissions);
 }
 
-static inline void sys_finfo_device_usage(const char* path, uint32_t* used, uint32_t* capacity) {
-    *used     = vfs_device_get_used(path);
-    *capacity = vfs_device_get_capacity(path);
+// Longest SYS_FINFO spends counting a device's used space before it answers
+// SYS_FINFO_COUNTING (the caller asks again)
+#define SYS_FINFO_COUNT_MS  100
+
+// Called without the VFS lock: the count lets go of it between steps
+static inline void sys_finfo_device_usage(const char* path, SysFileInfo* info) {
+    uint64_t capacity = vfs_device_get_capacity(path);
+    uint64_t used = 0;
+    uint32_t percent = 0;
+    if (!vfs_device_get_used(path, SYS_FINFO_COUNT_MS, &used, &percent)) {
+        info->flags |= SYS_FINFO_COUNTING;
+        info->device_percent = percent;
+        used = 0;
+    }
+    info->device_used        = (uint32_t)used;
+    info->device_used_hi     = (uint32_t)(used >> 32);
+    info->device_capacity    = (uint32_t)capacity;
+    info->device_capacity_hi = (uint32_t)(capacity >> 32);
 }
 
 // ==========================================================================
@@ -106,11 +122,13 @@ static int32_t sys_finfo_locked(SysProcessFiles* t, const SyscallArgs* args) {
         info.flags |= SYS_FINFO_ACCESS;
     if (sys_chmod_refusal(path) == SYS_OK)
         info.flags |= SYS_FINFO_CHMOD;
-    if (vfs_directory_check_mounted(path)) {
-        info.flags |= SYS_FINFO_DEVICE;
-        sys_finfo_device_usage(path, &info.device_used, &info.device_capacity);
-    }
+    bool device = vfs_directory_check_mounted(path);
     vfs_unlock();
+
+    if (device) {
+        info.flags |= SYS_FINFO_DEVICE;
+        sys_finfo_device_usage(path, &info);
+    }
 
     return sys_user_put(space, args->arg2, &info, sizeof(info)) ? SYS_OK : SYS_EFAULT;
 }

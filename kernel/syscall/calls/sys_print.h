@@ -3,10 +3,12 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/syscall/calls/sys_types.h>
+#include <kernel/syscall/calls/sys_security.h>
 #include <kernel/scheduler/process.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/arch/x86/drivers/serial.h>
 #include <kernel/console/print.h>
+#include <kernel/ipc/ipc.h>
 #include <kernel/mutex.h>
 
 #define SYS_PRINT_CHUNK  256
@@ -19,7 +21,9 @@ static void sys_print_init(void) {
 }
 
 // print(buf, length): write length bytes from the caller's buf to the text
-// console, mirrored to COM1. Returns the bytes written, or SYS_EFAULT.
+// console, mirrored to COM1. Returns the bytes written, or SYS_EFAULT. A
+// process with a terminal (SYS_SPAWN_TTY) writes to that instead, with or
+// without SYS_SEC_CONSOLE: only the kernel console needs it.
 //
 // A NUL byte ends that chunk on the console (print() takes C strings); COM1
 // still gets every byte.
@@ -35,6 +39,17 @@ static int32_t sys_print(const SyscallArgs* args) {
     AddressSpace* space = process_current_space();
     if (space == NULL)
         return SYS_EFAULT;
+
+    IpcCaller caller = {
+        .pid      = (uint32_t)process_current_id(),
+        .space    = space,
+        .security = process_current_security(),
+    };
+    int32_t sent = ipc_stdio_write(&caller, user_buffer, length);
+    if (sent != SYS_ENOTTY)
+        return sent;
+    if (!sys_security_allows(SYS_SEC_CONSOLE))
+        return SYS_EPERM;
 
     // Every page must be mapped and user-accessible. The copy below reads
     // through the VMM, so a bad pointer can never fault in the kernel.

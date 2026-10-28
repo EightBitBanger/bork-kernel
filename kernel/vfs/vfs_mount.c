@@ -23,6 +23,7 @@
 // Known filesystems. The first one formats blank devices.
 static const struct FsType* const vfs_fs_types[] = {
     &fs_type_basefs,
+    &fs_type_fat,
 };
 
 #define VFS_FS_TYPE_COUNT   (sizeof(vfs_fs_types) / sizeof(vfs_fs_types[0]))
@@ -48,14 +49,33 @@ bool vfs_fs_probe(const uint8_t* sector0, uint32_t sector_size) {
     return sector0 != NULL && vfs_fs_type_of(sector0, sector_size) != NULL;
 }
 
-bool vfs_fs_claims_partition(uint8_t mbr_type) {
-    if (mbr_type == 0)
+bool fs_type_claims_mbr(const struct FsType* type, uint8_t mbr_type) {
+    if (type == NULL || mbr_type == 0)
         return false;
-    for (uint32_t i = 0; i < VFS_FS_TYPE_COUNT; i++) {
-        if (vfs_fs_types[i]->mbr_type == mbr_type)
+    for (uint32_t i = 0; i < FS_MBR_TYPES_MAX && type->mbr_types[i] != 0; i++) {
+        if (type->mbr_types[i] == mbr_type)
             return true;
     }
     return false;
+}
+
+bool vfs_fs_claims_partition(uint8_t mbr_type) {
+    for (uint32_t i = 0; i < VFS_FS_TYPE_COUNT; i++) {
+        if (fs_type_claims_mbr(vfs_fs_types[i], mbr_type))
+            return true;
+    }
+    return false;
+}
+
+const struct FsType* vfs_fs_type_by_name(const char* name) {
+    if (name == NULL || name[0] == '\0')
+        return NULL;
+    for (uint32_t i = 0; i < VFS_FS_TYPE_COUNT; i++) {
+        const struct FsType* type = vfs_fs_types[i];
+        if (strcmp(type->name, name) == 0 || (type->alias != NULL && strcmp(type->alias, name) == 0))
+            return type;
+    }
+    return NULL;
 }
 
 // The type a device holds, or the default type when none recognizes it
@@ -156,4 +176,8 @@ struct FsMount* vfs_mount_device(struct BlockDevice* device, void* mnt_dir, bool
 
 const char* vfs_mount_fs_name(const struct FsMount* mount) {
     return (mount != NULL && mount->type != NULL) ? mount->type->name : "";
+}
+
+const struct FsType* vfs_fs_default_type(void) {
+    return vfs_fs_types[0];
 }

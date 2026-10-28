@@ -86,7 +86,17 @@ bool vfs_path_normalize(const char* base, const char* path, char* out, size_t si
 
 // Device
 uint64_t vfs_device_get_capacity(const char* path);
-uint64_t vfs_device_get_used(const char* path);
+
+// Bytes in use on the device holding `path`. The first answer for a device
+// means counting its whole allocation bitmap, which on a large stick takes
+// seconds, so this works in short steps for up to `budget_ms`, holding the
+// VFS lock for one step at a time so every other thread keeps using the file
+// system meanwhile. True with *used when known (0 if `path` is not on an
+// open device); false when the budget ran out first: call again later, the
+// count carries on where it stopped and is kept once complete. `percent`
+// (may be NULL): how far the count has got. Call it without holding the VFS
+// lock, or the lock is never let go.
+bool vfs_device_get_used(const char* path, uint32_t budget_ms, uint64_t* used, uint32_t* percent);
 
 // What the device holding `path` is. False if `path` is not on a mounted
 // device (or the device has been detached, see vfs_device_release_disk).
@@ -134,9 +144,60 @@ VfsFormatResult vfs_device_format_context(struct FsMount* mount, uint64_t capaci
                                           uint32_t block_size, bool full_wipe,
                                           vfs_format_progress_fn progress);
 
+// Same, as filesystem `type` (fs/fs_type.h): a mount driven as another
+// type is switched to it first, and stays switched even if the format
+// fails (it then reports as unformatted)
+struct FsType;
+VfsFormatResult vfs_device_format_as(struct FsMount* mount, const struct FsType* type,
+                                     uint64_t capacity, uint32_t block_size, bool full_wipe,
+                                     vfs_format_progress_fn progress);
+
 // The largest volume the mount's filesystem can put on its device, 0 when
 // the mount is detached
 uint64_t vfs_device_max_capacity(struct FsMount* mount);
+
+// Checking (chkdsk)
+//
+// Walk a mounted volume's directory tree and check its structures: every
+// directory's records and extents, every file's data chain, the links
+// between them, and that the blocks in use match the allocation table.
+// Without `repair` nothing is written to the volume; with it, what is found
+// is fixed (and repair is refused while a file on the volume is open).
+
+typedef enum {
+    VFS_CHECK_OK = 0,           // Ran to the end; the report says what it found
+    VFS_CHECK_NOT_MOUNTED,      // No device behind the mount (detached)
+    VFS_CHECK_UNFORMATTED,      // No readable volume on the device
+    VFS_CHECK_UNSUPPORTED,      // The filesystem has no checker
+    VFS_CHECK_BUSY,             // Repair asked for, but files on it are open
+    VFS_CHECK_NO_MEMORY,        // Stopped part way
+    VFS_CHECK_IO_ERROR,         // The repairs did not reach the disk
+} VfsCheckResult;
+
+// One problem: `path` is the object it concerns, from the volume's root
+// ("/sys/fonts", "" for the volume as a whole). `fixed` is set when it was
+// repaired. Runs with the VFS lock held: it may print, but must not touch
+// the VFS or kernel_lock.
+typedef void (*vfs_check_problem_fn)(void* user, const char* path, const char* problem, bool fixed);
+
+typedef struct {
+    // Set by the caller
+    vfs_check_problem_fn problem;   // May be NULL
+    void*    user;
+
+    // Filled in by the check
+    uint32_t directories;           // Below the root
+    uint32_t files;
+    uint64_t file_bytes;            // Sum of the file sizes
+    uint32_t block_size;
+    uint64_t blocks_used;           // Blocks the tree uses (metadata included)
+    uint64_t blocks_total;
+    bool     blocks_checked;        // The allocation table was compared too
+    uint32_t problems;              // Found
+    uint32_t fixed;                 // Of those, repaired
+} VfsCheckReport;
+
+VfsCheckResult vfs_device_check(struct FsMount* mount, bool repair, VfsCheckReport* report);
 
 // Quick format of the device mounted at `path` (e.g. "/mnt/ata1"), using the
 // whole disk and its native sector size as the block size
@@ -151,7 +212,7 @@ bool vfs_device_format(const char* path);
 // first_sector: VFS_PARTITION_START_BOOT leaves room for the boot loader
 // and kernel (build-disk.sh layout); VFS_PARTITION_START_DATA is the usual
 // 1 MB alignment for a disk that will never boot.
-#define VFS_PARTITION_START_BOOT    8192ULL     // = BOOT_RESERVED_SECTORS in build-disk.sh
+#define VFS_PARTITION_START_BOOT    16384ULL     // = BOOT_RESERVED_SECTORS in build-disk.sh
 #define VFS_PARTITION_START_DATA    2048ULL
 
 VfsFormatResult vfs_device_partition(const char* path, uint64_t first_sector);
@@ -162,6 +223,16 @@ struct BlockDevice;
 // can be rewritten underneath them. VFS_FORMAT_BUSY (nothing detached) if a
 // file on any of them is open. The mounts show as unformatted afterwards.
 VfsFormatResult vfs_device_release_disk(struct BlockDevice* disk);
+
+// After a disk released with vfs_device_release_disk has been rescanned:
+// remove the /mnt entries of the disk and its partitions that are still
+// detached, so /mnt shows what a fresh boot would (ahci0p1, not ahci0 as
+// well). Entries the rescan mounted again are left alone.
+void vfs_device_prune_disk(struct BlockDevice* disk);
+
+// A removable disk was pulled out: detach its mounts (and its partitions')
+// without syncing and remove them from /mnt
+VfsFormatResult vfs_device_remove_disk(struct BlockDevice* disk);
 
 // The mount of a block device ("ata1", "ata0p1"), or NULL if it is not
 // mounted. Hand it to vfs_device_format_context; it stays valid for as long
@@ -179,6 +250,14 @@ struct FsMount* vfs_mount_device(struct BlockDevice* device, void* mnt_dir, bool
 
 // Name of the filesystem driving a mount ("basefs")
 const char* vfs_mount_fs_name(const struct FsMount* mount);
+
+// The filesystem a blank device is mounted (and so formatted) with
+struct FsType;
+const struct FsType* vfs_fs_default_type(void);
+
+// The filesystem called `name` (its name or alias, "basefs", "fat32"),
+// NULL if none is
+const struct FsType* vfs_fs_type_by_name(const char* name);
 
 // For the storage scan (block_scan_disk): whether a device's first sector
 // starts a volume of any known filesystem, and whether an MBR partition

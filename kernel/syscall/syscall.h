@@ -84,7 +84,15 @@
 #define SYS_FINFO      51   // (path, SysFileInfo*)     0
 #define SYS_CHMOD      52   // (path, permissions)      0
 #define SYS_SYNC       53   // ()                       0, every file system written out
-#define SYS_COUNT      54
+#define SYS_ELEVATE    54   // (reason or 0)            0, SYS_SEC_ADMIN granted          (needs SYS_SEC_ELEVATE)
+#define SYS_ELEVATE_AGENT 55 // (op, id, arg or buf)    by op         (needs ADMIN + INPUT + GFX_SCREEN)
+#define SYS_FORMAT     56   // (device, SysFormatSpec*) 0             (needs FILE_READ; + ADMIN, FILE_WRITE to write)
+#define SYS_SPAWN_TTY  57   // (path, argv or 0, cwd or 0, mask, pipe) process id   (needs EXEC + IPC)
+#define SYS_IOCTL      58   // (fd, request, arg)       by request
+#define SYS_TTY_RESIZE 59   // (pipe, columns, rows)    0
+#define SYS_REG_GET    60   // (path, name, buf, size)  value length    (registry, sys_registry.h)
+#define SYS_REG_KEYS   61   // (path, index, buf, size) subkey name length, 0 past the last
+#define SYS_COUNT      62
 
 #define SYS_OK               0
 #define SYS_ENOSYS          -1  // Unknown syscall number
@@ -110,6 +118,8 @@
 #define SYS_EPIPE          -21  // The other end of the pipe is closed
 #define SYS_EBADFMT        -22  // Not a resource file / executable this kernel can load
 #define SYS_E2BIG          -23  // Argument list too long (SYS_SPAWN)
+#define SYS_ETIMEDOUT      -24  // Nobody answered in time (SYS_ELEVATE)
+#define SYS_ENOTTY         -25  // Not a terminal, or a request the terminal doesn't know (SYS_IOCTL)
 
 #define SYS_ERROR_MIN       -4095
 
@@ -128,23 +138,30 @@
 //   SYS_SEC_FILE_WRITE   open for writing / create / trunc / append, write
 //                        (to a file), mkdir, remove, rename, truncate
 //                        (copy needs both file bits)
-//   SYS_SEC_CONSOLE      print, and write to descriptors 1 and 2
+//   SYS_SEC_CONSOLE      print, and write to descriptors 1 and 2, on the
+//                        kernel console. A process on a terminal (see
+//                        "Terminals") uses that without it.
 //   SYS_SEC_GFX          graphics surfaces: info, create, destroy, submit,
 //                        write, read
 //   SYS_SEC_GFX_SCREEN   present a surface onto the display. Needs
 //                        SYS_SEC_GFX too.
 //   SYS_SEC_IPC          pipes, ports and shared memory: pipe, port_create,
 //                        connect, accept, send, recv, shm_create, shm_map,
-//                        shm_unmap, and ipc_wait on those handles
+//                        shm_unmap, tty_resize, and ipc_wait on those handles
 //   SYS_SEC_INPUT        take the keyboard and mouse: input_open,
 //                        input_read, and ipc_wait on an input handle
-//   SYS_SEC_EXEC         start other programs: spawn
+//   SYS_SEC_EXEC         start other programs: spawn, spawn_tty (with
+//                        SYS_SEC_IPC)
 //   SYS_SEC_ADMIN        configure security masks: SYS_SEC_SET on any
 //                        process (itself included) and SYS_SEC_GET on other
 //                        processes; create ports named "sys.*"
+//   SYS_SEC_ELEVATE      ask the user for SYS_SEC_ADMIN: SYS_ELEVATE (see
+//                        "Elevation" below). Leave it out of a child's mask
+//                        to keep it from ever asking.
 //
 // Always allowed: exit, yield, sleep, getpid, sbrk, close, seek, getcwd, gethome, time,
-// ipc_close, ipc_info and SYS_SEC_GET on the caller itself.
+// ipc_close, ipc_info, SYS_SEC_GET on the caller itself, ioctl, and read / write
+// / print on the caller's terminal.
 //
 // Files: every file and directory on a storage device carries a mask of
 // these same bits, the clearance it requires. A process may open, list,
@@ -177,11 +194,170 @@
 #define SYS_SEC_INPUT       0x00000040u
 #define SYS_SEC_EXEC        0x00000080u
 #define SYS_SEC_ADMIN       0x00000100u
+#define SYS_SEC_ELEVATE     0x00000200u
 
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | \
                              SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | SYS_SEC_IPC | \
-                             SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN)
+                             SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN | \
+                             SYS_SEC_ELEVATE)
+
+//
+// Elevation
+//
+// SYS_ELEVATE(reason) asks the user to give the calling process
+// SYS_SEC_ADMIN. Needs SYS_SEC_ELEVATE. The call blocks until the user
+// answers, at most SYS_ELEVATE_TIMEOUT_MS.
+//
+//   reason   0, or a short NUL-terminated note shown under the prompt as
+//            the program's own words (at most SYS_ELEVATE_REASON_MAX - 1
+//            bytes are kept; anything but printable ASCII shows as '?')
+//
+// Returns SYS_OK once SYS_SEC_ADMIN is in the caller's mask (at once when it
+// already was), or:
+//   SYS_EACCES     the user chose Cancel
+//   SYS_ETIMEDOUT  no answer in time
+//   SYS_EAGAIN     no desktop is running to ask the user
+//   SYS_EBUSY      too many requests waiting, or this process was refused
+//                  less than SYS_ELEVATE_COOLDOWN_MS ago
+//   SYS_EPERM      no SYS_SEC_ELEVATE
+//   SYS_EFAULT     bad reason pointer
+//
+// The prompt is never the program's to draw or answer. The kernel keeps the
+// request, and only the one registered agent (the desktop, which owns the
+// screen and the keyboard and mouse) can see and answer it; it shows the
+// program's name and executable path as the kernel knows them, not as the
+// program tells them. The grant is made by the kernel on the requesting
+// thread itself, after the agent's answer.
+//
+// An elevated process is an administrator like any other, with two limits:
+// a child it starts with SYS_SPAWN_INHERIT does not inherit SYS_SEC_ADMIN
+// (ask for it in the mask explicitly), and neither it nor any admin child of
+// it can register as the agent or change the agent's mask. To give the
+// rights back: SYS_SEC_SET(0, mask without SYS_SEC_ADMIN).
+//
+// SYS_ELEVATE_AGENT(op, id, arg) is the agent's side. Needs SYS_SEC_ADMIN,
+// SYS_SEC_INPUT and SYS_SEC_GFX_SCREEN, and an elevated process may not use
+// it. While requests wait, the agent's input handle reads as ready
+// (SYS_IPC_WAIT), so it wakes without polling.
+//
+//   REGISTER  ()                   become the agent; SYS_EBUSY while another
+//                                  live process is. Ends when it exits:
+//                                  every waiting request then fails with
+//                                  SYS_EAGAIN.
+//   NEXT      (0, SysElevateRequest*)  the oldest request not shown yet,
+//                                  now marked shown: 1, or 0 for none
+//   STATUS    (id)                 1 while that request still waits, 0 once
+//                                  it is over (the program gave up, ended,
+//                                  or was answered)
+//   ANSWER    (id, allow)          1 allows, 0 refuses. Only a request that
+//                                  NEXT handed out, and allowing only once
+//                                  it has been showing SYS_ELEVATE_ARM_MS
+//                                  (SYS_EAGAIN before). SYS_ESRCH when the
+//                                  request is over.
+//
+
+#define SYS_ELEVATE_OP_REGISTER  1
+#define SYS_ELEVATE_OP_NEXT      2
+#define SYS_ELEVATE_OP_STATUS    3
+#define SYS_ELEVATE_OP_ANSWER    4
+
+#define SYS_ELEVATE_REASON_MAX   128        // Bytes kept, terminator included
+#define SYS_ELEVATE_NAME_MAX     16         // == PROCESS_NAME_MAX
+#define SYS_ELEVATE_PATH_MAX     256        // == PROCESS_PATH_MAX
+#define SYS_ELEVATE_TIMEOUT_MS   120000     // The requester gives up after this
+#define SYS_ELEVATE_COOLDOWN_MS  5000       // After a Cancel, the same process waits this long
+#define SYS_ELEVATE_ARM_MS       750        // A prompt shows this long before Allow counts
+
+typedef struct {
+    uint32_t id;                            // For STATUS and ANSWER (never 0)
+    int32_t  pid;                           // The process asking
+    uint32_t security;                      // Its mask when it asked
+    uint32_t waiting;                       // Requests behind this one
+    char     name[SYS_ELEVATE_NAME_MAX];    // Kernel's record: the executable's file name
+    char     path[SYS_ELEVATE_PATH_MAX];    // ... and its absolute path when it was started
+    char     reason[SYS_ELEVATE_REASON_MAX];// The program's own words (printable ASCII)
+} SysElevateRequest;
+
+//
+// Formatting
+//
+// SYS_FORMAT(device, SysFormatSpec* spec) formats a storage device with a
+// filesystem. Everything on it is lost.
+//
+//   device   a block device name as listed in /mnt: "ata1", "ahci0",
+//            "usb0", "ata0p1" (lowercase letters and digits, no "/mnt/").
+//            A whole disk is wiped from sector 0, boot sector, partition
+//            table and every partition on it included, and gets one
+//            whole-disk volume; a partition is formatted inside its range.
+//   spec     in and out, see SysFormatSpec. size must be
+//            sizeof(SysFormatSpec), reserved fields 0.
+//
+// With SYS_FORMAT_QUERY nothing is written: the call checks the request and
+// fills in what a format would do (device size, whole disk or not, the
+// volume size and block size it would use, the largest size). Needs
+// SYS_SEC_FILE_READ, like SYS_FINFO on the device's root.
+//
+// Without it the device is formatted and the call returns when it is done
+// (a full format of a large disk takes a while; it cannot be cancelled, and
+// a kill takes effect only afterwards). Needs SYS_SEC_ADMIN and
+// SYS_SEC_FILE_WRITE as well: a user program asks for admin first
+// (SYS_ELEVATE). The device holding the system folders (SYS_GETHOME), and
+// the disk it is on, are never formatted this way (SYS_EACCES; the kernel
+// console's format can). One format runs at a time, system-wide.
+//
+// Returns SYS_OK (spec filled in) or:
+//   SYS_EPERM      no SYS_SEC_FILE_READ; to format, no SYS_SEC_ADMIN or
+//                  SYS_SEC_FILE_WRITE
+//   SYS_EINVAL     bad device name, spec size, flags or reserved fields;
+//                  a filesystem this device cannot be formatted with; a
+//                  block size outside SYS_FORMAT_BLOCK_MIN..MAX, not a power
+//                  of two, or not one the filesystem takes; a capacity
+//                  smaller than one block
+//   SYS_ENOSPC     capacity larger than max_capacity (spec is filled in, so
+//                  max_capacity says what fits)
+//   SYS_ENOENT     no such device, or a partition that is not mounted
+//   SYS_EACCES     the system device (spec is filled in, info has
+//                  SYS_FORMAT_INFO_SYSTEM)
+//   SYS_EBUSY      files on the device are open, or another format runs
+//   SYS_EIO        the device failed. After a whole-disk wipe failed the
+//                  disk is in an unknown state.
+//   SYS_EFAULT     bad device or spec pointer
+//
+
+#define SYS_FORMAT_QUERY        0x0001      // flags: check and describe, write nothing
+#define SYS_FORMAT_QUICK        0x0002      // flags: write the structures only (see below)
+#define SYS_FORMAT_FLAGS        (SYS_FORMAT_QUERY | SYS_FORMAT_QUICK)
+
+// A full format zeroes every sector it covers first. A quick one writes the
+// filesystem's structures only; on a whole disk the boot area, the last
+// sectors and the head of every partition are still zeroed, so nothing on
+// it can be found or booted afterwards.
+
+#define SYS_FORMAT_INFO_WHOLE_DISK  0x0001  // info: wiped from sector 0, partitions and all
+#define SYS_FORMAT_INFO_FORMATTED   0x0002  // info: holds a readable volume (before; after: always)
+#define SYS_FORMAT_INFO_SYSTEM      0x0004  // info: holds the system folders, or the disk they are on
+
+#define SYS_FORMAT_BLOCK_MIN    512
+#define SYS_FORMAT_BLOCK_MAX    4096
+#define SYS_FORMAT_FS_MAX       16          // filesystem[], terminator included
+
+typedef struct {
+    uint32_t size;                  // in:  sizeof(SysFormatSpec)
+    uint32_t flags;                 // in:  SYS_FORMAT_QUERY / SYS_FORMAT_QUICK
+    uint32_t block_size;            // in:  allocation block, 0 = the current one (else 512)
+                                    // out: the one used
+    uint32_t reserved;              // in:  0
+    uint64_t capacity;              // in:  volume bytes, 0 = the current size of a
+                                    //      partition's volume, else the whole device
+                                    // out: the size used (a whole number of blocks)
+    uint64_t max_capacity;          // out: the largest volume that fits
+    uint64_t device_bytes;          // out: the device's size
+    uint32_t device_sector_size;    // out: bytes per hardware sector
+    uint32_t info;                  // out: SYS_FORMAT_INFO_*
+    char     filesystem[SYS_FORMAT_FS_MAX];  // in:  "basefs", "fat32", or "" for the default
+                                    // out: the one used
+} SysFormatSpec;
 
 //
 // Files
@@ -193,9 +369,10 @@
 // process with no executable file or when the chosen directory is not
 // usable. "." and ".." are folded as text before the VFS sees the path.
 //
-// Descriptors are private to the process. 0, 1 and 2 are reserved: writing
-// to 1 or 2 prints like SYS_PRINT, anything else on them is SYS_EBADF.
-// SYS_OPEN hands out 3 and up. All are closed when the process exits.
+// Descriptors are private to the process. 0, 1 and 2 are reserved for the
+// terminal (see "Terminals"): without one, writing to 1 or 2 prints like
+// SYS_PRINT and reading 0 is SYS_EBADF. SYS_OPEN hands out 3 and up. All
+// are closed when the process exits.
 //
 
 #define SYS_PATH_MAX        512     // Bytes, terminator included (= VFS_PATH_MAX)
@@ -458,9 +635,10 @@ typedef struct {
 // SYS_IPC_WAIT (READABLE). Mouse and key events are in order among
 // themselves; a burst read in one call returns the mouse events first.
 //
-// Keys: presses only (releases are not reported); `key` is the character
-// (ASCII, Shift applied) or one of SYS_KEY_*. `mods` holds the modifier
-// keys at the time the event is read, `x` `y` `buttons` the mouse state.
+// Keys: presses only (releases are not reported, except SYS_KEY_ALT_UP when
+// the last Alt key is let go, so a program can end an Alt+Tab); `key` is
+// the character (ASCII, Shift applied) or one of SYS_KEY_*. `mods` holds the
+// modifier keys at the time the event is read, `x` `y` `buttons` the mouse state.
 //
 
 #define SYS_INPUT_READ_MAX      32
@@ -489,6 +667,19 @@ typedef struct {
 #define SYS_KEY_DOWN            0x5000
 #define SYS_KEY_PAGE_DOWN       0x5100
 #define SYS_KEY_DELETE          0x5300
+#define SYS_KEY_F1              0x3B00
+#define SYS_KEY_F2              0x3C00
+#define SYS_KEY_F3              0x3D00
+#define SYS_KEY_F4              0x3E00
+#define SYS_KEY_F5              0x3F00
+#define SYS_KEY_F6              0x4000
+#define SYS_KEY_F7              0x4100
+#define SYS_KEY_F8              0x4200
+#define SYS_KEY_F9              0x4300
+#define SYS_KEY_F10             0x4400
+#define SYS_KEY_F11             0x5700
+#define SYS_KEY_F12             0x5800
+#define SYS_KEY_ALT_UP          0x3800  // Not a press: both Alt keys were let go
 
 // One input event. 16 bytes.
 typedef struct {
@@ -555,6 +746,13 @@ typedef struct {
 // device is. Works on files the caller may not open (like stat). Needs
 // SYS_SEC_FILE_READ.
 //
+// A device's used space is counted the first time it is asked for, which on
+// a large device takes a while. SYS_FINFO counts for at most a moment
+// (SYS_FINFO_COUNT_MS) and, if that wasn't enough, answers with
+// SYS_FINFO_COUNTING set: call it again to carry on. Other programs keep
+// using the file system while the count runs, and once complete it is kept
+// until the device goes away.
+//
 // SYS_CHMOD(path, permissions) replaces a file's or folder's SYS_PERM_* bits.
 // Needs SYS_SEC_FILE_WRITE, clearance for the file and the folder holding
 // it, and that folder must be writable (SYS_EACCES otherwise). A device's
@@ -564,14 +762,19 @@ typedef struct {
 #define SYS_FINFO_DEVICE    0x0001  // A storage device's root: device_* are filled in
 #define SYS_FINFO_ACCESS    0x0002  // The caller's clearance covers `security`
 #define SYS_FINFO_CHMOD     0x0004  // SYS_CHMOD on it would be allowed for the caller
+#define SYS_FINFO_COUNTING  0x0008  // DEVICE: still counting the used space; device_used is 0
+                                    // and device_percent how far it got. Ask again in a moment.
 
 // Filled by SYS_FINFO. 32 bytes.
 typedef struct {
     uint32_t security;          // SYS_SEC_* bits the file requires (0: anyone)
     uint32_t flags;             // SYS_FINFO_*
-    uint32_t device_used;       // DEVICE: as the device reports them (vfs_device_get_*)
+    uint32_t device_used;       // DEVICE: bytes in use and in all, low 32 bits (vfs_device_get_*)
     uint32_t device_capacity;
-    uint32_t reserved[4];
+    uint32_t device_used_hi;    // DEVICE: high 32 bits of the two above
+    uint32_t device_capacity_hi;
+    uint32_t device_percent;    // DEVICE + COUNTING: how much has been counted (0..99)
+    uint32_t reserved;
 } SysFileInfo;
 
 //
@@ -625,21 +828,82 @@ typedef struct {
 #define SYS_ARG_MAX             64              // Strings in argv
 #define SYS_ARG_BYTES           4096            // Bytes of them, terminators included
 
+//
+// Terminals
+//
+// A terminal is a pipe whose one end a program's standard descriptors are
+// wired to. The host (a console window) makes a pipe with SYS_IPC_PIPE and
+// starts the program with SYS_SPAWN_TTY(path, argv, cwd, mask, pipe): the
+// same as SYS_SPAWN, plus `pipe`, the end the child gets. The child holds
+// its own reference to it, so the host closes its handle right after (or
+// it never sees the hangup when the child ends). Needs SYS_SEC_EXEC and
+// SYS_SEC_IPC; SYS_EBADF if `pipe` is not a pipe end.
+//
+// In the child, with or without SYS_SEC_CONSOLE (the host chose to give it
+// the terminal; that bit is for the kernel console):
+//   read(0)      the next message the host sent, or as much of it as fits
+//                (the rest comes with the next read). Blocks until one is
+//                queued. 0 (end of file) once the host's end is closed.
+//   write(1|2)   and SYS_PRINT: sent to the host as messages of up to
+//                SYS_IPC_MSG_MAX bytes. Blocks while the host's queue is
+//                full; SYS_EPIPE once the host's end is closed.
+//   ioctl        on 0, 1 or 2, see below
+// The host does its own line editing and echo: it sends whole lines
+// ("text\n") and shows what it receives. Nothing is translated either way.
+// A process started any other way has no terminal; a child started by a
+// process with one does not inherit it.
+//
+// SYS_IOCTL(fd, request, arg): the Unix call, for terminals only. Request
+// numbers are Linux's, so code written for it keeps them.
+//   SYS_TIOCGWINSZ  arg = SysWinSize*: the terminal's size
+//   SYS_FIONREAD    arg = int32_t*: bytes ready for read(0) without blocking
+// SYS_ENOTTY for a descriptor with no terminal behind it (3 and up always)
+// or a request not listed here, SYS_EBADF past SYS_FD_MAX.
+//
+// SYS_TTY_RESIZE(pipe, columns, rows): the host sets the size TIOCGWINSZ
+// reports, from either end of the pipe. Each 1 .. 0xFFFF (SYS_EINVAL
+// otherwise). A new pipe starts at SYS_TTY_DEFAULT_COLUMNS x
+// SYS_TTY_DEFAULT_ROWS. No signal tells the child: it asks again when it
+// needs to.
+//
+// SYS_REG_GET(path, name, buf, size) / SYS_REG_KEYS(path, index, buf, size):
+// read the registry. `path` starts with the hive's root key
+// ("hkey_root/software/shell/menus/desktop"). REG_GET copies the whole value
+// (SYS_ERANGE if it does not fit), REG_KEYS names the key's index-th subkey,
+// 0 past the last. Read only; details in calls/sys_registry.h.
+//
+
+#define SYS_TIOCGWINSZ          0x5413
+#define SYS_FIONREAD            0x541B
+
+#define SYS_TTY_DEFAULT_COLUMNS 80
+#define SYS_TTY_DEFAULT_ROWS    25
+
+// Filled by SYS_TIOCGWINSZ. 8 bytes, laid out as Linux's struct winsize.
+typedef struct {
+    uint16_t rows;
+    uint16_t columns;
+    uint16_t x_pixels;      // Always 0
+    uint16_t y_pixels;      // Always 0
+} SysWinSize;
+
 // Kernel side: set up the serial output and locks the syscalls use. The IDT
 // gate is installed by idt_init().
 void syscall_init(void);
 
 struct AddressSpace;
 
-// Kernel side: give a new process its descriptor table and working
-// directory. process_build() calls it after the address space exists and
+// Kernel side: give a new process its descriptor table, working directory
+// and terminal. process_build() calls it after the address space exists and
 // BEFORE the process's first thread is created, so no file call can ever
 // run against a default table. `cwd` is an absolute path; NULL, or one that
 // does not normalize or is not a directory, starts the process in "/".
+// `tty` is the pipe end from ipc_tty_take() for descriptors 0-2, or NULL;
+// the process takes its own reference to it.
 // Thread context with interrupts on (it checks the directory through the
 // VFS). Returns false only when out of memory. A process that fails to
 // start after this succeeded must be cleaned up with syscall_process_exit().
-bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd);
+bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd, void* tty);
 
 // Kernel side: close every file a process has open, free its graphics
 // surfaces, close its IPC handles and drop its descriptor table. DestroyProcess() calls it before freeing the address space, so

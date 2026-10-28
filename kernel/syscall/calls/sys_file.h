@@ -246,8 +246,23 @@ static int32_t sys_read_locked(SysProcessFiles* t, const SyscallArgs* args) {
 }
 
 static int32_t sys_read(const SyscallArgs* args) {
-    if (args->arg1 < SYS_FD_FIRST)
-        return SYS_EBADF;   // No stdin yet
+    if (args->arg1 < SYS_FD_FIRST) {
+        // The terminal, if any (0 only). Not under the table's lock: it
+        // blocks. Free, like writing to it: the host handed it over.
+        if (args->arg1 != SYS_FD_STDIN)
+            return SYS_EBADF;
+        IpcCaller c = {
+            .pid      = (uint32_t)process_current_id(),
+            .space    = process_current_space(),
+            .security = process_current_security(),
+        };
+        if (c.space == NULL)
+            return SYS_EFAULT;
+        return ipc_stdio_read(&c, args->arg2, args->arg3);
+    }
+    // Called with no requirement in the table: descriptor 0 needs none
+    if (!sys_security_allows(SYS_SEC_FILE_READ))
+        return SYS_EPERM;
     return sys_files_call(sys_read_locked, args);
 }
 
@@ -345,9 +360,7 @@ static int32_t sys_write(const SyscallArgs* args) {
     uint32_t fd = args->arg1;
 
     if (fd == SYS_FD_STDOUT || fd == SYS_FD_STDERR) {
-        // Called directly, so the table's SYS_PRINT check never ran
-        if (!sys_security_allows(SYS_SEC_CONSOLE))
-            return SYS_EPERM;
+        // The terminal, or the console (sys_print checks SYS_SEC_CONSOLE for that)
         SyscallArgs print_args = { .arg1 = args->arg2, .arg2 = args->arg3 };
         return sys_print(&print_args);
     }

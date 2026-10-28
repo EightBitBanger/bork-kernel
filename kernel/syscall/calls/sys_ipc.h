@@ -48,6 +48,19 @@ SYS_IPC_CALL(sys_shm_unmap,       ipc_sys_shm_unmap(&c, args->arg1))
 SYS_IPC_CALL(sys_ipc_info,        ipc_sys_info(&c, args->arg1, args->arg2))
 SYS_IPC_CALL(sys_input_open,      ipc_sys_input_open(&c))
 SYS_IPC_CALL(sys_input_read,      ipc_sys_input_read(&c, args->arg1, args->arg2, args->arg3))
+SYS_IPC_CALL(sys_tty_resize,      ipc_sys_tty_resize(&c, args->arg1, args->arg2, args->arg3))
+
+// ioctl(fd, request, arg): only the terminal behind 0-2 answers
+static int32_t sys_ioctl(const SyscallArgs* args) {
+    if (args->arg1 >= SYS_FD_MAX)
+        return SYS_EBADF;
+    if (args->arg1 >= SYS_FD_FIRST)
+        return SYS_ENOTTY;
+    IpcCaller c = sys_ipc_caller();
+    if (c.space == NULL)
+        return SYS_EFAULT;
+    return ipc_stdio_ioctl(&c, args->arg2, args->arg3);
+}
 
 #undef SYS_IPC_CALL
 

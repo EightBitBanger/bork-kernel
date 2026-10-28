@@ -9,6 +9,7 @@
 #include <kernel/scheduler/process.h>
 #include <kernel/arch/x86/drivers/serial.h>
 #include <kernel/vfs/vfs.h>
+#include <kernel/util/nospec.h>
 
 #include <kernel/syscall/calls/sys_exit.h>
 #include <kernel/syscall/calls/sys_print.h>
@@ -45,6 +46,15 @@
 #include <kernel/syscall/calls/sys_finfo.h>     // finfo chmod
 #include <kernel/syscall/calls/sys_sync.h>      // sync
 
+// Elevation: a program asks the user for admin; the desktop asks the user
+#include <kernel/syscall/calls/sys_elevate.h>   // elevate elevate_agent
+
+// Formatting: describe or format a storage device (admin to write)
+#include <kernel/syscall/calls/sys_format.h>    // format
+
+// Registry (read only)
+#include <kernel/syscall/calls/sys_registry.h>  // reg_get reg_keys
+
 typedef struct {
     const char* name;       // For traces and reports
     SyscallFn   handler;
@@ -64,15 +74,15 @@ typedef struct {
 // requirements that depend on their arguments.
 static const SyscallEntry syscall_table[] = {
     [SYS_EXIT]        = { "exit",        sys_exit,        0 },
-    [SYS_PRINT]       = { "print",       sys_print,       SYS_SEC_CONSOLE },
+    [SYS_PRINT]       = { "print",       sys_print,       0 },      // CONSOLE unless on a terminal
     [SYS_YIELD]       = { "yield",       sys_yield,       0 },
     [SYS_SLEEP]       = { "sleep",       sys_sleep,       0 },
     [SYS_GETPID]      = { "getpid",      sys_getpid,      0 },
     [SYS_SBRK]        = { "sbrk",        sys_sbrk,        0 },
     [SYS_OPEN]        = { "open",        sys_open,        0 },      // R and/or W by flags
     [SYS_CLOSE]       = { "close",       sys_close,       0 },      // Always: lets a process let go
-    [SYS_READ]        = { "read",        sys_read,        R },
-    [SYS_WRITE]       = { "write",       sys_write,       0 },      // CONSOLE or W by descriptor
+    [SYS_READ]        = { "read",        sys_read,        0 },      // R, except from a terminal
+    [SYS_WRITE]       = { "write",       sys_write,       0 },      // CONSOLE (none on a terminal) or W by descriptor
     [SYS_SEEK]        = { "seek",        sys_seek,        0 },
     [SYS_FSTAT]       = { "fstat",       sys_fstat,       R },
     [SYS_STAT]        = { "stat",        sys_stat,        R },
@@ -117,6 +127,15 @@ static const SyscallEntry syscall_table[] = {
     [SYS_FINFO]       = { "finfo",       sys_finfo,       R },
     [SYS_CHMOD]       = { "chmod",       sys_chmod,       W },
     [SYS_SYNC]        = { "sync",        sys_sync,        W },
+    [SYS_ELEVATE]     = { "elevate",     sys_elevate,     SYS_SEC_ELEVATE },
+    [SYS_ELEVATE_AGENT] = { "elevate_agent", sys_elevate_agent,
+                            SYS_SEC_ADMIN | INP | SYS_SEC_GFX_SCREEN },   // + not elevated
+    [SYS_FORMAT]      = { "format",      sys_format,      R },      // + ADMIN | W unless a query
+    [SYS_SPAWN_TTY]   = { "spawn_tty",   sys_spawn_tty,   SYS_SEC_EXEC | IPC },  // as spawn
+    [SYS_IOCTL]       = { "ioctl",       sys_ioctl,       0 },      // Terminals only
+    [SYS_TTY_RESIZE]  = { "tty_resize",  sys_tty_resize,  IPC },
+    [SYS_REG_GET]     = { "reg_get",     sys_reg_get,     R },
+    [SYS_REG_KEYS]    = { "reg_keys",    sys_reg_keys,    R },
 };
 
 #undef R
@@ -174,14 +193,21 @@ void syscall_init(void) {
     vfs_set_clearance_source(process_current_clearance);
 }
 
-bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd) {
-    return sys_files_process_start(process_id, space, cwd);
+bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd, void* tty) {
+    if (!sys_files_process_start(process_id, space, cwd))
+        return false;
+    if (!ipc_process_start(process_id, space, tty)) {
+        sys_files_process_exit(process_id);
+        return false;
+    }
+    return true;
 }
 
 void syscall_process_exit(uint32_t process_id) {
     sys_files_process_exit(process_id);
     sys_gfx_process_exit(process_id);
     ipc_process_exit(process_id);       // Unmaps shared memory: the space must still exist
+    elevate_process_exit((int32_t)process_id);
 }
 
 // Called from isr_syscall.asm with interrupts enabled, on the calling
@@ -195,13 +221,23 @@ void syscall_dispatch(struct SyscallFrame* frame) {
     }
 
     uint32_t number = frame->eax;
-    if (number >= SYS_COUNT || syscall_table[number].handler == NULL) {
+    if (number >= SYS_COUNT) {
+        frame->eax = (uint32_t)SYS_ENOSYS;
+        return;
+    }
+
+    // Spectre v1: past the bounds check the CPU may still run ahead with an
+    // out-of-range number and call through whatever it reads. Clamp it with
+    // a data dependency the CPU cannot guess around.
+    number = array_index_nospec(number, SYS_COUNT);
+    const SyscallEntry* entry = &syscall_table[number];
+    if (entry->handler == NULL) {
         frame->eax = (uint32_t)SYS_ENOSYS;
         return;
     }
 
     // Clearance first: a refused call has no effect at all
-    uint32_t requires = syscall_table[number].requires;
+    uint32_t requires = entry->requires;
     if (requires != 0 && (process_current_security() & requires) != requires) {
         frame->eax = (uint32_t)SYS_EPERM;
         return;
@@ -215,7 +251,19 @@ void syscall_dispatch(struct SyscallFrame* frame) {
         .arg5 = frame->edi,
     };
 
-    frame->eax = (uint32_t)syscall_table[number].handler(&args);
+    // While this is set, a kill from another thread is deferred to the
+    // check below, where this thread holds no kernel lock
+    ThreadBlock* self = current_thread;
+    self->in_syscall = true;
+
+    frame->eax = (uint32_t)entry->handler(&args);
+
+    // Killed while in the call (Ctrl+C, kill): end here. Still marked
+    // in_syscall, so nobody else tears the process down under us.
+    if (process_current_kill_pending())
+        process_exit_current(PROCESS_EXIT_KILLED);     // Does not return
+
+    self->in_syscall = false;
 }
 
 
