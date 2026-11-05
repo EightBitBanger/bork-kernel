@@ -4,6 +4,8 @@
 
 #include <kernel/util/string.h>
 
+#include <kernel/security/policy.h>
+
 // Layout (see FSFileHeader in structs.h)
 //
 //   header allocation:  [FSAllocHeader][FSFileHeader][inline data][slack]
@@ -83,6 +85,29 @@ static void fs_file_free_chain(struct FSDeviceContext* ctx, uint64_t extent_addr
 static bool fs_file_grow(struct FSDeviceContext* ctx, uint64_t address, struct FSFileHeader* file,
                          uint64_t new_size, uint64_t start_hint);
 
+// What a new object in `parent_directory` starts with: the directory's
+// group policy and security mask, so a file made in a folder put in "admin"
+// is in "admin" too. A directory in no group (the root of a volume, a
+// folder made before policies existed, or one taken out of its group)
+// gives the default instead: the user policy with its permissions as the
+// mask, the same as SYS_SETPOLICY "user" with every allowed bit ticked.
+// Every program the desktop starts holds those, so nothing is shut out.
+void fs_inherit_policy(struct FSDeviceContext* ctx, uint64_t parent_directory,
+                       uint32_t* policy, uint32_t* security) {
+    uint32_t parent_policy   = POLICY_NONE;
+    uint32_t parent_security = 0;
+    fs_file_get_policy(ctx, parent_directory, &parent_policy);
+    fs_file_get_security(ctx, parent_directory, &parent_security);
+
+    if (parent_policy == POLICY_NONE) {
+        *policy   = POLICY_USER;
+        *security = POLICY_USER_PERMISSIONS;
+        return;
+    }
+    *policy   = parent_policy;
+    *security = parent_security;
+}
+
 uint64_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t permissions, uint64_t size, uint64_t parent_directory) {
     struct FSFileHeader file;
     uint64_t            address;
@@ -109,13 +134,15 @@ uint64_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t p
     file.block.attributes  = 0;
     file.block.permissions = permissions;
     file.block.parent      = parent_directory;
-    // Inherit the directory's security clearance (0 when unlinked)
+    // The directory's group policy and security mask, or the user policy
+    // (0 for both when unlinked)
     if (parent_directory != FS_NULL) {
-        uint32_t security = file.block.security;
-        fs_file_get_security(ctx, parent_directory, &security);
+        uint32_t policy = 0, security = 0;
+        fs_inherit_policy(ctx, parent_directory, &policy, &security);
+        file.block.policy   = policy;
         file.block.security = security;
     }
-    
+
     file.block.created     = fs_time_now();
     file.block.modified    = file.block.created;
     file.total_logical_size = 0;

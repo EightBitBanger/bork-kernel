@@ -5,6 +5,7 @@
 
 #include <kernel/gfx/gfx.h>
 #include <kernel/gfx/gfx_display.h>
+#include <kernel/arch/cpu.h>
 
 // Layout & Styling Constants
 #define COLOR_BG        0xFF3A0000  // Deep dark red (crash)
@@ -40,16 +41,13 @@ void iso_print(TextContext* ctx, const char* str);
 void iso_print_hex32(TextContext* ctx, uint32_t val);
 
 void kernel_crashout(uint32_t error_code, uint32_t faulting_address, uint8_t type, const char* extra) {
-    __asm__ __volatile__("cli");
+    arch_irq_disable();
     kernel_panicking = true;
 
     // A panic before gfx_display_init() (e.g. from pmm_init) has nowhere to
     // draw: halt instead of faulting on a NULL framebuffer and triple-faulting
-    if (!gfx_display_ready()) {
-        while (1) {
-            __asm__ volatile("cli; hlt");
-        }
-    }
+    if (!gfx_display_ready())
+        arch_halt_forever();
 
     bool watchdog = (type == PT_WATCHDOG);
     uint32_t bg   = watchdog ? COLOR_BG_WD : COLOR_BG;
@@ -165,12 +163,10 @@ void kernel_crashout(uint32_t error_code, uint32_t faulting_address, uint8_t typ
     }
 
     // VRAM is write-combining: make sure every pixel has left the CPU
-    __asm__ volatile("sfence" ::: "memory");
+    arch_store_fence();
 
     // Halt execution safely
-    while (1) {
-        __asm__ volatile("cli; hlt");
-    }
+    arch_halt_forever();
 }
 
 // Print with '\n' handling. Characters past the right edge are clipped by

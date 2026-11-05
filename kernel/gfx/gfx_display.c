@@ -3,6 +3,7 @@
 #include <kernel/gfx/gfx_display.h>
 #include <kernel/gfx/gfx_internal.h>
 
+#include <kernel/arch/cpu.h>
 #include <kernel/util/string.h>
 
 static GfxSurface display_front;     // VRAM (write-combining), stride = pitch / 4
@@ -49,7 +50,7 @@ void gfx_display_present(const GfxRect* rect) {
         gfx_row_copy(gfx_row(&display_front, r.x, y), gfx_row(&display_back, r.x, y), (size_t)r.w);
 
     // VRAM is write-combining: drain the WC buffers so the frame shows now
-    __asm__ volatile("sfence" ::: "memory");
+    arch_store_fence();
 }
 
 void gfx_display_present_rect(int32_t x, int32_t y, int32_t w, int32_t h) {

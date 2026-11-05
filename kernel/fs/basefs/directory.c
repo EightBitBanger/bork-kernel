@@ -402,10 +402,12 @@ uint64_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint
     directory.block.attributes  = FS_ATTRIBUTE_DIRECTORY;
     directory.block.permissions = permissions;
     directory.block.parent      = parent_directory;
-    // Inherit the parent's security clearance (the root starts at 0)
+    // The parent's group policy and security mask, or the user policy
+    // (fs_inherit_policy). The root starts in no group, with no mask.
     if (parent_directory != FS_NULL) {
-        uint32_t security = directory.block.security;
-        fs_file_get_security(ctx, parent_directory, &security);
+        uint32_t policy = 0, security = 0;
+        fs_inherit_policy(ctx, parent_directory, &policy, &security);
+        directory.block.policy   = policy;
         directory.block.security = security;
     }
     directory.block.created     = fs_time_now();
@@ -748,6 +750,98 @@ static uint64_t dir_node_parent(struct FSDeviceContext* ctx, uint64_t address) {
     struct FSBlockHeader block;
     fs_mem_read(ctx, address, &block, sizeof(struct FSBlockHeader));
     return block.parent;
+}
+
+// ---------------------------------------------------------------------------
+// Move
+// ---------------------------------------------------------------------------
+
+// Relink `child` from one directory into another. Only directory records
+// and the child's parent field are written: the child's header, its data
+// and (for a directory) everything below it stay where they are, so the
+// cost does not depend on the size of what is moved.
+//
+// Order, so a crash at any point leaves the object reachable:
+//   1. link it into `to` under the new name
+//   2. point its parent field at `to`
+//   3. unlink it from `from`
+// After 1 or 2 it is linked from both directories. chkdsk keeps the entry in
+// the directory its parent field names and drops the other one ("also
+// linked from another folder"), so an interrupted move is either undone
+// (crash before 2) or completed (crash after 2).
+uint8_t fs_directory_move_entry(struct FSDeviceContext* ctx, uint64_t from_directory, uint64_t child,
+                                uint64_t to_directory, const char* new_name) {
+    if (!ctx || child == FS_NULL || child == 0 || from_directory == FS_NULL || to_directory == FS_NULL)
+        return FS_DIR_ERR_ARGUMENT;
+    if (from_directory == to_directory)
+        return fs_directory_rename_entry(ctx, from_directory, child, new_name);
+    if (child == to_directory || dir_name_length(new_name) == 0)
+        return FS_DIR_ERR_ARGUMENT;
+    if (!dir_is_directory(ctx, to_directory))
+        return FS_DIR_ERR_NOT_DIR;
+
+    // The entry being moved, and its type
+    DirWalk walk;
+    if (!dir_walk_begin(ctx, from_directory, &walk))
+        return FS_DIR_ERR_NOT_DIR;
+    uint8_t type = FS_ENTRY_TYPE_NONE;
+    while (dir_walk_next(ctx, &walk)) {
+        if (walk.entry.address == child) {
+            type = walk.entry.type;
+            break;
+        }
+    }
+    if (type == FS_ENTRY_TYPE_NONE)
+        return walk.corrupt ? FS_DIR_ERR_CORRUPT : FS_DIR_ERR_NOT_FOUND;
+
+    // A directory cannot go inside itself: `to` must not have it as an
+    // ancestor. The climb is bounded like any chain walk.
+    if (type == FS_ENTRY_TYPE_DIRECTORY) {
+        uint64_t node  = to_directory;
+        uint64_t guard = dir_walk_limit(ctx);
+        while (node != FS_NULL && node != 0) {
+            if (node == child)
+                return FS_DIR_ERR_ARGUMENT;
+            if (guard-- == 0)
+                return FS_DIR_ERR_CORRUPT;
+            uint64_t up = dir_node_parent(ctx, node);
+            if (up == node)
+                break;          // A root from an older build names itself
+            node = up;
+        }
+    }
+
+    uint8_t result = fs_directory_add_entry(ctx, to_directory, new_name, child, type);
+    if (result != FS_DIR_OK)
+        return result;
+
+    struct FSBlockHeader block;
+    fs_mem_read(ctx, child, &block, sizeof(struct FSBlockHeader));
+    uint64_t old_parent = block.parent;
+    block.parent = to_directory;
+    fs_mem_write(ctx, child, &block, sizeof(struct FSBlockHeader));
+
+    result = dir_remove(ctx, from_directory, child, FS_NULL);
+    if (result != FS_DIR_OK) {
+        // The old entry could not be unlinked (damaged directory): put
+        // things back rather than leave it in both places
+        block.parent = old_parent;
+        fs_mem_write(ctx, child, &block, sizeof(struct FSBlockHeader));
+        dir_remove(ctx, to_directory, child, FS_NULL);
+        return result;
+    }
+
+    uint32_t now = fs_time_now();
+    struct FSDirectoryHeader header;
+    if (dir_header_read(ctx, from_directory, &header)) {
+        header.block.modified = now;
+        dir_header_write(ctx, from_directory, &header);
+    }
+    if (dir_header_read(ctx, to_directory, &header)) {
+        header.block.modified = now;
+        dir_header_write(ctx, to_directory, &header);
+    }
+    return FS_DIR_OK;
 }
 
 // Delete a directory together with everything below it, then the directory

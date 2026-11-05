@@ -30,7 +30,7 @@
 //
 // Attributes
 //
-// FAT stores no security mask or certificate (security 0: anyone), and no
+// FAT stores no security mask or group policy (security 0: anyone), and no
 // execute bit. Files report READ, plus WRITE unless the read-only attribute
 // is set; FAT_ALLOW_EXECUTE decides whether programs on a FAT volume run.
 
@@ -766,12 +766,23 @@ static bool fat_remove(struct FsMount* m, uint64_t dir, uint64_t node) {
     return result == FR_OK;
 }
 
-static bool fat_rename(struct FsMount* m, uint64_t dir, uint64_t node, const char* name) {
+// Rename and move are one FatFs call: f_rename takes a full new path, so
+// the entry can land in another directory (FatFs rewrites a moved
+// directory's ".." entry). Only the directory entries change; the clusters
+// holding the data stay where they are. `from` is not needed: the node
+// knows its own path.
+static bool fat_move(struct FsMount* m, uint64_t from, uint64_t node, uint64_t dir, const char* name) {
+    (void)from;
     struct FatMount* fm = fat_mount(m);
-    if (fm == NULL || !m->is_open || node == FAT_NODE_ROOT || !fat_name_ok(name))
+    if (fm == NULL || !m->is_open || node == FAT_NODE_ROOT || node == dir || !fat_name_ok(name))
         return false;
     const char* old_rel = fat_node_path(fm, node);
     if (old_rel == NULL || !fat_child_path(fm, dir, name, fat_path2))
+        return false;
+
+    // A directory cannot go inside itself: refuse a target below it
+    size_t old_len = strlen(old_rel);
+    if (strncmp(fat_path2, old_rel, old_len) == 0 && fat_path2[old_len] == '/')
         return false;
 
     // Both with the drive prefix (FatFs takes the drive from the old one)
@@ -787,6 +798,10 @@ static bool fat_rename(struct FsMount* m, uint64_t dir, uint64_t node, const cha
         return false;
     fat_nodes_rename(fm, old_full + 2, fat_path2);
     return true;
+}
+
+static bool fat_rename(struct FsMount* m, uint64_t dir, uint64_t node, const char* name) {
+    return fat_move(m, dir, node, dir, name);
 }
 
 // Set the size of an open file, through its handle. Growing writes zeroes:
@@ -1008,11 +1023,12 @@ const struct FsType fs_type_fat = {
     .create             = fat_create,
     .remove             = fat_remove,
     .rename             = fat_rename,
+    .move               = fat_move,
     .resize             = fat_resize,
     .get_attr           = fat_get_attr,
     .set_permissions    = fat_set_permissions,
     .set_security       = NULL,
-    .set_certificate    = NULL,
+    .set_policy         = NULL,
 
     .open               = fat_open,
     .close              = fat_close,

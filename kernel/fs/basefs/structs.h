@@ -117,12 +117,16 @@ struct __attribute__((packed)) FSBlockHeader {
     // address. Kept in sync by create, move and directory delete.
     uint64_t parent;
     
-    // Security token assigned on file creation. Used to track trusted files/programs.
-    // When an uncertified program is run the user should be prompted to certify the 
-    // program before continuing. This is meant to prevent programs from other 
-    // systems from running until the user explicitly allows it. 
-    // Once certified the program will run normally on future runs.
-    uint32_t certificate;
+    // Group policy this object belongs to: an id from the kernel's policy
+    // table (POLICY_* in kernel/security/policy.h, listed read-only in the
+    // registry under hkey_root/system/policy). 0 means none. Setting a
+    // policy also sets `security` to the clearance that policy asks for;
+    // after that `security` is the live state (it can be loosened or
+    // tightened on its own) and the policy says which group the object
+    // belongs to. New objects inherit their parent directory's policy and
+    // mask; in a directory with no policy they start in "user" with the
+    // user permissions as their mask (fs_inherit_policy).
+    uint32_t policy;
     
     // Seconds since the Unix epoch, 0 = unknown (no clock at the time)
     uint32_t created;

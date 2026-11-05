@@ -49,6 +49,15 @@ uint8_t  fs_directory_add_entry(struct FSDeviceContext* ctx, uint64_t directory_
 uint8_t  fs_directory_remove_entry(struct FSDeviceContext* ctx, uint64_t directory_address, uint64_t child);
 uint8_t  fs_directory_rename_entry(struct FSDeviceContext* ctx, uint64_t directory_address, uint64_t child, const char* new_name);
 
+// Move: relink `child` from `from_directory` into `to_directory` under
+// `new_name`, keeping its address. Only directory records and the child's
+// parent field are written, whatever its size. Same directory: a rename.
+// Fails with FS_DIR_ERR_EXISTS if the name is taken there, and with
+// FS_DIR_ERR_ARGUMENT for a directory moved into itself or below itself.
+// A failure leaves both directories as they were.
+uint8_t  fs_directory_move_entry(struct FSDeviceContext* ctx, uint64_t from_directory, uint64_t child,
+                                 uint64_t to_directory, const char* new_name);
+
 // Index-based access, in on-disk order. Indices run 0..count-1. Entries
 // added or removed in between shift the order, so hold the VFS lock across
 // a listing loop.

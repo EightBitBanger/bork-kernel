@@ -93,6 +93,13 @@ FormatResult format_run(const char* device_name, const FormatRequest* request, F
 bool format_lock_try(void);
 void format_lock_release(void);
 
+// True when `device` holds the system folders (home), is the disk the home
+// partition is on, or is a partition of the home disk: what format_plan
+// refuses without allow_system, and what SYS_UNMOUNT never unmounts. Takes
+// the VFS lock: call it without holding it.
+struct BlockDevice;
+bool format_device_is_system(struct BlockDevice* device);
+
 // One line for a result ("device busy: close open files on it first")
 const char* format_result_text(FormatResult result);
 

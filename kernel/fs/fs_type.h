@@ -48,7 +48,7 @@ typedef struct {
     uint64_t size;                  // Files only
     uint8_t  permissions;           // VFS_PERMISSION_*
     uint32_t security;              // VFS_SECURITY_* mask, 0 if the type has none
-    uint32_t certificate;           // 0 if the type has none
+    uint32_t policy;                // Group policy id (POLICY_*), 0 if none or the type has none
     uint32_t created;               // Seconds since the Unix epoch, 0 = unknown
     uint32_t modified;
 } FsNodeAttr;
@@ -148,6 +148,15 @@ struct FsType {
     // Rename the entry for `node` in `dir`. Fails if the name is taken.
     bool (*rename)(struct FsMount* m, uint64_t dir, uint64_t node, const char* name);
 
+    // Optional (NULL: the VFS reports VFS_MOVE_CROSS_DEVICE and callers copy
+    // instead). Move the entry for `node` from directory `from` to directory
+    // `to` (both on this volume) under `name`, without copying its contents:
+    // `node` stays the same node, so open handles on it keep working. The
+    // caller has checked that the name is free in `to`, and that `to` is
+    // neither `node` nor below it. Fails (nothing changed) if the name is
+    // taken or the volume refuses.
+    bool (*move)(struct FsMount* m, uint64_t from, uint64_t node, uint64_t to, const char* name);
+
     // Grow or shrink a file. Fails (file unchanged) on a directory or when
     // out of space.
     bool (*resize)(struct FsMount* m, uint64_t node, uint64_t size);
@@ -157,7 +166,7 @@ struct FsType {
 
     // Optional (NULL: the type cannot store them, and setting one fails)
     bool (*set_security)(struct FsMount* m, uint64_t node, uint32_t security);
-    bool (*set_certificate)(struct FsMount* m, uint64_t node, uint32_t certificate);
+    bool (*set_policy)(struct FsMount* m, uint64_t node, uint32_t policy);
 
     //
     // Open files

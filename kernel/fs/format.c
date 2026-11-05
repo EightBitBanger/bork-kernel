@@ -66,6 +66,10 @@ static bool format_is_system(struct BlockDevice* device) {
     return block_partition_parent(device) == home_device;
 }
 
+bool format_device_is_system(struct BlockDevice* device) {
+    return device != NULL && format_is_system(device);
+}
+
 FormatResult format_plan(const char* device_name, const FormatRequest* request, FormatPlan* plan) {
     memset(plan, 0, sizeof(FormatPlan));
     if (device_name == NULL || request == NULL)

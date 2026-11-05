@@ -234,6 +234,12 @@ static bool basefs_rename(struct FsMount* m, uint64_t dir, uint64_t node, const 
     return fs_directory_rename_entry(basefs_ctx(m), dir, node, name) == FS_DIR_OK;
 }
 
+// Relinks the entry: the object keeps its address, so its data, everything
+// below a directory, and open handles on it are untouched
+static bool basefs_move(struct FsMount* m, uint64_t from, uint64_t node, uint64_t to, const char* name) {
+    return fs_directory_move_entry(basefs_ctx(m), from, node, to, name) == FS_DIR_OK;
+}
+
 static bool basefs_resize(struct FsMount* m, uint64_t node, uint64_t size) {
     return fs_file_resize(basefs_ctx(m), node, size);
 }
@@ -254,7 +260,7 @@ static bool basefs_get_attr(struct FsMount* m, uint64_t node, FsNodeAttr* out) {
         out->size = fs_file_get_size(ctx, node);
 
     fs_file_get_security(ctx, node, &out->security);
-    fs_file_get_certificate(ctx, node, &out->certificate);
+    fs_file_get_policy(ctx, node, &out->policy);
     fs_file_get_times(ctx, node, &out->created, &out->modified);
     return true;
 }
@@ -267,9 +273,8 @@ static bool basefs_set_security(struct FsMount* m, uint64_t node, uint32_t secur
     return fs_file_set_security_flag(basefs_ctx(m), node, security);
 }
 
-// fs_file_set_certificate rejects 0 and 0xFFFFFFFF
-static bool basefs_set_certificate(struct FsMount* m, uint64_t node, uint32_t certificate) {
-    return fs_file_set_certificate(basefs_ctx(m), node, certificate);
+static bool basefs_set_policy(struct FsMount* m, uint64_t node, uint32_t policy) {
+    return fs_file_set_policy(basefs_ctx(m), node, policy);
 }
 
 //
@@ -338,11 +343,12 @@ const struct FsType fs_type_basefs = {
     .create          = basefs_create,
     .remove          = basefs_remove,
     .rename          = basefs_rename,
+    .move            = basefs_move,
     .resize          = basefs_resize,
     .get_attr        = basefs_get_attr,
     .set_permissions = basefs_set_permissions,
     .set_security    = basefs_set_security,
-    .set_certificate = basefs_set_certificate,
+    .set_policy      = basefs_set_policy,
 
     .open            = basefs_open,
     .close           = basefs_close,
