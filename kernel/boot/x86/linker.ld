@@ -12,6 +12,15 @@ SECTIONS
     }
     
     .rodata : { *(.rodata*) }
+    
+    /* Built-in drivers (DRIVER_BUILTIN_DECLARE, driver/driver.h) */
+    .kdrivers : ALIGN(4)
+    {
+        __kdrivers_start = .;
+        KEEP(*(.kdrivers))
+        __kdrivers_end = .;
+    }
+    
     .data   : { *(.data) }
     .bss    : { *(COMMON) *(.bss) }
     

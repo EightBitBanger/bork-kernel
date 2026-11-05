@@ -10,6 +10,10 @@
 #include <kernel/console/print.h>
 #include <kernel/console/console_const.h>
 
+// Most a command reads from a character device (no size: it reads until the
+// device says the end, and some never do)
+#define COMMAND_DEVICE_READ_MAX     (64u * 1024u)
+
 // Turn a command argument into the absolute, normalized path the VFS takes:
 //
 //   "/mnt/ata0/file"  -> "/mnt/ata0/file"

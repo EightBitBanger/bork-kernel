@@ -20,6 +20,7 @@
 //   |-ata1p2       32M part (ntfs)
 //   `-ata1p3       31M part (linux)
 //   ahci0         128M disk         /mnt/ahci0
+//   nvme0         128M disk         /mnt/nvme0
 //   usb0          128M disk fat     /mnt/usb0
 //
 // Partitions come from each disk's MBR, so entries the kernel does not

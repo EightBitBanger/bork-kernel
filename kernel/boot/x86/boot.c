@@ -15,6 +15,8 @@
 
 // Buses
 #include <kernel/arch/x86/bus/pci/pci.h>
+#include <kernel/driver/driver.h>
+#include <kernel/net/net.h>
 
 // Drivers
 #include <kernel/arch/x86/drivers/ata/ata.h>
@@ -38,7 +40,6 @@
 #include <kernel/console/virtual_key.h>
 
 #include <kernel/vfs/vfs.h>
-#include <kernel/resources/resource_manager.h>
 #include <kernel/registry/registry.h>
 #include <kernel/panic/panic_error.h>
 #include <kernel/scheduler/scheduler.h>
@@ -245,6 +246,12 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
     
     kernel_init();
     
+    // IPv4 stack and loopback, before the drivers that add interfaces
+    net_init();
+
+    // Driver model: built-in drivers, platform devices, /drv
+    driver_init();
+    
     print("kernel v0.1.0\n");
     gfx_display_present_all();
     
@@ -316,7 +323,9 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
         // Launch the dwm with executive level permissions (admin + file).
         // SYS_SEC_ELEVATE is only there to be handed down: programs started
         // from the desktop may ask the user for admin, and the dwm is the
-        // one that shows them the prompt (SYS_ELEVATE_AGENT).
+        // one that shows them the prompt (SYS_ELEVATE_AGENT). SYS_SEC_NET is
+        // the same: the dwm doesn't use the network, it can hand it to the
+        // programs it starts (none get it unless their mask asks for it).
         if (start_desktop) {
             strncat(sys_path, "/dwm", sizeof(sys_path) - strlen(sys_path) - 1);
             char* args[] = { sys_path, NULL };
@@ -324,9 +333,11 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
             uint32_t proc_sec = SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
                                 SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | 
                                 SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_EXEC |
-                                SYS_SEC_ELEVATE;
+                                SYS_SEC_ELEVATE | SYS_SEC_NET;
             
             console_cmd_execute(1, args, proc_sec, CONSOLE_THREAD_BLOCK | CONSOLE_THREAD_NO_BREAK);
+        } else {
+            print("\nbooting from removable media...\n");
         }
     }
     

@@ -53,7 +53,8 @@ static int cmd_cat_run(int arg_count, char** args) {
         }
 
         char buffer[128];
-        uint64_t remaining = vfs_get_size(file);
+        uint64_t remaining = vfs_file_is_device(file, NULL) ? COMMAND_DEVICE_READ_MAX
+                                                            : vfs_get_size(file);
         while (remaining > 0) {
             uint32_t want = (remaining < sizeof(buffer)) ? (uint32_t)remaining : (uint32_t)sizeof(buffer);
             int32_t got = vfs_read(file, buffer, want);

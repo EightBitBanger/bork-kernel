@@ -30,7 +30,9 @@
 //                                be a partition ("ata1p2") to install onto that one
 //   boot repair <disk> [-f]      recreate missing system folders and system files (programs, DWM images),
 //                                fix their permissions, add missing registry defaults (the desktop's
-//                                context menus, boot_registry.h), and check the boot area
+//                                context menus, file types and startup services,
+//                                boot_registry.h), set the folder policies the asset
+//                                archive lists (boot_assets.h), and check the boot area
 //   boot update <disk>           replace the boot loader and kernel only, keeping the
 //                                partition table and everything in the partition
 //
@@ -49,9 +51,15 @@
 // The install / update source is the boot area stage 2 loaded this kernel
 // from (see boot_image.h), so it works when booted from a USB stick the
 // kernel itself cannot read. The asset archive the system files are
-// extracted from is part of that boot area (behind the kernel file), so an
-// installed disk carries it too and "boot repair" works when booted from
-// it, and "boot update" refreshes it along with the kernel.
+// extracted from is part of that boot area (behind the kernel file), but
+// it is not copied: an installed disk gets stage 2 and the kernel only,
+// with stage 2's archive count set to 0 (boot_install_sectors). The
+// archive stays on the install media, and the system files it holds are
+// extracted into the partition.
+//
+// The command is for the install media: started from an installed system
+// disk it says so and does nothing (there is no archive there to install
+// or repair from).
 //
 // Everything here runs on the console thread, one command at a time, so
 // the static sector buffers below are never shared.
@@ -66,6 +74,12 @@
 #define BOOT_MBR_ENTRIES        4
 #define BOOT_MBR_SIGNATURE      0x1FE   // 0x55 0xAA
 
+// Stage 2's header (stage2.asm), at the start of LBA 1: jmp short, nop,
+// "S2AS", then the archive's length in sectors (little-endian 32-bit)
+#define BOOT_STAGE2_MAGIC           "S2AS"
+#define BOOT_STAGE2_MAGIC_OFFSET    3
+#define BOOT_STAGE2_ASSETS_OFFSET   7
+
 // Sectors read (and, where they differ, written) per request when syncing
 // the boot area. 64 is the most a USB stick takes per command.
 #define BOOT_IO_SECTORS         64
@@ -73,6 +87,8 @@
 // Static: mapped, physically stable memory a DMA driver (AHCI) can use
 static uint8_t boot_io_buffer[BOOT_IO_SECTORS * MBR_SECTOR_SIZE] __attribute__((aligned(16)));
 static uint8_t boot_mbr[MBR_SECTOR_SIZE] __attribute__((aligned(16)));
+// Stage 2's first sector as an installed disk gets it (no archive)
+static uint8_t boot_stage2_first[MBR_SECTOR_SIZE] __attribute__((aligned(16)));
 
 // System folders, relative to a device root. Parents come before children.
 // Only folders no asset lands in: the folders the archive's files go into
@@ -163,6 +179,25 @@ static const uint8_t* boot_get_image(uint32_t* sectors) {
         return NULL;
     *sectors = bytes / MBR_SECTOR_SIZE;
     return image;
+}
+
+static inline uint32_t boot_le32(const uint8_t* p);
+
+// What of the loaded boot area goes onto a disk: sector 0, stage 2 and the
+// kernel, not the asset archive behind them. Puts stage 2's first sector,
+// with its archive count set to 0, in boot_stage2_first. Returns how many
+// sectors that is. A stage 2 without the header (an older loader) can't
+// be told to skip the archive: the whole area, as before.
+static uint32_t boot_install_sectors(const uint8_t* image, uint32_t image_sectors) {
+    const uint8_t* stage2 = image + MBR_SECTOR_SIZE;
+    memcpy(boot_stage2_first, stage2, MBR_SECTOR_SIZE);
+    if (memcmp(stage2 + BOOT_STAGE2_MAGIC_OFFSET, BOOT_STAGE2_MAGIC, 4) != 0)
+        return image_sectors;
+    uint32_t assets = boot_le32(stage2 + BOOT_STAGE2_ASSETS_OFFSET);
+    if (assets >= image_sectors - 2)
+        return image_sectors;
+    memset(boot_stage2_first + BOOT_STAGE2_ASSETS_OFFSET, 0, 4);
+    return image_sectors - assets;
 }
 
 //
@@ -316,11 +351,12 @@ static bool boot_mbr_first_partition(const uint8_t* mbr, uint64_t* first) {
     return true;
 }
 
-// Compare the boot area on `disk` with `image` and, with `write`, rewrite
-// every sector that differs. Sector 0 keeps the disk's own signature and
-// partition table; only its boot code comes from the image. Nothing at or
-// past the first partition is ever touched. *changed counts the sectors
-// that differ (or were rewritten).
+// Compare the boot area on `disk` with the first `image_sectors` of `image`
+// and, with `write`, rewrite every sector that differs. Sector 0 keeps the
+// disk's own signature and partition table; only its boot code comes from
+// the image. Sector 1 (stage 2's header) comes from boot_stage2_first
+// (boot_install_sectors). Nothing at or past the first partition is ever
+// touched. *changed counts the sectors that differ (or were rewritten).
 //
 // Stage 2 and the kernel are written first and sector 0 last. This is not
 // atomic: if it is cut short the disk may not boot until it is run again.
@@ -337,7 +373,16 @@ static BootAreaResult boot_area_sync(struct BlockDevice* disk, const uint8_t* im
     if ((uint64_t)image_sectors > first_partition)
         return BOOT_AREA_TOO_SMALL;
 
-    for (uint32_t lba = 1; lba < image_sectors; ) {
+    // Sector 1: stage 2's header, its archive count as this disk gets it
+    if (!block_read(disk, 1, 1, boot_io_buffer))
+        return BOOT_AREA_IO_ERROR;
+    if (memcmp(boot_io_buffer, boot_stage2_first, MBR_SECTOR_SIZE) != 0) {
+        (*changed)++;
+        if (write && !block_write(disk, 1, 1, boot_stage2_first))
+            return BOOT_AREA_IO_ERROR;
+    }
+
+    for (uint32_t lba = 2; lba < image_sectors; ) {
         uint32_t count = image_sectors - lba;
         if (count > BOOT_IO_SECTORS)
             count = BOOT_IO_SECTORS;
@@ -421,6 +466,7 @@ static int boot_install(const char* disk_name) {
         print("No boot image (kernel not started by the boot loader)\n");
         return 1;
     }
+    image_sectors = boot_install_sectors(image, image_sectors);
 
     struct BlockDevice* device = boot_find_device(disk_name);
     if (device == NULL)
@@ -596,10 +642,17 @@ static int boot_install(const char* disk_name) {
         print(missing ? "  ! no asset archive on the boot media, system files not installed\n"
                       : "  ! some system files missing\n");
 
-    // Registry defaults (the desktop's context menus) into the new sys/hkr
+    // Registry defaults (context menus, file types, startup services) into the new sys/hkr
     BootRegistryStats reg;
     if (!boot_registry_defaults(root, false, &reg))
         print("  ! registry defaults not written\n");
+
+    // Folder policies from the archive (sys -> admin, ...), last so the
+    // registry files are covered too
+    BootPolicyStats policies;
+    bool listed = false;
+    if (!boot_apply_policies(root, &policies, &listed))
+        print("  ! some folder policies not set\n");
 
     if (!vfs_sync_all())
         print("  ! disk flush failed\n");
@@ -619,6 +672,7 @@ static int boot_update(const char* disk_name) {
         print("No boot image (kernel not started by the boot loader)\n");
         return 1;
     }
+    image_sectors = boot_install_sectors(image, image_sectors);
 
     struct BlockDevice* disk = boot_find_device(disk_name);
     if (disk == NULL)
@@ -688,6 +742,7 @@ static void boot_repair_check_area(struct BlockDevice* disk) {
         print("not checked (no boot image)\n");
         return;
     }
+    image_sectors = boot_install_sectors(image, image_sectors);
 
     uint32_t differ = 0;
     switch (boot_area_sync(disk, image, image_sectors, false, &differ)) {
@@ -769,11 +824,21 @@ static int boot_repair(const char* name, bool force) {
                          files.kept, " kept", files.failed);
     }
 
-    // Registry defaults: menus that are missing or empty (all of them with -f)
+    // Registry defaults: menus, file types and services that are missing or
+    // empty (all of them with -f)
     BootRegistryStats reg;
     bool reg_ok = boot_registry_defaults(root, force, &reg);
     boot_print_stats("registry", reg.written, " written",
                      reg.kept, " kept", reg.failed);
+
+    // Folder policies the archive lists, every time (a policy changed by
+    // hand inside one is set back)
+    BootPolicyStats policies;
+    bool listed = false;
+    bool policy_ok = boot_apply_policies(root, &policies, &listed);
+    if (listed)
+        boot_print_stats("policies", policies.folders, " folders",
+                         policies.objects, " objects set", policies.failed);
 
     // Report only: the disk may intentionally hold another kernel version
     boot_repair_check_area(disk);
@@ -782,7 +847,7 @@ static int boot_repair(const char* name, bool force) {
     if (!synced)
         print("  ! disk flush failed\n");
 
-    if (layout.failed > 0 || !files_ok || !reg_ok || !synced) {
+    if (layout.failed > 0 || !files_ok || !reg_ok || !policy_ok || !synced) {
         print("\nRepair incomplete\n");
         return 5;
     }
@@ -801,7 +866,9 @@ static const char* msg_boot_usage =
     "                               the boot partition (fdisk) and install the system\n"
     "  boot repair <disk> [-f]      restore system folders, files and registry\n"
     "                               defaults (-f replaces existing ones)\n"
-    "  boot update <disk>           update the boot loader and kernel only\n";
+    "  boot update <disk>           update the boot loader and kernel only\n"
+    "Only from the install media: the asset archive stays there, it is not\n"
+    "copied to the disk.\n";
 
 static int cmd_boot_run(int arg_count, char** args) {
     if (arg_count < 1) {
@@ -828,6 +895,13 @@ static int cmd_boot_run(int arg_count, char** args) {
 }
 
 int console_cmd_boot(int arg_count, char** args) {
+    // An installed system has no archive to install or repair from, and
+    // nothing newer than itself to update with
+    if (pci_boot_media() == PCI_BOOT_SYSTEM_DISK) {
+        print("boot only works when started from the install media (USB stick)\n");
+        console_command_end();
+        return 1;
+    }
     // Never while a program formats a disk (SYS_FORMAT), or the reverse
     if (!format_lock_try()) {
         print("Another format is running, try again when it is done\n");

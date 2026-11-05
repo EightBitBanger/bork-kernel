@@ -3,7 +3,7 @@
 
 // Block devices
 //
-// A storage driver (ATA, AHCI, RAM disk..) registers each disk it finds 
+// A storage driver (ATA, AHCI, NVMe, RAM disk..) registers each disk it finds 
 // as a BlockDevice with a small table of operations. Everything above 
 // the drivers, the filesystem included, only ever sees BlockDevice*
 // and addresses sectors through block_read / block_write / block_flush.
@@ -32,7 +32,7 @@ struct BlockDeviceOps {
 
 struct BlockDevice {
     char     name[BLOCK_NAME_MAX];  // "ata0", "ahci1", ... (also the /mnt name)
-    uint32_t sector_size;           // Bytes per sector (512 for ATA/AHCI)
+    uint32_t sector_size;           // Bytes per sector (512 for ATA/AHCI, 512..4096 for NVMe)
     uint64_t sector_count;          // Addressable sectors
 
     const struct BlockDeviceOps* ops;

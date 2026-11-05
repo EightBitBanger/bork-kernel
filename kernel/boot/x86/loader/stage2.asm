@@ -35,7 +35,6 @@ STAGING         equ 0x01000000  ; Boot area (LBA 0 .. end of the asset archive) 
 KERNEL_IMAGE    equ STAGING + KERNEL_LBA * 512  ; The kernel file inside it
 ASSETS_LBA      equ KERNEL_LBA + KERNEL_SECTORS ; Asset archive (ustar), right behind the kernel
 ASSETS_IMAGE    equ STAGING + ASSETS_LBA * 512
-BOOT_AREA_BYTES equ (ASSETS_LBA + ASSETS_SECTORS) * 512
 MODS            equ 0x1D00      ; Two multiboot_module entries (16 bytes each)
 MODS_MAX        equ 2
 HEADER_SEARCH   equ 8192        ; Multiboot header must lie in the first 8 KB
@@ -79,6 +78,18 @@ VMI_LIN_RED     equ 0x36        ; VBE 3.0+: same six bytes, for linear modes
 
 ; Mode attributes we need: supported (0), graphics (4), linear framebuffer (7)
 VMI_ATTR_NEEDED equ (1 << 0) | (1 << 4) | (1 << 7)
+
+; -----------------------------------------------------------------------------
+; Header at the start of stage 2 (LBA 1, byte 0): a jump over it, a magic and
+; the archive's length in sectors. It is data, not an assembled constant, so
+; "boot install" can write a copy of this loader with the count set to 0:
+; the archive stays on the install media, the installed disk boots with only
+; stage 2 and the kernel. boot.h (BOOT_STAGE2_*) reads and patches it.
+; -----------------------------------------------------------------------------
+    jmp     short stage2_entry
+    nop
+stage2_magic    db "S2AS"               ; BOOT_STAGE2_MAGIC
+assets_sectors  dd ASSETS_SECTORS       ; BOOT_STAGE2_ASSETS_OFFSET (7)
 
 stage2_entry:
     cli
@@ -129,20 +140,26 @@ stage2_entry:
     ; another one. This is also how the archive reaches memory when booting
     ; from a USB stick: the BIOS reads the stick here (INT 13h emulates it
     ; as a hard disk), the kernel never has to.
+    call    boot_area_bytes
+    add     eax, STAGING
     mov     dword [MODS + 0], STAGING
-    mov     dword [MODS + 4], STAGING + BOOT_AREA_BYTES
+    mov     [MODS + 4], eax
     mov     dword [MODS + 8], module_name
     mov     dword [MODS + 12], 0
     mov     dword [MBI + MBI_MODS_COUNT], 1
     mov     dword [MBI + MBI_MODS_ADDR], MODS
-%if ASSETS_SECTORS > 0
-    ; Module 1: the asset archive, a slice of module 0
+    ; Module 1: the asset archive, a slice of module 0 (when there is one)
+    mov     eax, [assets_sectors]
+    test    eax, eax
+    jz      .no_assets
+    shl     eax, 9
+    add     eax, ASSETS_IMAGE
     mov     dword [MODS + 16], ASSETS_IMAGE
-    mov     dword [MODS + 20], ASSETS_IMAGE + ASSETS_SECTORS * 512
+    mov     [MODS + 20], eax
     mov     dword [MODS + 24], assets_name
     mov     dword [MODS + 28], 0
     mov     dword [MBI + MBI_MODS_COUNT], 2
-%endif
+.no_assets:
 
     jmp     enter_kernel
 
@@ -447,11 +464,21 @@ upper_from_bios:
     mov     si, msg_memory
     jmp     fatal
 
+; EAX = bytes of the boot area: LBA 0 to the end of the archive
+boot_area_bytes:
+    mov     eax, [assets_sectors]
+    add     eax, ASSETS_LBA
+    shl     eax, 9
+    ret
+
 check_staging_fits:
+    call    boot_area_bytes
+    add     eax, STAGING
+    mov     ebx, eax
     mov     eax, [MBI + MBI_MEM_UPPER]
     shl     eax, 10
     add     eax, 0x100000
-    cmp     eax, STAGING + BOOT_AREA_BYTES
+    cmp     eax, ebx
     jae     .ok
     mov     si, msg_low_memory
     jmp     fatal
@@ -464,7 +491,9 @@ check_staging_fits:
 ; -----------------------------------------------------------------------------
 load_boot_area:
     mov     dword [read_lba], 0
-    mov     dword [read_left], ASSETS_LBA + ASSETS_SECTORS
+    mov     eax, [assets_sectors]
+    add     eax, ASSETS_LBA
+    mov     [read_left], eax
     mov     dword [read_dest], STAGING
 
 .chunk:

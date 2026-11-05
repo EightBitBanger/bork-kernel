@@ -36,9 +36,9 @@
 // only change where one ends.
 //
 // The sectors in front of the first partition hold the boot loader and
-// kernel ("boot install"). New partitions start after that boot area (8 MB),
+// kernel ("boot install"). New partitions start after that boot area (16 MB),
 // or at 1 MB with -d (a data disk that will never boot). Once a partition
-// starts lower than 8 MB, the space down to it counts as free as well.
+// starts lower than 16 MB, the space down to it counts as free as well.
 //
 // Deleting every partition leaves an empty table; the disk then shows in
 // /mnt whole again (blank) until a partition is added.
@@ -65,7 +65,7 @@ static const char* msg_fdisk_usage =
     "  fdisk <disk> new [-d] [-t<fs>] [-M<MB>..]\n"
     "                                   new partition in the first free space\n"
     "                                   (one per -M; no -M: all of that space;\n"
-    "                                   -d: data disk, may use space below 8 MB;\n"
+    "                                   -d: data disk, may use space below 16 MB;\n"
     "                                   -t: basefs (default) or fat32)\n"
     "  fdisk <disk> del <n>             delete partition n, leaving free space\n"
     "  fdisk <disk> grow <n> [-M<MB>]   grow partition n into the space after it\n"

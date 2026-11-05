@@ -31,8 +31,10 @@
 #include <kernel/console/commands/mkdir.h>
 #include <kernel/console/commands/remove.h>
 #include <kernel/console/commands/rename.h>
+#include <kernel/console/commands/move.h>
 #include <kernel/console/commands/copy.h>
 #include <kernel/console/commands/chmod.h>
+#include <kernel/console/commands/policy.h>
 
 #include <kernel/console/commands/type.h>
 #include <kernel/console/commands/cat.h>
@@ -49,6 +51,8 @@
 #include <kernel/console/commands/lsblk.h>
 #include <kernel/console/commands/ps.h>
 #include <kernel/console/commands/kill.h>
+#include <kernel/console/commands/net.h>
+#include <kernel/console/commands/drvload.h>
 
 // Indexed by id, so console_command_run() needs no search and a missing or
 // misplaced row is caught at compile time (array size) or by the NULL check.
@@ -64,7 +68,9 @@ static const ConsoleCommand command_table[] = {
     [CONSOLE_CMD_REMOVE]  = { "rm",     CONSOLE_CMD_REMOVE,  console_cmd_rm,      CONSOLE_CMD_FLAG_BUILTIN, "rm <path>" },
     [CONSOLE_CMD_RENAME]  = { "rn",     CONSOLE_CMD_RENAME,  console_cmd_rename,  CONSOLE_CMD_FLAG_BUILTIN, "rn <path> <new name>" },
     [CONSOLE_CMD_COPY]    = { "cp",     CONSOLE_CMD_COPY,    console_cmd_copy,    CONSOLE_CMD_FLAG_BUILTIN, "cp <path> <path or dir>" },
+    [CONSOLE_CMD_MOVE]    = { "mv",     CONSOLE_CMD_MOVE,    console_cmd_move,    CONSOLE_CMD_FLAG_BUILTIN, "mv <path> <path or dir>" },
     [CONSOLE_CMD_CHMOD]   = { "chmod",  CONSOLE_CMD_CHMOD,   console_cmd_chmod,   CONSOLE_CMD_FLAG_BUILTIN, "chmod [+|-|=]<xrw> <path...>" },
+    [CONSOLE_CMD_POLICY]  = { "policy", CONSOLE_CMD_POLICY,  console_cmd_policy,  CONSOLE_CMD_FLAG_BUILTIN, "policy [set <name>] [path...], group policies" },
 
     [CONSOLE_CMD_TYPE]    = { "type",   CONSOLE_CMD_TYPE,    console_cmd_type,    CONSOLE_CMD_FLAG_BUILTIN, "type <file>, print it" },
     [CONSOLE_CMD_CAT]     = { "cat",    CONSOLE_CMD_CAT,     console_cmd_cat,     CONSOLE_CMD_FLAG_BUILTIN, "cat <file...> [> or >> <dest>], join files" },
@@ -80,7 +86,15 @@ static const ConsoleCommand command_table[] = {
     [CONSOLE_CMD_LSUSB]   = { "lsusb",  CONSOLE_CMD_LSUSB,   console_cmd_lsusb,   CONSOLE_CMD_FLAG_BUILTIN, "list USB devices" },
     [CONSOLE_CMD_LSBLK]   = { "lsblk",  CONSOLE_CMD_LSBLK,   console_cmd_lsblk,   CONSOLE_CMD_FLAG_BUILTIN, "lsblk [-b] [disk...], list disks and partitions" },
     [CONSOLE_CMD_PS]      = { "ps",     CONSOLE_CMD_PS,      console_cmd_ps,      CONSOLE_CMD_FLAG_BUILTIN, "list running processes" },
-    [CONSOLE_CMD_KILL]    = { "kill",   CONSOLE_CMD_KILL,    console_cmd_kill,    CONSOLE_CMD_FLAG_BUILTIN, "kill <pid...>, end processes" }
+    [CONSOLE_CMD_KILL]    = { "kill",   CONSOLE_CMD_KILL,    console_cmd_kill,    CONSOLE_CMD_FLAG_BUILTIN, "kill <pid...>, end processes" },
+
+    [CONSOLE_CMD_IFCONFIG] = { "ifconfig", CONSOLE_CMD_IFCONFIG, console_cmd_ifconfig, CONSOLE_CMD_FLAG_BUILTIN, "ifconfig [<if> <ip>/<bits> [gw] | dhcp | none | up | down]" },
+    [CONSOLE_CMD_PING]    = { "ping",   CONSOLE_CMD_PING,    console_cmd_ping,    CONSOLE_CMD_FLAG_BUILTIN, "ping <a.b.c.d> [count]" },
+    [CONSOLE_CMD_ARP]     = { "arp",    CONSOLE_CMD_ARP,     console_cmd_arp,     CONSOLE_CMD_FLAG_BUILTIN, "list the ARP (neighbour) table" },
+    [CONSOLE_CMD_NET]     = { "net",    CONSOLE_CMD_NET,     console_cmd_net,     CONSOLE_CMD_FLAG_BUILTIN, "net [scan | list] [wlanN], wireless networks" },
+
+    [CONSOLE_CMD_LOAD]    = { "load",   CONSOLE_CMD_LOAD,    console_cmd_load,    CONSOLE_CMD_FLAG_BUILTIN, "load [driver file], start a driver; no file lists them" },
+    [CONSOLE_CMD_UNLOAD]  = { "unload", CONSOLE_CMD_UNLOAD,  console_cmd_unload,  CONSOLE_CMD_FLAG_BUILTIN, "unload <driver>, stop a loaded driver" }
 };
 
 _Static_assert(sizeof(command_table) / sizeof(command_table[0]) == CONSOLE_CMD_COUNT,

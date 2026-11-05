@@ -15,8 +15,9 @@ const uint8_t* boot_image_get(uint32_t* size);
 
 // The asset archive (ustar) "boot install" / "boot repair" extract the
 // system files from. Stage 2 reads it off the boot disk right behind the
-// kernel file, so it lies inside the boot area above and travels with it
-// to every disk "boot install" writes. Under GRUB it is a module of its own
+// kernel file, so it lies inside the boot area above. "boot install" does
+// not copy it: an installed disk gets the boot area up to the kernel's end
+// (stage 2's archive count set to 0), the archive stays on the stick. Under GRUB it is a module of its own
 // ("module /boot/assets.tar assets"). kmain() keeps it the same way as the
 // boot area.
 

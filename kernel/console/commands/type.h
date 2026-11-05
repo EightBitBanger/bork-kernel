@@ -63,7 +63,10 @@ static int cmd_type_run(int arg_count, char** args) {
     
     // Read and process in chunks
     char buffer[129];
-    uint64_t remaining = vfs_get_size(src_file);
+    // A character device (/dev/hello) has no size: read until it says the
+    // end, at most COMMAND_DEVICE_READ_MAX bytes (/dev/zero never does)
+    uint64_t remaining = vfs_file_is_device(src_file, NULL) ? COMMAND_DEVICE_READ_MAX
+                                                           : vfs_get_size(src_file);
     
     while (remaining > 0) {
         uint32_t want = (remaining < sizeof(buffer) - 1) ? (uint32_t)remaining : (uint32_t)(sizeof(buffer) - 1);
