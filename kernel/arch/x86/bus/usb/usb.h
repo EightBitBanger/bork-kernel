@@ -26,6 +26,8 @@
 //   hcd/xhci.c     USB 3 host controller (polled), all speeds
 //   usb_hid.c      boot protocol keyboards and mice, fed into the PS/2 input path
 //   usb_storage.c  mass storage (bulk-only, SCSI): block devices mounted in /mnt
+//   usb_bind.c     every other interface as a driver model device (BUS_USB),
+//                  and the pipes drivers use on it
 //
 //   usb_hotplug.c  the "usb" thread: polls keyboards and mice, notices
 //                  devices plugged in or pulled out on root and hub ports
@@ -68,6 +70,8 @@ struct UsbInterface {
 
 struct UsbController;
 struct PCIDeviceInfo;
+struct Device;
+struct UsbPipe;
 
 struct UsbDevice {
     struct UsbController* hc;
@@ -100,6 +104,13 @@ struct UsbDevice {
     char serial[USB_STRING_MAX];
 
     char node_name[16];                 // Its /dev/usb entry (usb_prop.c)
+
+    // Driver model (usb_bind.c). Interfaces usb_hid / usb_storage took are
+    // left out (bit i: interfaces[i]); the others are devices in bound[].
+    uint8_t  claimed;
+    bool     gone;                      // Unplugged: driver calls fail, freed once unbound
+    struct Device*  bound[USB_MAX_INTERFACES];
+    struct UsbPipe* pipes;              // Open driver pipes (hc->lock)
 
     // Hub class
     bool     is_hub;
@@ -150,6 +161,7 @@ uint32_t usb_controller_index(const struct UsbController* hc);
 #define USB_ERR_IO          (-3)    // CRC, babble, bit stuffing, ...
 #define USB_ERR_PARAM       (-4)
 #define USB_ERR_NOMEM       (-5)
+#define USB_ERR_GONE        (-6)    // Unplugged (driver calls below)
 
 int usb_control_transfer(struct UsbDevice* dev, uint8_t request_type, uint8_t request,
                          uint16_t value, uint16_t index, void* data, uint16_t length);
@@ -157,6 +169,55 @@ int usb_control_transfer(struct UsbDevice* dev, uint8_t request_type, uint8_t re
 // Standard requests built on usb_control_transfer()
 int usb_get_descriptor(struct UsbDevice* dev, uint8_t type, uint8_t index, uint16_t lang, void* buf, uint16_t length);
 int usb_set_configuration(struct UsbDevice* dev, uint8_t value);
+
+//
+// Drivers (driver/driver.h, BUS_USB)
+//
+// Each interface of a configured device that is not a hub, and that the
+// built-in keyboard / mouse and mass storage code did not take, is a
+// struct Device named "usb<controller>-<address>:<interface>":
+//   vendor / product                idVendor / idProduct (device descriptor)
+//   class_code / subclass / protocol the interface's
+//   bus_index                       the interface number
+// Devices are added and removed by the "usb" thread with no controller
+// locked, as driver.h asks.
+//
+// Everything a device reports is the device's word, not a fact: check
+// lengths and ranges before using any of it.
+//
+// A driver talks to its device only through the calls below. Once the
+// device is unplugged they fail with USB_ERR_GONE; its pipes are closed on
+// the host side at that moment, and the driver's remove() follows shortly
+// after. remove() must still call usb_pipe_close on each pipe (that frees
+// it). The Device and what usb_dev / usb_dev_interface return stay valid
+// until remove() returns.
+//
+
+// The USB device / interface behind a BUS_USB device, NULL for any other
+struct UsbDevice* usb_dev(const struct Device* dev);
+const struct UsbInterface* usb_dev_interface(const struct Device* dev);
+bool usb_dev_gone(const struct Device* dev);
+
+// Control transfer on endpoint 0 (usb_control_transfer), USB_ERR_GONE once
+// unplugged
+int usb_dev_control(const struct Device* dev, uint8_t request_type, uint8_t request,
+                    uint16_t value, uint16_t index, void* data, uint16_t length);
+
+// A bulk pipe on one of the interface's endpoints (the numbers come from
+// usb_dev_interface). NULL when the endpoint is not the interface's, the
+// controller has no bulk support, or out of memory.
+struct UsbPipe* usb_pipe_open_bulk(const struct Device* dev, uint8_t endpoint, bool in);
+
+// Move up to USB_PIPE_MAX bytes and wait for it. Returns the bytes moved
+// (an IN transfer may come back short), or a USB_ERR_* code.
+#define USB_PIPE_MAX        4096
+int  usb_pipe_transfer(struct UsbPipe* pipe, void* data, uint32_t length, uint32_t timeout_ms);
+
+// After USB_ERR_STALL: CLEAR_FEATURE(ENDPOINT_HALT) and reset the host side
+int  usb_pipe_clear_halt(struct UsbPipe* pipe);
+
+// Close and free (NULL: nothing)
+void usb_pipe_close(struct UsbPipe* pipe);
 
 // Names for printing
 const char* usb_speed_name(uint8_t speed);

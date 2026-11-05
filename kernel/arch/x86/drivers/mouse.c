@@ -7,7 +7,12 @@
 #include <kernel/console/mouse.h>
 #include <kernel/util/timer.h>
 
-static uint8_t mouse_packet[3];
+static uint8_t mouse_packet[4];
+
+// 3 for a plain PS/2 mouse; 4 once it answered the IntelliMouse knock
+// (mouse_initiate), the fourth byte carrying the wheel
+static uint8_t mouse_packet_size = 3;
+static uint8_t mouse_id = 0;
 
 bool mouse_left_clicked   = false;
 bool mouse_right_clicked  = false;
@@ -35,6 +40,10 @@ static volatile uint32_t mouse_queue_tail = 0; // Read by the input consumers
 
 Point mouse_get_position(void) {
     return (Point){mouse_x, mouse_y};
+}
+
+bool mouse_has_wheel(void) {
+    return mouse_packet_size == 4;
 }
 
 bool mouse_get_button(uint8_t button) {
@@ -122,6 +131,27 @@ void mouse_initiate(void) {
     mouse_write(0xF6);
     mouse_read(); // Clear the Acknowledge byte (0xFA)
     
+    // Wheel: the IntelliMouse knock. Sample rates 200, 100, 80 in a row,
+    // then a wheel mouse reports ID 3 (wheel) or 4 (wheel + buttons 4, 5)
+    // and sends 4-byte packets from then on. Anything else stays at 3.
+    static const uint8_t knock[3] = { 200, 100, 80 };
+    for (int i = 0; i < 3; i++) {
+        mouse_write(0xF3);
+        mouse_read();
+        mouse_write(knock[i]);
+        mouse_read();
+    }
+    mouse_write(0xF2);      // Get device ID
+    mouse_read();           // ACK
+    mouse_id = mouse_read();
+    mouse_packet_size = (mouse_id == 3 || mouse_id == 4) ? 4 : 3;
+    
+    // Back to the default rate the knock replaced
+    mouse_write(0xF3);
+    mouse_read();
+    mouse_write(100);
+    mouse_read();
+    
     // Tell the mouse hardware to start streaming data packets
     mouse_write(0xF4);
     mouse_read(); // Clear the Acknowledge byte (0xFA)
@@ -135,7 +165,7 @@ void mouse_initiate(void) {
     mouse_cycle = 0;
 }
 
-void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middle) {
+void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middle, int32_t wheel) {
     uint32_t next_head = (mouse_queue_head + 1) % MOUSE_QUEUE_SIZE;
 
     // Queue full. The producer (this IRQ) must never write tail: a consumer
@@ -151,6 +181,7 @@ void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middl
             mouse_queue[newest].left_button = left;
             mouse_queue[newest].right_button = right;
             mouse_queue[newest].middle_button = middle;
+            mouse_queue[newest].wheel += wheel;     // Notches add up, none lost
             mouse_queue[newest].timestamp = timer_get_ms();
         }
         return;
@@ -161,6 +192,7 @@ void mouse_enqueue_event(int32_t x, int32_t y, bool left, bool right, bool middl
     mouse_queue[mouse_queue_head].left_button = left;
     mouse_queue[mouse_queue_head].right_button = right;
     mouse_queue[mouse_queue_head].middle_button = middle;
+    mouse_queue[mouse_queue_head].wheel = wheel;
     mouse_queue[mouse_queue_head].timestamp = timer_get_ms();
     
     // Update head last so the consumer doesn't read incomplete data
@@ -209,8 +241,8 @@ void mouse_event_handler(void) {
     mouse_packet[mouse_cycle] = input_byte;
     mouse_cycle++;
     
-    // Process complete 3-byte packet
-    if (mouse_cycle == 3) {
+    // Process a complete packet (3 bytes, 4 with a wheel)
+    if (mouse_cycle >= mouse_packet_size) {
         mouse_cycle = 0; // Reset state machine for next packet
         
         // Ignore invalid overflow packets (Bit 6 = X overflow, Bit 7 = Y overflow)
@@ -226,8 +258,18 @@ void mouse_event_handler(void) {
         if (mouse_packet[0] & 0x10) rel_x |= 0xFF00; // Bit 4 = X Sign
         if (mouse_packet[0] & 0x20) rel_y |= 0xFF00; // Bit 5 = Y Sign
         
+        // Wheel, + toward the user. ID 3: the whole fourth byte; ID 4: its
+        // low four bits (sign-extended), the rest being buttons 4 and 5
+        int32_t wheel = 0;
+        if (mouse_packet_size == 4) {
+            if (mouse_id == 4)
+                wheel = (int32_t)(int8_t)(uint8_t)(mouse_packet[3] << 4) >> 4;
+            else
+                wheel = (int8_t)mouse_packet[3];
+        }
+        
         // Y axis is inverted in screen space
-        mouse_motion(rel_x, -(int32_t)rel_y, mouse_packet[0] & 0x07);
+        mouse_motion_wheel(rel_x, -(int32_t)rel_y, wheel, mouse_packet[0] & 0x07);
     }
 }
 
@@ -235,6 +277,11 @@ void mouse_event_handler(void) {
 // (1 left, 2 right, 4 middle), from the PS/2 packet above or a USB mouse
 // report (usb_hid.c, which calls it with interrupts off)
 void mouse_motion(int32_t rel_x, int32_t rel_y, uint8_t buttons) {
+    mouse_motion_wheel(rel_x, rel_y, 0, buttons);
+}
+
+// ... and wheel notches (+ toward the user, scroll down)
+void mouse_motion_wheel(int32_t rel_x, int32_t rel_y, int32_t wheel, uint8_t buttons) {
     mouse_left_clicked   = (buttons & 0x01) ? true : false;
     mouse_right_clicked  = (buttons & 0x02) ? true : false;
     mouse_middle_clicked = (buttons & 0x04) ? true : false;
@@ -257,7 +304,7 @@ void mouse_motion(int32_t rel_x, int32_t rel_y, uint8_t buttons) {
     mouse_x = fixed_mouse_x >> 8;
     mouse_y = fixed_mouse_y >> 8;
     
-    mouse_enqueue_event(mouse_x, mouse_y, mouse_left_clicked, mouse_right_clicked, mouse_middle_clicked);
+    mouse_enqueue_event(mouse_x, mouse_y, mouse_left_clicked, mouse_right_clicked, mouse_middle_clicked, wheel);
 }
 
 

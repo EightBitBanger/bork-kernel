@@ -13,6 +13,8 @@
 //   - polls each hub's status change endpoint, which reports the ports
 //     whose state changed
 //   - checks the root hub ports of every controller for connect changes
+//   - adds and removes the driver model devices (usb_bind.c), with no
+//     controller locked
 //
 // A connect change removes whatever was on that port (and everything
 // behind it, when it was a hub) and enumerates what is there now, so a
@@ -130,11 +132,12 @@ static void usb_remove_device(struct UsbDevice* dev) {
     usb_storage_detach(dev);
     if (dev->is_hub)
         usb_hotplug_unwatch_hub(dev);
+    usb_bind_unplug(dev);       // Driver pipes go before the device does
     if (hc->ops->release_device != NULL)
         hc->ops->release_device(hc, dev);
 
     usb_unregister_device(dev);
-    free(dev);
+    usb_bind_retire(dev);       // Freed once its driver let go
     exports_stale = true;
 }
 
@@ -228,6 +231,7 @@ static void usb_hotplug_thread(void* arg) {
         }
 
         usb_storage_service();
+        usb_bind_service();
 
         if (exports_stale) {
             exports_stale = false;

@@ -2,9 +2,11 @@
 #include <kernel/arch/x86/bus/usb/usb.h>
 #include <kernel/arch/x86/bus/usb/usb_internal.h>
 
+#include <kernel/driver/device.h>
+#include <kernel/driver/driver.h>
 #include <kernel/kernel.h>
 #include <kernel/knode.h>
-#include <kernel/device/device.h>
+#include <kernel/vfs/vfs.h>
 
 #include <kernel/util/string.h>
 
@@ -12,6 +14,12 @@
 // same layout as /dev/pci. <name> is the device's product string ("Cruzer_Blade"),
 // or what it is ("keyboard", "mouse", "hub") when it has none; a second device
 // of the same name gets "-2", "-3" ...
+//
+// The whole tree is rebuilt under the VFS lock by usb_export_all(), on the
+// "usb" thread after usb_bind_service(), so a device shows up here only
+// once its driver had the chance to take it: "driver" is final when the
+// device appears. Programs watch for it (the dwm says when what was
+// plugged in has no driver).
 
 static void* usb_directory = NULL;
 
@@ -33,12 +41,12 @@ static void* usb_get_directory(void) {
 
 static void usb_property(void* parent, const char* name, const char* value) {
     // Device names hold 15 characters
-    char text[sizeof(((struct Device*)0)->name)];
+    char text[KPROPERTY_TEXT_MAX];
     strncpy(text, value, sizeof(text) - 1);
     text[sizeof(text) - 1] = '\0';
 
     void* prop_dir = create_knode(name, parent);
-    struct Device* device_val = create_device(text);
+    struct KProperty* device_val = create_property(text);
     knode_add_reference(prop_dir, device_val);
     knode_set_permissions(prop_dir, KMALLOC_PERMISSION_READ);
     knode_set_permissions(device_val, KMALLOC_PERMISSION_READ);
@@ -124,7 +132,30 @@ static void usb_pick_name(void* dir, struct UsbDevice* dev) {
     }
 }
 
-void usb_export_device(struct UsbDevice* dev) {
+// What drives `dev`: "hub", "usb-hid" / "usb-storage" (built in), the
+// driver model driver bound to one of its interfaces, or "none".
+// Device.driver is read without the driver lock, as device_get() listings
+// do; only this thread adds and removes USB devices.
+static const char* usb_driver_name(const struct UsbDevice* dev) {
+    if (dev->is_hub)
+        return "hub";
+    if (dev->configuration == 0)
+        return "none";
+
+    for (uint32_t i = 0; i < dev->interfaces_known && i < USB_MAX_INTERFACES; i++) {
+        if (dev->claimed & (1U << i))
+            return dev->interfaces[i].if_class == USB_CLASS_HID ? "usb-hid" : "usb-storage";
+    }
+    for (uint32_t i = 0; i < USB_MAX_INTERFACES; i++) {
+        const struct Device* bound = dev->bound[i];
+        const struct Driver* drv = bound != NULL ? bound->driver : NULL;
+        if (drv != NULL && drv->name[0] != '\0')
+            return drv->name;
+    }
+    return "none";
+}
+
+static void usb_export_device(struct UsbDevice* dev) {
     void* dir = usb_get_directory();
     if (dir == NULL)
         return;
@@ -162,27 +193,36 @@ void usb_export_device(struct UsbDevice* dev) {
     if (dev->manufacturer[0] != '\0') usb_property(node, "maker", dev->manufacturer);
     if (dev->product[0] != '\0')      usb_property(node, "name",  dev->product);
     if (dev->serial[0] != '\0')       usb_property(node, "serial", dev->serial);
+
+    usb_property(node, "driver", usb_driver_name(dev));
 }
 
 // Free a property knode and the device value it names
 static void usb_destroy_property(void* prop, void* parent) {
     for (uint32_t n = knode_get_reference_count(prop); n > 0; n--) {
         void* value = knode_get_reference(prop, n - 1);
+        vfs_knode_revoke_handles(value);
         knode_remove_reference(prop, value);
         kfree(value);
     }
+    vfs_knode_revoke_handles(prop);
     destroy_knode(prop, parent);
 }
 
 void usb_export_all(void) {
+    // Programs read /dev/usb while it is rebuilt (VFS lock before bus locks)
+    vfs_lock();
     void* dir = usb_get_directory();
-    if (dir == NULL)
+    if (dir == NULL) {
+        vfs_unlock();
         return;
+    }
 
     for (uint32_t n = knode_get_reference_count(dir); n > 0; n--) {
         void* node = knode_get_reference(dir, n - 1);
         for (uint32_t p = knode_get_reference_count(node); p > 0; p--)
             usb_destroy_property(knode_get_reference(node, p - 1), node);
+        vfs_knode_revoke_handles(node);
         destroy_knode(node, dir);
     }
 
@@ -190,4 +230,5 @@ void usb_export_all(void) {
     for (uint32_t i = 0; i < usb_device_count(); i++)
         usb_export_device(usb_get_device(i));
     usb_device_list_unlock();
+    vfs_unlock();
 }

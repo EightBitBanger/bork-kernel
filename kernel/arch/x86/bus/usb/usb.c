@@ -205,8 +205,11 @@ void usb_init(void) {
             usb_start_controller(hc);
     }
 
-    // Disks found above get their /mnt entries (with no controller locked)
+    // Disks found above get their /mnt entries, and the other interfaces
+    // their drivers (with no controller locked)
     usb_storage_service();
+    usb_bind_service();
+    usb_export_all();
 
     // From here on devices come and go at run time: quietly
     if (controllers_started > 0) {
@@ -236,9 +239,7 @@ bool usb_register_device(struct UsbDevice* dev) {
     }
     devices[device_total++] = dev;
     usb_device_list_unlock();
-
-    usb_export_device(dev);
-    return true;
+    return true;        // In /dev/usb at the next usb_export_all()
 }
 
 void usb_unregister_device(struct UsbDevice* dev) {

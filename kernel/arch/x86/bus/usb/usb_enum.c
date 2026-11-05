@@ -347,6 +347,7 @@ struct UsbDevice* usb_enumerate_device(struct UsbController* hc, struct UsbDevic
     if (dev->configuration != 0) {
         usb_hid_attach(dev);
         usb_storage_attach(dev);
+        usb_bind_attach(dev);   // What those two left, for the driver model
     }
 
     // Children come after their hub in the device list

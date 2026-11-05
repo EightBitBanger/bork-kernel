@@ -191,8 +191,12 @@ static void usb_mouse_report(const uint8_t* report, int length) {
     if (length < 3)
         return;
 
+    // Most boot mice put the wheel in the fourth byte (+ away from the
+    // user in HID, so it is turned round: + scrolls down here)
+    int32_t wheel = (length >= 4) ? -(int32_t)(int8_t)report[3] : 0;
+
     uint32_t flags = irq_save();
-    mouse_motion((int8_t)report[1], (int8_t)report[2], report[0] & 0x07);
+    mouse_motion_wheel((int8_t)report[1], (int8_t)report[2], wheel, report[0] & 0x07);
     event_signal(&input_event);
     ipc_input_irq();
     irq_restore(flags);
@@ -318,5 +322,6 @@ void usb_hid_attach(struct UsbDevice* dev) {
         }
 
         hids[hid_count++] = hid;
+        dev->claimed |= (uint8_t)(1U << i);
     }
 }

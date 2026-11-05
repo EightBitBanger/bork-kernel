@@ -363,6 +363,19 @@ void* vmm_alloc_pages(size_t num_pages) {
     return (void*)start_vaddr;
 }
 
+// Pages of the kernel VM window nobody holds (a scan of the bitmap: 8 KB)
+uint32_t vmm_free_page_count(void) {
+    uint32_t irq_flags = irq_save();
+    uint32_t used = 0;
+    for (size_t i = 0; i < VIRT_BITMAP_SIZE; i++) {
+        uint8_t bits = virt_bitmap[i];
+        for (; bits != 0; bits &= (uint8_t)(bits - 1))     // No libgcc popcount here
+            used++;
+    }
+    irq_restore(irq_flags);
+    return (uint32_t)(VM_SIZE / PAGE_SIZE) - used;
+}
+
 void vmm_free_pages(void* virtual_addr, size_t num_pages) {
     // Round DOWN to the containing page (rounding up would skip a page)
     uint32_t vaddr = (uint32_t)virtual_addr & ~0xFFFU;

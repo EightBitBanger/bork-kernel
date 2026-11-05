@@ -10,7 +10,7 @@
 //   pci.c          pci_init(), the class driver table
 //   pci_scan.c     bus walk, bridges, the /dev/pci tree
 //   pci_config.c   configuration space, command register, BARs
-//   pci_storage.c  IDE / AHCI controllers and mounting their disks
+//   pci_storage.c  IDE / AHCI / NVMe controllers and mounting their disks
 //   pci_prop.c     /dev/pci property nodes
 //   pci_strings.c  name formatting
 //
@@ -35,6 +35,7 @@
 
 #define PCI_SUBCLASS_IDE            0x01    // PCI_CLASS_STORAGE
 #define PCI_SUBCLASS_SATA           0x06    // PCI_CLASS_STORAGE
+#define PCI_SUBCLASS_NVM            0x08    // PCI_CLASS_STORAGE (prog_if 0x02: NVMe)
 #define PCI_SUBCLASS_PCI_BRIDGE     0x04    // PCI_CLASS_BRIDGE
 #define PCI_SUBCLASS_USB            0x03    // PCI_CLASS_SERIAL_BUS
 
@@ -43,6 +44,9 @@
 #define PCI_USB_OHCI                0x10
 #define PCI_USB_EHCI                0x20
 #define PCI_USB_XHCI                0x30
+
+// NVM Express controller (prog_if of PCI_SUBCLASS_NVM)
+#define PCI_NVM_NVME                0x02
 
 // BAR decode result
 #define PCI_BAR_NONE    0   // Unimplemented / out of range
@@ -97,7 +101,7 @@ void pci_mount_removable(struct BlockDevice* disk, bool quiet);
 // tell. The boot disk is found by its disk signature (see pci_storage.c).
 enum PciBootMedia {
     PCI_BOOT_UNKNOWN,       // No boot area to compare with (booted by another loader)
-    PCI_BOOT_SYSTEM_DISK,   // A fixed (ATA / AHCI) disk, and home's /sys is on it
+    PCI_BOOT_SYSTEM_DISK,   // A fixed (ATA / AHCI / NVMe) disk, and home's /sys is on it
     PCI_BOOT_MEDIA,         // A USB disk, a disk without the system on it (a stick
                             // from build-image.sh, an install disk), or one the
                             // kernel cannot reach

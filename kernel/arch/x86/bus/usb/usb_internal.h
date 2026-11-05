@@ -164,6 +164,21 @@ void usb_storage_detach(struct UsbDevice* dev);
 // controller lock may be held: mounting reads the disk.
 void usb_storage_service(void);
 
+// Driver model (usb_bind.c)
+
+// A device just enumerated and configured (hc->lock held): its unclaimed
+// interfaces become devices at the next usb_bind_service
+void usb_bind_attach(struct UsbDevice* dev);
+// The device was unplugged (hc->lock held, before release_device): driver
+// calls fail from now on and its driver pipes are closed
+void usb_bind_unplug(struct UsbDevice* dev);
+// Instead of free(dev) for a device that was unplugged: freed by the next
+// usb_bind_service, after its devices are removed (hc->lock held)
+void usb_bind_retire(struct UsbDevice* dev);
+// Remove the devices of unplugged USB devices, then add those of new ones.
+// No controller lock may be held (driver.h lock order).
+void usb_bind_service(void);
+
 // Hot plug (usb_hotplug.c)
 
 // Start the "usb" thread (once)
@@ -191,8 +206,8 @@ int usb_control_locked(struct UsbDevice* dev, uint8_t request_type, uint8_t requ
 
 // /dev/usb (usb_prop.c)
 
-void usb_export_device(struct UsbDevice* dev);
-// Rebuild /dev/usb after devices went away (names are handed out again)
+// Rebuild /dev/usb: after enumeration, once usb_bind_service() has run
+// (names are handed out again). Takes the VFS lock: no controller locked.
 void usb_export_all(void);
 
 // Helpers (usb.c)

@@ -94,6 +94,11 @@ void vmm_init(struct MultibootInfo* mbi, uint32_t identity_map_size);
 
 void* vmm_alloc_pages(size_t num_pages);
 void vmm_free_pages(void* virtual_addr, size_t num_pages);
+
+// Pages of the kernel VM window (vmm_alloc_pages, kernel heap, kernel
+// stacks, user page tables) still free. Process creation keeps a reserve
+// of these for the kernel itself.
+uint32_t vmm_free_page_count(void);
 void vmm_unmap_page(uint32_t virtual_addr);
 
 // Map a physical address into kernel space. Panics on a user-space address.

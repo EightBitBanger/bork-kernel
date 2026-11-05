@@ -365,6 +365,7 @@ void usb_storage_attach(struct UsbDevice* dev) {
 
     disk->mount_pending = true;
     disks[disk_count++] = disk;
+    dev->claimed |= (uint8_t)(1U << (itf - dev->interfaces));
 }
 
 void usb_storage_detach(struct UsbDevice* dev) {

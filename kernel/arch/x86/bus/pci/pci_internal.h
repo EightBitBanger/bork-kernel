@@ -45,6 +45,7 @@ void pci_probe_driver(const struct PCIDeviceInfo* info, struct PCIScanContext* c
 
 void pci_storage_probe_ide(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
 void pci_storage_probe_ahci(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
+void pci_storage_probe_nvme(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx);
 
 // Properties (pci_prop.c)
 

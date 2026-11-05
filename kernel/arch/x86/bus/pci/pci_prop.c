@@ -9,7 +9,7 @@
 
 void* pci_create_property_node(void* parent_knode, const char* name, const char* value) {
     void* prop_dir = create_knode(name, parent_knode);
-    struct Device* device_val = create_device(value);
+    struct KProperty* device_val = create_property(value);
     knode_add_reference(prop_dir, device_val);
     knode_set_permissions(prop_dir, KMALLOC_PERMISSION_READ);
     knode_set_permissions(device_val, KMALLOC_PERMISSION_READ);

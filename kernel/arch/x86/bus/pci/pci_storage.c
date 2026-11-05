@@ -4,6 +4,7 @@
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/arch/x86/drivers/ahci/ahci.h>
 #include <kernel/arch/x86/drivers/ata/ata.h>
+#include <kernel/arch/x86/drivers/nvme/nvme.h>
 #include <kernel/block/block.h>
 #include <kernel/block/partition.h>
 #include <kernel/boot/x86/boot_image.h>
@@ -291,6 +292,50 @@ void pci_storage_probe_ahci(const struct PCIDeviceInfo* info, struct PCIScanCont
         struct BlockDevice* device = ahci_create_block_device(port);
         if (device != NULL)
             pci_mount_disk(device, ctx->mnt_dir, ctx->fs_paths);
+    }
+}
+
+void pci_storage_probe_nvme(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx) {
+    uint8_t bus = info->bus, dev = info->dev, func = info->func;
+    uint16_t location = (uint16_t)((bus << 8) | (dev << 3) | func);
+
+    // A second scan finds the controller already running: only namespaces
+    // not registered yet are mounted
+    struct NvmeController* ctrl = nvme_find_controller(location);
+    if (ctrl == NULL) {
+        // Polled: INTx stays off so the controller never raises an
+        // interrupt nothing handles
+        pci_enable_command_bits(bus, dev, func,
+                                PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER | PCI_COMMAND_INTX_DISABLE);
+
+        // BAR0 (64-bit, BAR0-1): the registers and the first doorbells.
+        // The driver is told how much is mapped, so it never touches a
+        // doorbell past the end of it.
+        struct PCIBar bar;
+        if (pci_read_bar(bus, dev, func, 0, &bar) == 0 || bar.size == 0)
+            return;
+        uint32_t size = bar.size < NVME_MMIO_SIZE ? (uint32_t)bar.size : NVME_MMIO_SIZE;
+
+        uint32_t flags = VM_PRESENT | VM_READWRITE | VM_PCD;
+        void* regs = pci_map_bar(bus, dev, func, 0, size, flags);
+        if (regs == NULL) return;
+
+        ctrl = nvme_init(regs, size, location);
+        if (ctrl == NULL) return;
+    }
+
+    uint32_t count = nvme_namespace_count(ctrl);
+    for (uint32_t i = 0; i < count; i++) {
+        struct NvmeNamespace* ns = nvme_get_namespace(ctrl, i);
+        if (ns == NULL || block_find_driver(ns) != NULL)
+            continue;   // Already mounted
+
+        struct BlockDevice* device = nvme_create_block_device(ns);
+        if (device == NULL) {
+            storage_print("NVMe Error: could not register disk\n");
+            continue;
+        }
+        pci_mount_disk(device, ctx->mnt_dir, ctx->fs_paths);
     }
 }
 

@@ -2,15 +2,52 @@
 #include <kernel/arch/x86/bus/pci/pci_internal.h>
 #include <kernel/arch/x86/bus/usb/usb.h>
 
+#include <kernel/driver/device.h>
 #include <kernel/kernel.h>
 #include <kernel/knode.h>
+#include <kernel/malloc.h>
+#include <kernel/util/string.h>
+#include <kernel/util/snprint.h>
+
+// Network controllers go to the driver model (driver/device.h) as BUS_PCI
+// devices, so a driver claims them by vendor / device ID through its match
+// table (the AR9485 Wi-Fi card, drivers/net/athn_pci.c). pci_init() may run
+// twice (the F7 console, then the boot); a function already added is kept.
+static void pci_device_add(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx) {
+    (void)ctx;
+    char name[DEVICE_NAME_MAX];
+    snprintf(name, sizeof(name), "pci%u:%02x.%u", (unsigned)info->bus, (unsigned)info->dev, (unsigned)info->func);
+    if (device_find(name) != NULL)
+        return;
+
+    // The device keeps a pointer to it for as long as it lives
+    struct PCIDeviceInfo* copy = (struct PCIDeviceInfo*)malloc(sizeof(struct PCIDeviceInfo));
+    if (copy == NULL)
+        return;
+    memcpy(copy, info, sizeof(*copy));
+
+    struct DeviceInfo dev = {
+        .bus        = BUS_PCI,
+        .vendor     = info->vendor_id,
+        .product    = info->device_id,
+        .class_code = info->class_code,
+        .subclass   = info->subclass,
+        .protocol   = info->prog_if,
+        .bus_data   = copy,
+        .bus_index  = 0,
+    };
+    if (device_add(name, NULL, &dev) == NULL)
+        free(copy);
+}
 
 // Class drivers, first match wins. Functions nothing matches still get
 // their /dev/pci entry.
 static const struct PCIClassDriver pci_class_drivers[] = {
     { PCI_CLASS_STORAGE,    PCI_SUBCLASS_IDE,  PCI_ANY, pci_storage_probe_ide  },
     { PCI_CLASS_STORAGE,    PCI_SUBCLASS_SATA, PCI_ANY, pci_storage_probe_ahci },
+    { PCI_CLASS_STORAGE,    PCI_SUBCLASS_NVM,  PCI_NVM_NVME, pci_storage_probe_nvme },
     { PCI_CLASS_SERIAL_BUS, PCI_SUBCLASS_USB,  PCI_ANY, usb_pci_probe          },
+    { PCI_CLASS_NETWORK,    PCI_ANY,           PCI_ANY, pci_device_add         },
 };
 
 #define PCI_CLASS_DRIVER_COUNT  (sizeof(pci_class_drivers) / sizeof(pci_class_drivers[0]))

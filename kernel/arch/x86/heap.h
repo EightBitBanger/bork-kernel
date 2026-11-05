@@ -35,11 +35,12 @@
 #define KMALLOC_PERMISSION_WRITE       0x04
 #define KMALLOC_PERMISSION_USER        0x08
 
-#define KMALLOC_TYPE_DEVICE            0x01
+#define KMALLOC_TYPE_PROPERTY          0x01    // struct KProperty (kernel.h)
 #define KMALLOC_TYPE_DRIVER            0x02
 #define KMALLOC_TYPE_BLOCK             0x04
 #define KMALLOC_TYPE_RAW               0x08
 #define KMALLOC_TYPE_PROCBLOCK         0x10
+#define KMALLOC_TYPE_CHARDEV           0x20    // struct CharDevice (driver/chardev.h)
 
 // size stays the first field, for code that reads the header directly.
 // 32 bytes on x86; wider pointers make it 48, still a multiple of 16.
