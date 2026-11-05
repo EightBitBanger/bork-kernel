@@ -1,4 +1,5 @@
 #include <kernel/malloc.h>
+#include <kernel/security/policy.h>
 #include <kernel/registry/registry.h>
 #include <kernel/util/string.h>
 #include <kernel/vfs/vfs.h>
@@ -457,6 +458,15 @@ bool registry_hive_initiate(const char* path) {
             ok = false;
         }
     }
+    
+    // The group policies (kernel/security/policy.h), read-only, under
+    // hkey_root/system/policy. Rewritten whenever the hive's copy doesn't
+    // match the kernel's table, so an older or edited hive is corrected.
+    bool policy_failed = false;
+    if (policy_registry_publish(&hkey_root, &policy_failed) &&
+        !registry_hive_export(&hkey_root, hkr_fpath))
+        ok = false;
+    if (policy_failed) ok = false;
     
     return ok;
 }

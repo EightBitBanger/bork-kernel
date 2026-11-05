@@ -105,5 +105,10 @@ bool registry_get_string(struct RegistryKey* parent, const char* name, char* out
 // Free every subkey and value below `key`, leaving the key itself (empty)
 void registry_clear_key(struct RegistryKey* key);
 
+// Unlink the subkey / value `name` from `parent` and free it (a key with
+// everything below it). False when there is none by that name.
+bool registry_remove_key(struct RegistryKey* parent, const char* name);
+bool registry_remove_value(struct RegistryKey* parent, const char* name);
+
 #endif
 

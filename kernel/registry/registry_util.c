@@ -113,3 +113,37 @@ void registry_clear_key(struct RegistryKey* key) {
     }
     key->values = NULL;
 }
+
+bool registry_remove_key(struct RegistryKey* parent, const char* name) {
+    if (parent == NULL || name == NULL) return false;
+    
+    struct RegistryKey** link = &parent->child_keys;
+    while (*link != NULL) {
+        struct RegistryKey* key = *link;
+        if (strcmp(key->name, name) == 0) {
+            *link = key->next;
+            key->next = NULL;
+            registry_free_key(key);
+            return true;
+        }
+        link = &key->next;
+    }
+    return false;
+}
+
+bool registry_remove_value(struct RegistryKey* parent, const char* name) {
+    if (parent == NULL || name == NULL) return false;
+    
+    struct RegistryValue** link = &parent->values;
+    while (*link != NULL) {
+        struct RegistryValue* value = *link;
+        if (strcmp(value->name, name) == 0) {
+            *link = value->next;
+            if (value->data != NULL) free(value->data);
+            free(value);
+            return true;
+        }
+        link = &value->next;
+    }
+    return false;
+}

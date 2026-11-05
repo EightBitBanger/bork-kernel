@@ -3,9 +3,8 @@
 
 // ELF32 executable loader (i386, static, non-PIE)
 //
-// A resource class, but not a ResourceHandler: an executable is a plain ELF
-// file (no RSRC header) and loads into a user address space, not the kernel
-// heap. File reads go through resources/resource_io.h like every class.
+// An executable is a plain ELF file and loads into a user address space,
+// not the kernel heap. File reads go through resources/resource_io.h.
 //
 // elf_load() reads an executable through the VFS and builds its image in a
 // user address space: every PT_LOAD segment gets zeroed pages at p_vaddr

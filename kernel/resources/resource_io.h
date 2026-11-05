@@ -4,7 +4,7 @@
 
 // Shared helpers for resource classes: little-endian field encoding and
 // exact-length file I/O (vfs_read / vfs_write may return short counts).
-// Used by the manager and by every class under resources/classes/.
+// Used by the ELF loader (resources/classes/elf.c).
 
 #include <stdint.h>
 #include <stdbool.h>
