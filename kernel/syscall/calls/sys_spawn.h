@@ -9,6 +9,7 @@
 #include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/scheduler/process.h>
+#include <kernel/security/elevate.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/ipc/ipc.h>
@@ -100,9 +101,18 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
     // Admin the user granted (SYS_ELEVATE) is not passed on by default: a
     // child of an elevated process gets it only when the mask says so, and
     // is then elevated too.
+    //
+    // SYS_SPAWN_ELEVATE (syscall.h, "Processes"): the child also gets what
+    // the executable's file needs, after the user's yes for bits we don't
+    // hold ourselves. Worked out once the path is known (below).
     ProcessSecurity mine = process_current_security();
     ProcessSecurity mask = (ProcessSecurity)args->arg4;
     bool elevated = process_current_elevated();
+    bool with_file = false;
+    if (mask != SYS_SPAWN_INHERIT && (mask & SYS_SPAWN_ELEVATE) != 0) {
+        mask &= ~SYS_SPAWN_ELEVATE;
+        with_file = true;
+    }
     if (mask == SYS_SPAWN_INHERIT)
         mask = elevated ? (mine & ~SYS_SEC_ADMIN) : mine;
     else if ((mask & ~SYS_SEC_VALID) != 0)
@@ -148,7 +158,8 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
     else
         q->argc = 0;
 
-    // Clear answers for the common failures before the loader runs
+    // Clear answers for the common failures before the loader runs (and
+    // before anyone is asked)
     if (result == SYS_OK) {
         FSFileStats st;
         if (strlen(q->path) >= PROCESS_PATH_MAX)
@@ -157,9 +168,40 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
             result = SYS_ENOENT;
         else if (st.type != VFS_TYPE_FILE)
             result = SYS_EISDIR;
-        else if (!vfs_check_access(q->path))
-            result = SYS_EACCES;
     }
+
+    // SYS_SPAWN_ELEVATE: the bits the file needs go to the child too. Those
+    // we lack need the user's yes for this one launch; the file is then
+    // checked and loaded with them as clearance, on this thread, until the
+    // call returns. Our own mask stays as it is.
+    bool boosted = false;
+    ProcessSecurity old_extra = 0;
+    if (result == SYS_OK && with_file) {
+        uint32_t needs = 0;
+        if (!vfs_get_security(q->path, &needs))
+            needs = 0;                  // A file system that keeps no mask
+        needs &= SYS_SEC_VALID;
+        ProcessSecurity added  = needs & ~mask;     // What the child gets on top
+        ProcessSecurity asked  = needs & ~mine;     // ... that isn't ours to give
+        if (asked != 0) {
+            if (!(mine & SYS_SEC_ELEVATE))
+                result = SYS_EPERM;
+            else
+                result = elevate_request_launch(q->path, asked);
+            if (result == SYS_OK) {
+                old_extra = process_current_set_clearance_extra(asked);
+                boosted = true;
+            }
+        }
+        if (result == SYS_OK) {
+            mask |= added;
+            if (added & SYS_SEC_ADMIN)
+                elevated = true;        // Admin from the user's yes (or ours to hand down)
+        }
+    }
+
+    if (result == SYS_OK && !vfs_check_access(q->path))
+        result = SYS_EACCES;
 
     if (result == SYS_OK) {
         ProcessLaunch launch = {
@@ -175,6 +217,8 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
         ProcessId pid = CreateProcessLaunch(&launch);
         result = (pid > 0) ? (int32_t)pid : sys_spawn_error(pid);
     }
+    if (boosted)
+        process_current_set_clearance_extra(old_extra);
 
     free(q);
     return result;

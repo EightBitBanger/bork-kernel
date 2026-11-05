@@ -32,7 +32,8 @@
 #define WD_MAX_LOCKS      24
 #define WD_MAX_NAMES      24
 #define WD_MAX_WATCHES    16
-#define WD_MAX_THREADS    64
+#define WD_MAX_THREADS    64        // Threads listed in a dump
+#define WD_SCAN_THREADS   (1 << 20) // Loop guard when only looking (no fixed thread count)
 #define WD_MAX_WAITERS    32
 #define WD_MAX_FRAMES     10        // One backtrace line must fit the screen at 1x
 #define WD_MAX_CHAIN      16
@@ -404,7 +405,7 @@ static void wd_locks_section(void) {
     // Unnamed mutexes somebody is waiting on (each printed once)
     if (thread_queue == NULL) return;
     ThreadBlock* t = thread_queue;
-    int guard = WD_MAX_THREADS;
+    int guard = WD_SCAN_THREADS;
     do {
         mutex_t* m = wd_waiting_on(t);
         if (m != NULL && wd_lock_name(m) == NULL) {
@@ -489,6 +490,8 @@ static void wd_threads_section(uint64_t now, const ThreadBlock* stale) {
             wd_dump_thread(t, now, stale);
             t = t->next;
         } while (t != NULL && t != thread_queue && guard-- > 0);
+        if (t != NULL && t != thread_queue)
+            out_s("  ... more threads, not listed\n");
     }
 
     // The idle thread is not in the run queue
@@ -604,7 +607,7 @@ static void wd_check_lock_waits(uint64_t now) {
 
     ThreadBlock* worst = NULL;
     ThreadBlock* t = thread_queue;
-    int guard = WD_MAX_THREADS;
+    int guard = WD_SCAN_THREADS;
     do {
         mutex_t* m = wd_waiting_on(t);
         if (m != NULL) {

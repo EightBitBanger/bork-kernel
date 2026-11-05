@@ -29,10 +29,22 @@
 // Everything below 0x40000000 and from 0xC0000000 up is kernel, mapped
 // supervisor-only: a user access there page-faults and kills the process.
 //
-// ProcessId layout: [ generation (23 bits) | slot (8 bits) ], always > 0.
+// Process slots: there is no fixed process count. Slots are allocated in
+// blocks of PROCESS_BLOCK_SLOTS as they are needed and are never moved or
+// freed, so a Process pointer stays valid for the life of the kernel. A new
+// process is refused (PROCESS_ERR_NO_SLOTS, SYS_EAGAIN from SYS_SPAWN) only
+// when memory runs low: fewer than PROCESS_RESERVE_FRAMES frames above the
+// PMM's kernel reserve, or fewer than PROCESS_RESERVE_KERNEL_PAGES pages left
+// in the kernel VM window. That leaves the kernel room to keep running (and
+// the existing processes room to exit) however many programs are started.
+// PROCESS_SLOT_LIMIT, set by the id layout, is far beyond what memory holds.
+//
+// ProcessId layout: [ generation (15 bits) | slot (16 bits) ], always > 0.
 // The generation is bumped every time a slot is freed, so a stale id held
 // after DestroyProcess() can never refer to a newer process that happened
-// to reuse the same slot.
+// to reuse the same slot. Free slots are reused round robin, so the
+// generations of all slots advance together and an id comes back only after
+// about 32768 x (slots in use) process starts.
 //
 // Working directory: every process starts with one, set before its first
 // thread runs (syscall_process_start). Relative paths in file syscalls
@@ -70,7 +82,10 @@
 // SYS_SPAWN reaches CreateProcessLaunch() from user space, always with a
 // mask inside the caller's own.
 
-#define PROCESS_MAX                64     // Must be <= 256 (8-bit slot field)
+#define PROCESS_SLOT_LIMIT      65536     // Slot field of a ProcessId (16 bits); memory runs out first
+#define PROCESS_BLOCK_SLOTS        64     // Slots added at a time
+#define PROCESS_RESERVE_FRAMES    128     // Free frames (512 KB) above the PMM reserve a new process needs
+#define PROCESS_RESERVE_KERNEL_PAGES 2048 // Kernel VM window pages (8 MB) kept back from new processes
 #define PROCESS_NAME_MAX           16
 #define PROCESS_PATH_MAX          256
 #define PROCESS_ARG_MAX            64     // argv strings (= SYS_ARG_MAX)
@@ -109,7 +124,7 @@ typedef uint32_t ProcessSecurity;
 // Error codes (all negative, so any ProcessId > 0 is a success)
 #define PROCESS_OK                  0
 #define PROCESS_ERR_INVALID_ARG    -1
-#define PROCESS_ERR_NO_SLOTS       -2
+#define PROCESS_ERR_NO_SLOTS       -2     // Not enough memory left for another process
 #define PROCESS_ERR_NO_MEMORY      -3
 #define PROCESS_ERR_NO_PAGING      -4
 #define PROCESS_ERR_LOAD_FAILED    -5     // The executable could not be read
@@ -277,6 +292,10 @@ bool ProcessGetImage(ProcessId pid, char name[PROCESS_NAME_MAX], char path[PROCE
 // Number of live (creating or running) processes
 uint32_t process_get_count(void);
 
+// Process slots allocated so far (live or free), a multiple of
+// PROCESS_BLOCK_SLOTS. Grows with demand, never shrinks.
+uint32_t process_get_capacity(void);
+
 // Short, static, human-readable text for a PROCESS_ERR_* code
 const char* process_error_string(int code);
 
@@ -306,6 +325,14 @@ bool process_current_elevated(void);
 // is refused, so a process without SYS_SEC_ADMIN cannot touch files marked
 // VFS_SECURITY_ADMIN.
 uint32_t process_current_clearance(void);
+
+// Extra bits process_current_clearance() counts for the calling process,
+// on top of its mask, for file access only (no syscall checks them). For
+// the kernel's own use inside one syscall, put back before it returns:
+// SYS_SPAWN_ELEVATE loads the executable with admin clearance after the
+// user's yes, SYS_FINFO reads a program's kind marks. Returns the previous
+// extra bits.
+ProcessSecurity process_current_set_clearance_extra(ProcessSecurity bits);
 
 // Address space of the calling thread's process, NULL for a kernel thread
 struct AddressSpace* process_current_space(void);

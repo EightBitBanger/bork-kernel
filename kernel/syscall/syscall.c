@@ -21,7 +21,7 @@
 // File calls. sys_files.h holds the per-process descriptor tables and
 // working directories they share; sys_user.h the user-memory helpers.
 #include <kernel/syscall/calls/sys_file.h>      // open close read write seek fstat
-#include <kernel/syscall/calls/sys_path.h>      // stat mkdir remove rename truncate copy
+#include <kernel/syscall/calls/sys_path.h>      // stat mkdir remove rename truncate copy move
 #include <kernel/syscall/calls/sys_dir.h>       // readdir chdir getcwd
 
 // Graphics: per-process surfaces drawn with the kernel's gfx layer
@@ -34,7 +34,6 @@
 #include <kernel/syscall/calls/sys_ipc.h>       // ipc_* shm_* input_*
 
 // Resources: load by path, look up by name, draw with the gfx calls
-#include <kernel/syscall/calls/sys_resource.h>  // res_load res_get res_info
 #include <kernel/syscall/calls/sys_home.h>      // gethome
 #include <kernel/syscall/calls/sys_time.h>      // time
 #include <kernel/syscall/calls/sys_input.h>     // input_warp
@@ -43,8 +42,9 @@
 #include <kernel/syscall/calls/sys_spawn.h>     // spawn
 
 // File details beyond stat: security mask, device usage; permission changes
-#include <kernel/syscall/calls/sys_finfo.h>     // finfo chmod
+#include <kernel/syscall/calls/sys_finfo.h>     // finfo chmod setpolicy setsecurity
 #include <kernel/syscall/calls/sys_sync.h>      // sync
+#include <kernel/syscall/calls/sys_unmount.h>   // unmount
 
 // Elevation: a program asks the user for admin; the desktop asks the user
 #include <kernel/syscall/calls/sys_elevate.h>   // elevate elevate_agent
@@ -52,8 +52,14 @@
 // Formatting: describe or format a storage device (admin to write)
 #include <kernel/syscall/calls/sys_format.h>    // format
 
-// Registry (read only)
-#include <kernel/syscall/calls/sys_registry.h>  // reg_get reg_keys
+// Registry
+#include <kernel/syscall/calls/sys_registry.h>  // reg_get reg_keys reg_set reg_values reg_delete reg_mkkey reg_rename
+
+// Network: TCP sockets (SYS_SEC_NET)
+#include <kernel/syscall/calls/sys_net.h>       // sock_*
+
+// Drivers: load a driver file into the kernel (admin)
+#include <kernel/syscall/calls/sys_driver.h>    // drv_load drv_unload
 
 typedef struct {
     const char* name;       // For traces and reports
@@ -66,6 +72,7 @@ typedef struct {
 #define GFX SYS_SEC_GFX
 #define IPC SYS_SEC_IPC
 #define INP SYS_SEC_INPUT
+#define NET SYS_SEC_NET
 
 // Indexed by syscall number, so a missing row is a compile error.
 //
@@ -117,9 +124,6 @@ static const SyscallEntry syscall_table[] = {
     [SYS_IPC_INFO]    = { "ipc_info",    sys_ipc_info,    0 },
     [SYS_INPUT_OPEN]  = { "input_open",  sys_input_open,  INP },
     [SYS_INPUT_READ]  = { "input_read",  sys_input_read,  INP },
-    [SYS_RES_LOAD]    = { "res_load",    sys_res_load,    R | GFX },
-    [SYS_RES_GET]     = { "res_get",     sys_res_get,     GFX },
-    [SYS_RES_INFO]    = { "res_info",    sys_res_info,    GFX },
     [SYS_GETHOME]     = { "gethome",     sys_gethome,     0 },      // Always, like getcwd
     [SYS_TIME]        = { "time",        sys_time,        0 },
     [SYS_INPUT_WARP]  = { "input_warp",  sys_input_warp,  INP },    // + the caller's input handle
@@ -136,6 +140,27 @@ static const SyscallEntry syscall_table[] = {
     [SYS_TTY_RESIZE]  = { "tty_resize",  sys_tty_resize,  IPC },
     [SYS_REG_GET]     = { "reg_get",     sys_reg_get,     R },
     [SYS_REG_KEYS]    = { "reg_keys",    sys_reg_keys,    R },
+    [SYS_SOCK_LISTEN] = { "sock_listen", sys_sock_listen, NET },    // + ADMIN below port 1024
+    [SYS_SOCK_CONNECT] = { "sock_connect", sys_sock_connect, NET },
+    [SYS_SOCK_ACCEPT] = { "sock_accept", sys_sock_accept, NET },
+    [SYS_SOCK_SEND]   = { "sock_send",   sys_sock_send,   NET },
+    [SYS_SOCK_RECV]   = { "sock_recv",   sys_sock_recv,   NET },
+    [SYS_SOCK_CLOSE]  = { "sock_close",  sys_sock_close,  0 },      // Always: lets a process let go
+    [SYS_SOCK_WAIT]   = { "sock_wait",   sys_sock_wait,   NET },
+    [SYS_SOCK_INFO]   = { "sock_info",   sys_sock_info,   NET },
+    [SYS_DRV_LOAD]    = { "drv_load",    sys_drv_load,    SYS_SEC_ADMIN | R },
+    [SYS_DRV_UNLOAD]  = { "drv_unload",  sys_drv_unload,  SYS_SEC_ADMIN },
+    [SYS_REG_SET]     = { "reg_set",     sys_reg_set,     W },      // + ADMIN for hkey_root
+    [SYS_REG_VALUES]  = { "reg_values",  sys_reg_values,  R },
+    [SYS_REG_DELETE]  = { "reg_delete",  sys_reg_delete,  W },      // + ADMIN for hkey_root
+    [SYS_REG_MKKEY]   = { "reg_mkkey",   sys_reg_mkkey,   W },      // + ADMIN for hkey_root
+    [SYS_REG_RENAME]  = { "reg_rename",  sys_reg_rename,  W },      // + ADMIN for hkey_root
+    [SYS_DRV_CALL]    = { "drv_call",    sys_drv_call,    0 },      // + the function's own security bits
+    [SYS_DRV_EXPORTS] = { "drv_exports", sys_drv_exports, 0 },
+    [SYS_MOVE]        = { "move",        sys_move,        W },
+    [SYS_UNMOUNT]     = { "unmount",     sys_unmount,     W },      // never the system disk
+    [SYS_SETPOLICY]   = { "setpolicy",   sys_setpolicy,   SYS_SEC_ADMIN | W },
+    [SYS_SETSECURITY] = { "setsecurity", sys_setsecurity, SYS_SEC_ADMIN | W },
 };
 
 #undef R
@@ -143,6 +168,7 @@ static const SyscallEntry syscall_table[] = {
 #undef GFX
 #undef IPC
 #undef INP
+#undef NET
 
 _Static_assert(sizeof(syscall_table) / sizeof(syscall_table[0]) == SYS_COUNT,
                "every syscall number needs a row in syscall_table");
@@ -164,8 +190,6 @@ _Static_assert(SYS_GFX_BLEND_COPY == GFX_BLEND_COPY && SYS_GFX_BLEND_ALPHA == GF
                SYS_GFX_GRADIENT_VERTICAL == GFX_GRADIENT_VERTICAL &&
                SYS_GFX_GRADIENT_HORIZONTAL == GFX_GRADIENT_HORIZONTAL, "SYS_GFX_* must match the gfx layer");
 _Static_assert(SYS_GFX_PIE_MAX == GFX_PIE_MAX_SLICES, "SYS_GFX_PIE_MAX must equal GFX_PIE_MAX_SLICES");
-_Static_assert(SYS_RES_TYPE_SPRITE == RESOURCE_TYPE_SPRITE, "SYS_RES_TYPE_* must match ResourceType");
-_Static_assert(sizeof(SysResInfo) == 16, "SysResInfo is part of the user ABI");
 
 // File security masks hold SYS_SEC_* bits: a process's mask is its clearance
 _Static_assert(VFS_SECURITY_ADMIN == SYS_SEC_ADMIN, "VFS_SECURITY_ADMIN must equal SYS_SEC_ADMIN");
@@ -208,6 +232,7 @@ void syscall_process_exit(uint32_t process_id) {
     sys_gfx_process_exit(process_id);
     ipc_process_exit(process_id);       // Unmaps shared memory: the space must still exist
     elevate_process_exit((int32_t)process_id);
+    sys_net_process_exit(process_id);
 }
 
 // Called from isr_syscall.asm with interrupts enabled, on the calling

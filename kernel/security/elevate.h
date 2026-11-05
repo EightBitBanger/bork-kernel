@@ -35,6 +35,13 @@
 // is copied and cleaned. Blocks; thread context. SYS_OK or a SYS_E* code.
 int32_t elevate_request(const char* reason);
 
+// SYS_SPAWN_ELEVATE for bits the caller lacks: the same prompt, naming
+// the program at `image_path` (absolute, resolved by the kernel) as the one
+// to start, the caller as the one starting it, and the `requested` bits.
+// Grants nothing: SYS_OK tells sys_spawn the user said yes for this launch.
+// A no is SYS_ECANCELED; otherwise the codes of elevate_request(). Blocks.
+int32_t elevate_request_launch(const char* image_path, uint32_t requested);
+
 // SYS_ELEVATE_AGENT. Each checks that the caller is the agent (REGISTER
 // makes it one). Thread context.
 int32_t elevate_agent_register(void);

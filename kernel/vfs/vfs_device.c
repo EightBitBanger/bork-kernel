@@ -513,6 +513,50 @@ VfsFormatResult vfs_device_remove_disk(struct BlockDevice* disk) {
     return VFS_FORMAT_OK;
 }
 
+// Unmount for removal (vfs.h): sync everything first, and only when all of
+// it reached the disk detach and drop the /mnt entries, so a failure
+// leaves the drive mounted and its files reachable
+VfsFormatResult vfs_device_unmount_disk(struct BlockDevice* disk) {
+    if (disk == NULL) return VFS_FORMAT_NOT_MOUNTED;
+    vfs_lock();
+    VfsFormatResult result = VFS_FORMAT_OK;
+    void* mnt = vfs_mnt_directory();
+    uint32_t count = (mnt != NULL) ? knode_get_reference_count(mnt) : 0;
+
+    bool any = false;
+    for (uint32_t i = 0; i < count; i++) {
+        struct FsMount* mount = vfs_mount_at(mnt, i);
+        if (mount == NULL || !vfs_mount_on_disk(mount, disk))
+            continue;
+        any = true;
+        if (vfs_mount_has_open_files(mount))
+            result = VFS_FORMAT_BUSY;
+    }
+    if (!any)
+        result = VFS_FORMAT_NOT_MOUNTED;
+
+    for (uint32_t i = 0; i < count && result == VFS_FORMAT_OK; i++) {
+        struct FsMount* mount = vfs_mount_at(mnt, i);
+        if (mount != NULL && vfs_mount_on_disk(mount, disk) && mount->is_open &&
+            !mount->type->sync(mount))
+            result = VFS_FORMAT_IO_ERROR;
+    }
+    // The drive's own cache too: a stick may hold writes it has acknowledged
+    if (result == VFS_FORMAT_OK && !block_flush(disk))
+        result = VFS_FORMAT_IO_ERROR;
+
+    if (result == VFS_FORMAT_OK) {
+        for (uint32_t i = 0; i < count; i++) {
+            struct FsMount* mount = vfs_mount_at(mnt, i);
+            if (mount != NULL && vfs_mount_on_disk(mount, disk))
+                vfs_mount_detach(mount);
+        }
+        do_prune_disk(disk);
+    }
+    vfs_unlock();
+    return result;
+}
+
 void vfs_device_prune_disk(struct BlockDevice* disk) {
     if (disk == NULL) return;
     vfs_lock();

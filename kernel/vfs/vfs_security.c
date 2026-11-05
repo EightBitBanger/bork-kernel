@@ -215,14 +215,22 @@ static bool do_get_security(const char* path, uint32_t* security) {
     return vfs_fs_node_security(mount, address, security);
 }
 
+bool vfs_security_change_allowed(uint32_t old_mask, uint32_t new_mask) {
+    uint32_t clearance = vfs_caller_clearance();
+    // An administrator may change any object's mask, even one it isn't
+    // cleared to open (or would lock itself out of)
+    if ((clearance & VFS_SECURITY_ADMIN) == VFS_SECURITY_ADMIN)
+        return true;
+    // Anyone else: cleared for it now, and only bits it holds itself
+    return vfs_clearance_covers(clearance, old_mask) && vfs_clearance_covers(clearance, new_mask);
+}
+
 static bool do_set_security(const char* path, uint32_t security) {
     uint32_t old;
     if (!do_get_security(path, &old))
         return false;
 
-    // Nobody grants or strips a bit they do not hold themselves
-    uint32_t clearance = vfs_caller_clearance();
-    if (!vfs_clearance_covers(clearance, old) || !vfs_clearance_covers(clearance, security))
+    if (!vfs_parent_allowed(path) || !vfs_security_change_allowed(old, security))
         return false;
     if (old == security)
         return true;

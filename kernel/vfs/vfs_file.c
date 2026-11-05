@@ -5,6 +5,7 @@
 #include <kernel/knode.h>
 
 #include <kernel/vfs/vfs_internal.h>
+#include <kernel/driver/chardev.h>
 
 #include <kernel/util/string.h>
 #include <kernel/util/tok.h>
@@ -59,6 +60,15 @@ static bool vfs_split_path(const char* path, char* parent_path, size_t parent_si
 // OpenFileDescriptor cannot be freed by vfs_close() while it is in use.
 //
 
+// A character device's own SYS_SEC_* bits (CharDevice.security), checked
+// before its driver sees an open and again on every read, write and ioctl:
+// a driver's open() never runs for a caller without them, and taking a bit
+// away also stops the handles already open
+static bool chardev_cleared(const void* knode) {
+    uint32_t required = ((const struct CharDevice*)knode)->security;
+    return (vfs_caller_clearance() & required) == required;
+}
+
 static File do_open(const char* path, uint16_t flags) {
     if (path == NULL || path[0] == '\0') 
         return VFS_INVALID_FILE;
@@ -97,9 +107,21 @@ static File do_open(const char* path, uint16_t flags) {
             return VFS_INVALID_FILE;
         }
         // Kernel nodes are fixed-size blocks: they can neither be emptied
-        // nor grown at the end
-        if (modifying) {
+        // nor grown at the end. A character device has no size, so
+        // truncating or appending to it means nothing and is allowed.
+        if (modifying && !chardev_check(current_knode)) {
             return VFS_INVALID_FILE;
+        }
+        // A character device opens only the ways its driver can go, and
+        // only for a caller with its security bits
+        if (chardev_check(current_knode)) {
+            if (!chardev_cleared(current_knode))
+                return VFS_INVALID_FILE;
+            const struct CharDeviceOps* ops = ((struct CharDevice*)current_knode)->ops;
+            if ((flags & VFS_OPEN_READ) && ops->read == NULL)
+                return VFS_INVALID_FILE;
+            if ((flags & VFS_OPEN_WRITE) && ops->write == NULL)
+                return VFS_INVALID_FILE;
         }
     }
     
@@ -161,6 +183,16 @@ static File do_open(const char* path, uint16_t flags) {
         return VFS_INVALID_FILE;
     }
     
+    // Last, so a refused open has nothing to undo but the descriptor
+    if (!in_file_system && chardev_check(current_knode)) {
+        struct CharDevice* cd = (struct CharDevice*)current_knode;
+        if (cd->ops->open != NULL && cd->ops->open(cd, flags) < 0) {
+            list_remove(&open_files_head, &open_files_tail, desc);
+            free(desc);
+            return VFS_INVALID_FILE;
+        }
+    }
+    
     return desc->id;
 }
 
@@ -169,6 +201,10 @@ static void do_close(File file) {
     if (!desc) return;
     if (desc->in_file_system) {
         desc->mount->type->close(desc->handle);
+    } else if (chardev_check(desc->knode)) {
+        struct CharDevice* cd = (struct CharDevice*)desc->knode;
+        if (cd->ops->close != NULL)
+            cd->ops->close(cd);
     }
     
     list_remove(&open_files_head, &open_files_tail, desc);
@@ -194,6 +230,12 @@ static int32_t do_read(File file, void* buffer, uint32_t size) {
         
         if (!(parent_perm & KMALLOC_PERMISSION_READ)) 
             return -1;
+        if (chardev_check(desc->knode)) {
+            struct CharDevice* cd = (struct CharDevice*)desc->knode;
+            if (!chardev_cleared(cd))
+                return -1;
+            return (cd->ops->read != NULL) ? cd->ops->read(cd, buffer, size) : -1;
+        }
         uint32_t node_size = kmalloc_get_size(desc->knode);
         if (desc->offset >= node_size) return 0;
         if (desc->offset + size > node_size) {
@@ -231,6 +273,12 @@ static int32_t do_write(File file, const void* buffer, uint32_t size) {
         
         if (!(parent_perm & KMALLOC_PERMISSION_WRITE)) 
             return -1;
+        if (chardev_check(desc->knode)) {
+            struct CharDevice* cd = (struct CharDevice*)desc->knode;
+            if (!chardev_cleared(cd))
+                return -1;
+            return (cd->ops->write != NULL) ? cd->ops->write(cd, buffer, size) : -1;
+        }
         uint32_t node_size = kmalloc_get_size(desc->knode);
         if (desc->offset >= node_size) return -1;
         if (desc->offset + size > node_size) {
@@ -443,6 +491,89 @@ static bool do_rename(const char* path, const char* name) {
     }
 }
 
+// Move `src` to the full path `dest` on the same volume by relinking its
+// directory entry (FsType.move): nothing is copied, so the cost is the same
+// for an empty file and for a folder holding gigabytes. The object keeps its
+// node, so handles open on it (or on anything below it) keep working.
+//
+// Checks, as rename plus create: the object needs WRITE, both directories
+// READ and WRITE, and the caller clearance for the object and both
+// directories. A directory never moves into itself or below itself.
+static VfsMoveResult do_move(const char* src, const char* dest) {
+    if (src == NULL || src[0] == '\0' || src[0] == ' ' || !vfs_path_fits(dest))
+        return VFS_MOVE_FAILED;
+
+    char dest_parent_path[VFS_PATH_MAX];
+    const char* name = NULL;
+    if (!vfs_split_path(dest, dest_parent_path, sizeof(dest_parent_path), &name))
+        return VFS_MOVE_FAILED;
+    if (!vfs_name_is_valid(name))
+        return VFS_MOVE_FAILED;
+
+    uint64_t address = resolve_path_to_address(src);
+    if (vfs_address_is_null(address))
+        return VFS_MOVE_NOT_FOUND;
+    uint64_t from = resolve_parent_path_to_address(src);
+    uint64_t to   = resolve_path_to_address(dest_parent_path);
+    if (vfs_address_is_null(from) || vfs_address_is_null(to))
+        return VFS_MOVE_NOT_FOUND;
+
+    // Both ends on one open volume, or the caller has to copy
+    struct FsMount* mount = vfs_device_get_context(src);
+    if (mount == NULL || vfs_device_get_context(dest_parent_path) != mount)
+        return VFS_MOVE_CROSS_DEVICE;
+
+    uint8_t type = vfs_node_type(mount, address);
+    if (type == FS_NODE_NONE)
+        return VFS_MOVE_NOT_FOUND;
+    if (mount->type->parent(mount, address) == FS_NODE_NULL)
+        return VFS_MOVE_DENIED;         // The device's root is its mount
+    if (!vfs_node_is_directory(mount, from) || !vfs_node_is_directory(mount, to))
+        return VFS_MOVE_NOT_FOUND;
+
+    uint8_t item_perm = vfs_node_permissions(mount, address);
+    uint8_t from_perm = vfs_node_permissions(mount, from);
+    uint8_t to_perm   = vfs_node_permissions(mount, to);
+    uint8_t rw = VFS_PERMISSION_READ | VFS_PERMISSION_WRITE;
+    if (!(item_perm & VFS_PERMISSION_WRITE) || (from_perm & rw) != rw || (to_perm & rw) != rw)
+        return VFS_MOVE_DENIED;
+    if (!vfs_fs_node_allowed(mount, address) || !vfs_fs_node_allowed(mount, from) ||
+        !vfs_fs_node_allowed(mount, to))
+        return VFS_MOVE_DENIED;
+
+    // The name must be free where it goes (the VFS lock makes this atomic)
+    uint64_t existing = mount->type->lookup(mount, to, name);
+    if (existing != FS_NODE_NULL)
+        return (existing == address) ? VFS_MOVE_OK : VFS_MOVE_EXISTS;
+
+    // Not into itself: `to` must not be the object or have it as an ancestor
+    if (type == FS_NODE_DIRECTORY) {
+        uint64_t node  = to;
+        uint32_t guard = 1024;          // Far deeper than any real tree
+        while (node != FS_NODE_NULL && node != 0 && guard-- > 0) {
+            if (node == address)
+                return VFS_MOVE_INTO_ITSELF;
+            node = mount->type->parent(mount, node);
+        }
+    }
+
+    if (from == to)
+        return mount->type->rename(mount, from, address, name) ? VFS_MOVE_OK : VFS_MOVE_FAILED;
+    if (mount->type->move == NULL)
+        return VFS_MOVE_CROSS_DEVICE;   // This filesystem can only copy
+    if (!mount->type->move(mount, from, address, to, name))
+        return VFS_MOVE_FAILED;
+
+    // As a copy would be: at least as protected as its new directory. Only
+    // the object itself; what is inside a moved folder is reached through it.
+    FsNodeAttr item, dir;
+    if (mount->type->set_security != NULL &&
+        mount->type->get_attr(mount, address, &item) && mount->type->get_attr(mount, to, &dir) &&
+        (item.security | dir.security) != item.security)
+        mount->type->set_security(mount, address, item.security | dir.security);
+    return VFS_MOVE_OK;
+}
+
 static bool do_truncate(const char* path, uint64_t new_size) {
     if (path == NULL) 
         return false;
@@ -489,7 +620,7 @@ static bool do_stat(const char* path, FSFileStats* stats) {
             stats->size = attr.size;
         }
         
-        stats->certificate = attr.certificate;
+        stats->policy      = attr.policy;
         stats->created     = attr.created;
         stats->modified    = attr.modified;
         return true;
@@ -511,7 +642,8 @@ static bool do_stat(const char* path, FSFileStats* stats) {
             stats->type = VFS_TYPE_DIRECTORY;
         } else {
             stats->type = VFS_TYPE_FILE;
-            stats->size = kmalloc_get_size(knode);
+            // A character device is a stream: it has no size
+            stats->size = chardev_check(knode) ? 0 : kmalloc_get_size(knode);
         }
         return true;
     }
@@ -525,9 +657,32 @@ static uint64_t do_get_size(File file) {
     if (desc->in_file_system) {
         FsNodeAttr attr;
         return desc->mount->type->get_attr(desc->mount, desc->address, &attr) ? attr.size : 0;
+    } else if (chardev_check(desc->knode)) {
+        return 0;
     } else {
         return kmalloc_get_size(desc->knode);
     }
+}
+
+static bool do_file_device(File file, uint32_t* security) {
+    OpenFileDescriptor* desc = vfs_file_find_open(file);
+    if (!desc || desc->in_file_system || !chardev_check(desc->knode))
+        return false;
+    if (security != NULL)
+        *security = ((struct CharDevice*)desc->knode)->security;
+    return true;
+}
+
+static int32_t do_ioctl(File file, uint32_t request, uint32_t arg) {
+    OpenFileDescriptor* desc = vfs_file_find_open(file);
+    if (!desc || desc->in_file_system || !chardev_check(desc->knode))
+        return VFS_IOCTL_NOT_DEVICE;
+    struct CharDevice* cd = (struct CharDevice*)desc->knode;
+    if (cd->ops->ioctl == NULL)
+        return VFS_IOCTL_NOT_DEVICE;
+    if (!chardev_cleared(cd))
+        return VFS_IOCTL_DENIED;
+    return cd->ops->ioctl(cd, request, arg);
 }
 
 //
@@ -603,6 +758,13 @@ bool vfs_rename(const char* path, const char* name) {
     return result;
 }
 
+VfsMoveResult vfs_move(const char* src, const char* dest) {
+    vfs_lock();
+    VfsMoveResult result = do_move(src, dest);
+    vfs_unlock();
+    return result;
+}
+
 bool vfs_truncate(const char* path, uint64_t new_size) {
     vfs_lock();
     bool result = do_truncate(path, new_size);
@@ -620,6 +782,20 @@ bool vfs_stat(const char* path, FSFileStats* stats) {
 uint64_t vfs_get_size(File file) {
     vfs_lock();
     uint64_t result = do_get_size(file);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_file_is_device(File file, uint32_t* security) {
+    vfs_lock();
+    bool result = do_file_device(file, security);
+    vfs_unlock();
+    return result;
+}
+
+int32_t vfs_ioctl(File file, uint32_t request, uint32_t arg) {
+    vfs_lock();
+    int32_t result = do_ioctl(file, request, arg);
     vfs_unlock();
     return result;
 }

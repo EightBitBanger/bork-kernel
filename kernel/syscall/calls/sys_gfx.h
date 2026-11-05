@@ -53,8 +53,7 @@ typedef struct SysGfxProcess {
     mutex_t        lock;
     SysGfxSurface** surfaces;       // Handle h is surfaces[h - 1]; surface_cap entries
     uint32_t       surface_cap;     // Grows (doubling) up to SYS_GFX_SURFACE_MAX
-    SysGfxResource* resources[SYS_RES_MAX];         // Resource handle h is resources[h - 1]
-    uint32_t       bytes;           // Pixel memory charged to this process (surfaces and resources)
+    uint32_t       bytes;           // Pixel memory charged to this process (its surfaces)
     uint32_t*      cmd_buffer;      // SYS_GFX_SUBMIT_MAX bytes, allocated on first submit
     struct SysGfxProcess* next;
 } SysGfxProcess;
@@ -109,22 +108,9 @@ static void sys_gfx_free_handle(SysGfxProcess* t, uint32_t index) {
     sys_gfx_uncharge(t, bytes);
 }
 
-static void sys_gfx_free_resource(SysGfxProcess* t, uint32_t index) {
-    SysGfxResource* r = t->resources[index];
-    if (r == NULL)
-        return;
-    uint32_t bytes = sys_gfx_surface_bytes(r->surface.width, r->surface.height);
-    sys_gfx_resource_free(r);
-    free(r);
-    t->resources[index] = NULL;
-    sys_gfx_uncharge(t, bytes);
-}
-
 static void sys_gfx_free_all(SysGfxProcess* t) {
     for (uint32_t i = 0; i < t->surface_cap; i++)
         sys_gfx_free_handle(t, i);
-    for (uint32_t i = 0; i < SYS_RES_MAX; i++)
-        sys_gfx_free_resource(t, i);
     free(t->cmd_buffer);
     t->cmd_buffer = NULL;
 }
@@ -254,16 +240,6 @@ static SysGfxSurface* sys_gfx_env_lookup(void* ctx, uint32_t handle) {
     return sys_gfx_get((SysGfxProcess*)ctx, handle);
 }
 
-static SysGfxResource* sys_gfx_get_resource(SysGfxProcess* t, uint32_t handle) {
-    if (handle == 0 || handle > SYS_RES_MAX)
-        return NULL;
-    return t->resources[array_index_nospec(handle - 1, SYS_RES_MAX)];
-}
-
-static const SysGfxResource* sys_gfx_env_resource(void* ctx, uint32_t handle) {
-    return sys_gfx_get_resource((SysGfxProcess*)ctx, handle);
-}
-
 static SysGfxEnv sys_gfx_env(SysGfxProcess* t) {
     SysGfxEnv env = {
         .ctx      = t,
@@ -271,7 +247,6 @@ static SysGfxEnv sys_gfx_env(SysGfxProcess* t) {
         .copy_in  = sys_gfx_env_copy_in,
         .copy_out = sys_gfx_env_copy_out,
         .lookup   = sys_gfx_env_lookup,
-        .resource = sys_gfx_env_resource,
     };
     return env;
 }

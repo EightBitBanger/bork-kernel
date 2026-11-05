@@ -6,6 +6,7 @@
 #include <kernel/scheduler/scheduler.h>
 #include <kernel/resources/classes/elf.h>
 #include <kernel/mutex.h>
+#include <kernel/malloc.h>
 #include <kernel/knode.h>
 
 #include <kernel/arch/x86/irq.h>
@@ -20,9 +21,9 @@
 
 #define CR0_PG              0x80000000u
 
-#define PID_SLOT_BITS       8
-#define PID_SLOT_MASK       0xFFu
-#define PID_GEN_MASK        0x007FFFFFu     // 23 bits: keeps the id positive
+#define PID_SLOT_BITS       16
+#define PID_SLOT_MASK       0xFFFFu
+#define PID_GEN_MASK        0x7FFFu         // 15 bits: keeps the id positive
 
 // Initial ESP: 16 bytes below the top, so ESP % 16 == 0 at the entry point
 #define PROCESS_INITIAL_ESP (PROCESS_STACK_TOP - 16u)
@@ -32,7 +33,11 @@
 // End of the area ELF segments may occupy
 #define PROCESS_IMAGE_LIMIT (PROCESS_IMAGE_BASE + PROCESS_IMAGE_MAX)
 
-typedef char process_max_fits_slot_field[(PROCESS_MAX <= 256) ? 1 : -1];
+#define PROCESS_BLOCK_COUNT (PROCESS_SLOT_LIMIT / PROCESS_BLOCK_SLOTS)
+
+_Static_assert(PROCESS_SLOT_LIMIT == (1u << PID_SLOT_BITS), "slot limit must match the id's slot field");
+_Static_assert(PROCESS_SLOT_LIMIT % PROCESS_BLOCK_SLOTS == 0, "slots come in whole blocks");
+_Static_assert(PID_SLOT_BITS + 15 == 31, "generation and slot must fill a positive int32");
 
 _Static_assert(PROCESS_IMAGE_BASE == VM_USER_START, "image must start at the bottom of user space");
 _Static_assert(PROCESS_STACK_TOP == VM_USER_STACK_TOP, "stack must end at the top of user space");
@@ -59,6 +64,8 @@ typedef struct {
     ProcessSecurity security;   // SYS_SEC_* mask, checked by every syscall
     bool elevated;              // SYS_SEC_ADMIN came from the user's yes (SYS_ELEVATE),
                                 // or from a parent that had it that way
+    ProcessSecurity clearance_extra;    // Counted as file clearance only, for one
+                                        // syscall (process_current_set_clearance_extra)
     char name[PROCESS_NAME_MAX];
     char image_path[PROCESS_PATH_MAX];
 
@@ -99,7 +106,13 @@ typedef int (*ProcessLoadFn)(Process* p, void* ctx);
 
 extern ThreadBlock* current_thread;
 
-static Process process_table[PROCESS_MAX];
+// Process slots, in blocks that are allocated on demand and never move or
+// go away: slot N is process_blocks[N / PROCESS_BLOCK_SLOTS][N % ...].
+// process_block_count only grows, and a block pointer is written before the
+// count that makes it visible (both with interrupts off).
+static Process* process_blocks[PROCESS_BLOCK_COUNT];
+static uint32_t process_block_count = 0;
+static uint32_t process_next_slot = 0;      // Where the round-robin search starts
 static uint32_t process_count = 0;
 
 // CPU helpers
@@ -145,37 +158,97 @@ static ProcessId pid_encode(uint32_t generation, uint32_t slot) {
     return (ProcessId)(((generation & PID_GEN_MASK) << PID_SLOT_BITS) | (slot & PID_SLOT_MASK));
 }
 
+// Slot N, or NULL past the allocated blocks. Interrupts off.
+static inline Process* process_slot(uint32_t slot) {
+    uint32_t block = slot / PROCESS_BLOCK_SLOTS;
+    if (block >= process_block_count)
+        return NULL;
+    return &process_blocks[block][slot % PROCESS_BLOCK_SLOTS];
+}
+
 // Caller must hold the lock (interrupts disabled)
 static Process* process_lookup(ProcessId pid) {
     if (pid <= 0)
         return NULL;
-    uint32_t slot = (uint32_t)pid & PID_SLOT_MASK;
-    if (slot >= PROCESS_MAX)
-        return NULL;
-    Process* p = &process_table[slot];
-    if (p->state == PROCESS_STATE_FREE || p->pid != pid)
+    Process* p = process_slot((uint32_t)pid & PID_SLOT_MASK);
+    if (p == NULL || p->state == PROCESS_STATE_FREE || p->pid != pid)
         return NULL;
     return p;
 }
 
 // Slot management
 
-// Reserve a free slot (state CREATING). NULL when the table is full.
+// Enough memory for one more process, with the kernel's reserve left over:
+// frames for its page directory, page tables, kernel stack and first user
+// pages, and room in the kernel VM window. Each check is only a snapshot
+// (the allocations themselves still fail cleanly), but it stops a spawn loop
+// well before the kernel runs dry.
+static bool process_memory_available(void) {
+    if (pmm_free_count() < pmm_reserve_count() + PROCESS_RESERVE_FRAMES)
+        return false;
+    if (vmm_free_page_count() < PROCESS_RESERVE_KERNEL_PAGES)
+        return false;
+    return true;
+}
+
+// Claim a free slot among the allocated blocks, round robin from
+// process_next_slot. Interrupts off. NULL when every slot is in use.
+static Process* process_claim_locked(void) {
+    uint32_t capacity = process_block_count * PROCESS_BLOCK_SLOTS;
+    if (process_count >= capacity)
+        return NULL;
+
+    for (uint32_t n = 0; n < capacity; n++) {
+        uint32_t slot = (process_next_slot + n) % capacity;
+        Process* p = process_slot(slot);
+        if (p->state != PROCESS_STATE_FREE)
+            continue;
+
+        if (p->generation == 0)
+            p->generation = 1;
+        p->state = PROCESS_STATE_CREATING;
+        p->pid = pid_encode(p->generation, slot);
+        process_count++;
+        process_next_slot = (slot + 1) % capacity;
+        return p;
+    }
+    return NULL;
+}
+
+// Reserve a free slot (state CREATING), adding a block of slots when all
+// are in use. NULL when memory is low (see process_memory_available) or a
+// new block cannot be allocated. Thread context, interrupts on.
 static Process* process_reserve(void) {
-    Process* p = NULL;
+    if (!process_memory_available())
+        return NULL;
+
     uint32_t irq = irq_save();
-    for (uint32_t slot = 0; slot < PROCESS_MAX; slot++) {
-        if (process_table[slot].state == PROCESS_STATE_FREE) {
-            p = &process_table[slot];
-            if (p->generation == 0)
-                p->generation = 1;
-            p->state = PROCESS_STATE_CREATING;
-            p->pid = pid_encode(p->generation, slot);
-            process_count++;
-            break;
-        }
+    Process* p = process_claim_locked();
+    irq_restore(irq);
+    if (p != NULL)
+        return p;
+
+    // Every slot is taken: allocate another block, outside the lock
+    Process* block = malloc(sizeof(Process) * PROCESS_BLOCK_SLOTS);
+    if (block == NULL)
+        return NULL;
+    memset(block, 0, sizeof(Process) * PROCESS_BLOCK_SLOTS);   // FREE, generation 0
+
+    bool used = false;
+    irq = irq_save();
+    // Another thread may have freed a slot or added a block meanwhile
+    p = process_claim_locked();
+    if (p == NULL && process_block_count < PROCESS_BLOCK_COUNT) {
+        process_blocks[process_block_count] = block;
+        __asm__ volatile ("" ::: "memory");     // The block before the count that publishes it
+        process_block_count++;
+        used = true;
+        p = process_claim_locked();
     }
     irq_restore(irq);
+
+    if (!used)
+        free(block);
     return p;
 }
 
@@ -990,12 +1063,16 @@ uint32_t process_get_count(void) {
     return process_count;
 }
 
+uint32_t process_get_capacity(void) {
+    return process_block_count * PROCESS_BLOCK_SLOTS;
+}
+
 const char* process_error_string(int code) {
     if (code > 0) return "ok";
     switch (code) {
         case PROCESS_OK:                 return "ok";
         case PROCESS_ERR_INVALID_ARG:    return "Invalid program path";
-        case PROCESS_ERR_NO_SLOTS:       return "Too many programs running";
+        case PROCESS_ERR_NO_SLOTS:       return "Not enough memory for another program";
         case PROCESS_ERR_NO_MEMORY:      return "Not enough memory";
         case PROCESS_ERR_NO_PAGING:      return "Paging is not enabled";
         case PROCESS_ERR_LOAD_FAILED:    return "The program could not be read";
@@ -1048,9 +1125,32 @@ bool process_current_elevated(void) {
 }
 
 uint32_t process_current_clearance(void) {
-    if (process_current_id() == PROCESS_INVALID_ID)
+    ProcessId pid = process_current_id();
+    if (pid == PROCESS_INVALID_ID)
         return VFS_CLEARANCE_ALL;   // The kernel itself is never refused
-    return (uint32_t)process_current_security();
+
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    uint32_t clearance = (p != NULL && p->state == PROCESS_STATE_RUNNING)
+                       ? (uint32_t)(p->security | p->clearance_extra) : SYS_SEC_NONE;
+    irq_restore(irq);
+    return clearance;
+}
+
+ProcessSecurity process_current_set_clearance_extra(ProcessSecurity bits) {
+    ProcessId pid = process_current_id();
+    if (pid == PROCESS_INVALID_ID)
+        return SYS_SEC_NONE;
+
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    ProcessSecurity old = SYS_SEC_NONE;
+    if (p != NULL) {
+        old = p->clearance_extra;
+        p->clearance_extra = bits & SYS_SEC_VALID;
+    }
+    irq_restore(irq);
+    return old;
 }
 
 // The returned pointer stays valid while the caller runs: the only way the

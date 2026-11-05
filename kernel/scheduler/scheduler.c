@@ -1,12 +1,11 @@
 #include <stddef.h>
 
-#include <kernel/arch/x86/io.h>
-#include <kernel/arch/x86/irq.h>
-#include <kernel/arch/x86/virtual/vmm.h>
-#include <kernel/boot/x86/gdt.h>
+#include <kernel/arch/cpu.h>
+#include <kernel/arch/vmm.h>
 #include <kernel/malloc.h>
 #include <kernel/scheduler/configuration.h>
 #include <kernel/scheduler/scheduler.h>
+#include <kernel/scheduler/sched_platform.h>
 #include <kernel/scheduler/watchdog.h>
 
 #include <kernel/util/string.h>
@@ -16,41 +15,21 @@
 //
 //   region + 0                     guard page (unmapped -> overflow page-faults)
 //   region + PAGE_SIZE             usable stack, grows down
-//   top - FPU_STATE_SIZE           FXSAVE area (16-byte aligned)
+//   top - FPU_STATE_SIZE           FPU / SIMD save area (16-byte aligned)
 //   top = region + THREAD_ALLOC_PAGES * PAGE_SIZE
 //
-// The usable stack starts right below the FXSAVE area. That address is also
-// the thread's kernel_stack_top: for a user thread, the TSS esp0 the CPU
-// switches to when an interrupt, fault or syscall arrives in ring 3.
+// The usable stack starts right below the FPU area. That address is also
+// the thread's kernel_stack_top: for a user thread, the stack the CPU
+// switches to when an interrupt, fault or syscall arrives in user mode.
+//
+// Register frames, the FPU image, the address space switch and the yield
+// trap are the CPU's business: see sched_platform.h.
 #define THREAD_STACK_PAGES   4      // 16 KB usable stack
 #define THREAD_GUARD_PAGES   1
 #define THREAD_ALLOC_PAGES   (THREAD_STACK_PAGES + THREAD_GUARD_PAGES)
-#define FPU_STATE_SIZE       512
+#define FPU_STATE_SIZE       SCHED_PLAT_FPU_STATE_SIZE
 
 #define SCHED_TICK_MS        1      // Timer period (quantum ticks are this long)
-
-#define EFLAGS_IF_RESERVED   0x202  // IF set, bit 1 (always 1), IOPL 0
-
-// scheduler_context.asm / scheduler_yield_context.asm read fpu_state at this offset
-_Static_assert(offsetof(ThreadBlock, fpu_state) == 16, "update TB_FPU_STATE in the scheduler stubs");
-
-struct ThreadInterruptFrame {
-    uint32_t gs, fs, es, ds;                               // Pushed by ISR
-    uint32_t edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax; // Pushed by pushal
-    uint32_t eip, cs, eflags;                              // Pushed by CPU on interrupt
-} __attribute__((packed));
-
-// An interrupt taken in ring 3 also pushes the user stack (privilege change),
-// and the iret back pops it. Same layout, two more words on top.
-struct ThreadUserFrame {
-    struct ThreadInterruptFrame k;
-    uint32_t user_esp, user_ss;                            // Pushed by CPU on a ring 3 -> 0 entry
-} __attribute__((packed));
-
-_Static_assert(sizeof(struct ThreadInterruptFrame) == 60, "frame layout");
-_Static_assert(sizeof(struct ThreadUserFrame) == 68, "user frame layout");
-
-extern uint32_t page_directory[];
 
 ThreadBlock* current_thread = NULL;
 ThreadBlock* thread_queue = NULL;
@@ -60,27 +39,6 @@ static ThreadBlock* reap_list = NULL;
 
 // Timestamp of the previous scheduler entry (for CPU accounting)
 static uint64_t sched_last_ms = 0;
-
-static uint8_t main_fpu_state[FPU_STATE_SIZE]    __attribute__((aligned(16)));
-static uint8_t default_fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
-
-static inline uint32_t sched_read_cr3(void) {
-    uint32_t value;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(value));
-    return value;
-}
-
-static inline void sched_write_cr3(uint32_t value) {
-    __asm__ volatile("mov %0, %%cr3" : : "r"(value) : "memory");
-}
-
-// A clean FXSAVE image: x87 default control word, all exceptions masked
-// in MXCSR, empty register stack.
-static void fpu_build_default(void) {
-    memset(default_fpu_state, 0, FPU_STATE_SIZE);
-    *(uint16_t*)&default_fpu_state[0]  = 0x037F;   // FCW
-    *(uint32_t*)&default_fpu_state[24] = 0x1F80;   // MXCSR
-}
 
 //
 // Dynamic priority
@@ -159,7 +117,7 @@ static void thread_age(ThreadBlock* t, uint64_t now) {
 
 static void idle_thread_entry(void) {
     while (1) {
-        __asm__ volatile("hlt");
+        arch_wait_for_interrupt();
     }
 }
 
@@ -169,13 +127,13 @@ static void idle_thread_entry(void) {
 // Marks the thread DEAD and switches away at once instead of halting until
 // the next timer tick. The scheduler never saves a DEAD thread's frame and
 // the reaper frees the stack on a later pass, after we are off it, so the
-// int $0x80 below never returns. The loop is only a backstop.
+// yield below never returns. The loop is only a backstop.
 static __attribute__((noreturn)) void thread_exit(void) {
-    __asm__ volatile("cli");
+    arch_irq_disable();
     current_thread->state = THREAD_DEAD;
 
     while (1) {
-        __asm__ volatile("int $0x80" : : : "memory");
+        sched_plat_yield();
     }
 }
 
@@ -200,70 +158,8 @@ static bool thread_alloc_stack(ThreadBlock* thread) {
     thread->stack_base       = region;
     thread->fpu_state        = top - FPU_STATE_SIZE;
     thread->kernel_stack_top = (uint32_t)thread->fpu_state;   // 16-byte aligned
-    memcpy(thread->fpu_state, default_fpu_state, FPU_STATE_SIZE);
+    sched_plat_fpu_init(thread->fpu_state);
     return true;
-}
-
-// Initial frame for a kernel thread.
-//
-// Initial stack, top down (T = kernel_stack_top, 16-byte aligned):
-//
-//   T - 16   arg                 first cdecl argument, 16-byte aligned
-//   T - 20   thread_exit         return address for the entry function
-//   below    ThreadInterruptFrame (popped by the context switch, then iret)
-//
-// After the iret ESP = T - 20, so ESP % 16 == 12 at the entry point: exactly
-// what the i386 SysV ABI promises right after a CALL. A void(void) entry
-// simply ignores the argument slot (cdecl: the caller owns it).
-static void thread_build_kernel_frame(ThreadBlock* thread, uint32_t entry_point, void* arg) {
-    uint32_t stack_top = thread->kernel_stack_top;
-
-    // Argument slot (16-byte aligned) plus 12 bytes of padding above it
-    stack_top -= 16;
-    *(uint32_t*)stack_top = (uint32_t)arg;
-
-    // Return address for entry_point
-    stack_top -= sizeof(uint32_t);
-    *(uint32_t*)stack_top = (uint32_t)thread_exit;
-
-    stack_top -= sizeof(struct ThreadInterruptFrame);
-    struct ThreadInterruptFrame* frame = (struct ThreadInterruptFrame*)stack_top;
-    memset(frame, 0, sizeof(struct ThreadInterruptFrame));
-
-    frame->eip    = entry_point;
-    frame->cs     = GDT_KERNEL_CODE_SEL;
-    frame->eflags = EFLAGS_IF_RESERVED;
-    frame->ds     = GDT_KERNEL_DATA_SEL;
-    frame->es     = GDT_KERNEL_DATA_SEL;
-    frame->fs     = GDT_KERNEL_DATA_SEL;
-    frame->gs     = GDT_KERNEL_DATA_SEL;
-
-    thread->esp = stack_top;
-}
-
-// Initial frame for a user thread: exactly what an interrupt taken in ring 3
-// would have left at the top of the (otherwise empty) kernel stack. The first
-// context switch to it pops the segment registers and pushad block, and the
-// iret drops to ring 3 at entry with ESP = user_esp.
-//
-// The kernel stack is empty while the thread runs in ring 3, so esp0 is the
-// very top of it; the CPU pushes the next ring 3 entry right there.
-static void thread_build_user_frame(ThreadBlock* thread, uint32_t entry, uint32_t user_esp) {
-    uint32_t stack_top = thread->kernel_stack_top - sizeof(struct ThreadUserFrame);
-    struct ThreadUserFrame* frame = (struct ThreadUserFrame*)stack_top;
-    memset(frame, 0, sizeof(struct ThreadUserFrame));
-
-    frame->k.eip    = entry;
-    frame->k.cs     = GDT_USER_CODE_SEL;
-    frame->k.eflags = EFLAGS_IF_RESERVED;   // IOPL 0: in/out/cli/sti fault in ring 3
-    frame->k.ds     = GDT_USER_DATA_SEL;
-    frame->k.es     = GDT_USER_DATA_SEL;
-    frame->k.fs     = GDT_USER_DATA_SEL;
-    frame->k.gs     = GDT_USER_DATA_SEL;
-    frame->user_esp = user_esp;
-    frame->user_ss  = GDT_USER_DATA_SEL;
-
-    thread->esp = stack_top;
 }
 
 static void unlink_thread(ThreadBlock* dead) {
@@ -307,7 +203,7 @@ void thread_yield(void) {
     if (current_thread)
         current_thread->ticks_remaining = 0;
 
-    __asm__ volatile("int $0x80" : : : "memory");
+    sched_plat_yield();
 }
 
 void thread_sleep(uint32_t ms) {
@@ -316,13 +212,13 @@ void thread_sleep(uint32_t ms) {
         return;
     }
 
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
     current_thread->wake_tick = timer_get_ms() + ms;
     current_thread->state = THREAD_SLEEPING;
 
-    // int $0x80 works with IF=0; we resume here (still IF=0) once woken
+    // The yield works with interrupts off; we resume here (still off) once woken
     thread_yield();
-    irq_restore(flags);
+    arch_irq_restore(flags);
 }
 
 //
@@ -331,10 +227,10 @@ void thread_sleep(uint32_t ms) {
 
 void event_init(Event* event) {
     if (!event) return;
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
     event->signaled = false;
     event->waiters = NULL;
-    irq_restore(flags);
+    arch_irq_restore(flags);
 }
 
 // Must be called with interrupts disabled
@@ -353,7 +249,7 @@ static void event_remove_waiter(Event* event, ThreadBlock* thread) {
 
 void event_signal(Event* event) {
     if (!event) return;
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
 
     if (event->waiters == NULL) {
         // Nobody waiting: remember the signal for the next waiter
@@ -374,25 +270,25 @@ void event_signal(Event* event) {
         }
     }
 
-    irq_restore(flags);
+    arch_irq_restore(flags);
 }
 
 bool event_wait(Event* event, uint32_t timeout_ms) {
     if (!event) return false;
 
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
 
     // Before the scheduler exists there is nothing to switch to
     if (!current_thread) {
         bool was = event->signaled;
         event->signaled = false;
-        irq_restore(flags);
+        arch_irq_restore(flags);
         return was;
     }
 
     if (event->signaled) {
         event->signaled = false;
-        irq_restore(flags);
+        arch_irq_restore(flags);
         return true;
     }
 
@@ -421,12 +317,12 @@ bool event_wait(Event* event, uint32_t timeout_ms) {
     bool signaled = self->wait_signaled;
     self->wait_signaled = false;
 
-    irq_restore(flags);
+    arch_irq_restore(flags);
     return signaled;
 }
 
 void scheduler_init(void) {
-    fpu_build_default();
+    sched_plat_init();
 
     uint64_t now = timer_get_ms();
 
@@ -435,13 +331,13 @@ void scheduler_init(void) {
     if (!main_thread) return;
     memset(main_thread, 0, sizeof(ThreadBlock));
 
-    main_thread->cr3 = (uint32_t)page_directory;
+    main_thread->cr3 = sched_plat_kernel_space();
     main_thread->state = THREAD_RUNNING;
     main_thread->priority = PRIORITY_NORMAL;
     main_thread->ticks_remaining = PRIORITY_NORMAL;
     main_thread->stack_base = NULL;
-    main_thread->fpu_state = main_fpu_state;
-    main_thread->kernel_stack_top = 0;     // Never enters ring 3
+    main_thread->fpu_state = sched_plat_boot_fpu_state();
+    main_thread->kernel_stack_top = 0;     // Never enters user mode
     main_thread->next = main_thread;
     thread_init_dynamic(main_thread, PRIORITY_NORMAL, now);
 
@@ -454,9 +350,9 @@ void scheduler_init(void) {
         free(idle);
         return;
     }
-    thread_build_kernel_frame(idle, (uint32_t)idle_thread_entry, NULL);
+    sched_plat_build_kernel_frame(idle, (uint32_t)idle_thread_entry, NULL, thread_exit);
 
-    idle->cr3 = (uint32_t)page_directory;
+    idle->cr3 = sched_plat_kernel_space();
     idle->state = THREAD_READY;
     idle->priority = PRIORITY_IDLE;
     idle->ticks_remaining = PRIORITY_IDLE;
@@ -465,12 +361,12 @@ void scheduler_init(void) {
 
     // Publish last: the timer IRQ is already live and starts scheduling
     // as soon as thread_queue is non-NULL.
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
     sched_last_ms  = timer_get_ms();
     idle_thread    = idle;
     current_thread = main_thread;
     thread_queue   = main_thread;
-    irq_restore(flags);
+    arch_irq_restore(flags);
 }
 
 // Build a thread and put it on the run queue. Everything the caller asked
@@ -492,11 +388,11 @@ static ThreadBlock* thread_spawn(uint32_t entry_point, void* arg, ThreadPriority
     }
 
     if (user)
-        thread_build_user_frame(thread, entry_point, user_esp);
+        sched_plat_build_user_frame(thread, entry_point, user_esp);
     else
-        thread_build_kernel_frame(thread, entry_point, arg);
+        sched_plat_build_kernel_frame(thread, entry_point, arg, thread_exit);
 
-    thread->cr3 = cr3 ? cr3 : (uint32_t)page_directory;
+    thread->cr3 = cr3 ? cr3 : sched_plat_kernel_space();
     thread->user_mode = user;
     thread->process_id = process_id;
     thread->state = THREAD_READY;
@@ -509,7 +405,7 @@ static ThreadBlock* thread_spawn(uint32_t entry_point, void* arg, ThreadPriority
     if (name != NULL)
         wd_name_thread(thread, name);
 
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
     if (!thread_queue) {
         thread_queue = thread;
         thread->next = thread;
@@ -521,7 +417,7 @@ static ThreadBlock* thread_spawn(uint32_t entry_point, void* arg, ThreadPriority
         temp->next = thread;
         thread->next = thread_queue;
     }
-    irq_restore(flags);
+    arch_irq_restore(flags);
 
     return thread;
 }
@@ -544,7 +440,7 @@ ThreadBlock* thread_create_user(uint32_t entry, uint32_t user_esp, ThreadPriorit
 }
 
 uint32_t thread_get_count(void) {
-    uint32_t flags = irq_save();
+    arch_irq_flags_t flags = arch_irq_save();
     uint32_t count = 0;
 
     if (thread_queue) {
@@ -555,11 +451,11 @@ uint32_t thread_get_count(void) {
         } while (t != thread_queue);
     }
 
-    irq_restore(flags);
+    arch_irq_restore(flags);
     return count;
 }
 
-// Called from the timer IRQ and int $0x80 with interrupts disabled.
+// Called from the timer IRQ and the yield trap with interrupts disabled.
 //
 // The entry stubs save the outgoing thread's FPU/SSE state before calling
 // this and restore the incoming thread's after, so any C code may run here.
@@ -676,22 +572,12 @@ uint32_t thread_handler_c(uint32_t current_esp) {
     next->state = THREAD_RUNNING;
     current_thread = next;
 
-    // Where the CPU lands the next time this thread is interrupted in ring 3.
-    // Set for every thread with its own stack (harmless for kernel threads),
-    // so it is always right the moment a user thread is resumed.
-    if (next->kernel_stack_top != 0)
-        tss_set_kernel_stack(next->kernel_stack_top);
-
-    // Each process has its own page directory. The kernel half is shared, so
-    // switching here, still on prev's kernel stack, is safe. Skipped when it
-    // would not change anything (kernel thread to kernel thread), since every
-    // CR3 load flushes the TLB.
-    if (next->cr3 != 0 && next->cr3 != sched_read_cr3())
-        sched_write_cr3(next->cr3);
+    // Kernel stack for the next user-mode entry, and the address space
+    sched_plat_switch_to(next);
 
     // FPU/SSE state is saved and restored by the entry stubs
-    // (scheduler_context.asm / scheduler_yield_context.asm), around this
-    // function. Here would be too late: everything above (wd_tick,
+    // (scheduler_context.asm / scheduler_yield_context.asm on x86), around
+    // this function. Here would be too late: everything above (wd_tick,
     // reap_threads -> free -> memset, the 64-bit timestamp math, which GCC
     // may move through %xmm0 when SSE is enabled) runs first and could
     // clobber the outgoing thread's XMM registers.

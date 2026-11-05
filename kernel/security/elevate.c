@@ -14,7 +14,7 @@
 _Static_assert(SYS_ELEVATE_NAME_MAX == PROCESS_NAME_MAX, "SYS_ELEVATE_NAME_MAX must equal PROCESS_NAME_MAX");
 _Static_assert(SYS_ELEVATE_PATH_MAX == PROCESS_PATH_MAX, "SYS_ELEVATE_PATH_MAX must equal PROCESS_PATH_MAX");
 _Static_assert(sizeof(SysElevateRequest) == 16 + SYS_ELEVATE_NAME_MAX + SYS_ELEVATE_PATH_MAX +
-               SYS_ELEVATE_REASON_MAX, "SysElevateRequest is part of the user ABI");
+               SYS_ELEVATE_REASON_MAX + 4 + SYS_ELEVATE_NAME_MAX + 4, "SysElevateRequest is part of the user ABI");
 
 // How often a waiting requester looks at the clock and its kill flag. The
 // answer itself wakes it at once (the slot's event).
@@ -43,6 +43,9 @@ typedef struct {
     char            name[PROCESS_NAME_MAX];
     char            path[PROCESS_PATH_MAX];
     char            reason[SYS_ELEVATE_REASON_MAX];
+    uint32_t        flags;          // SYS_ELEVATE_*
+    char            by[PROCESS_NAME_MAX];   // LAUNCH: the requester's own name
+    uint32_t        requested;      // SYS_SEC_* bits asked for
 } ElevateSlot;
 
 typedef struct {
@@ -156,21 +159,12 @@ static int32_t withdraw(ElevateSlot* s, uint32_t id, int32_t fallback) {
     return result;
 }
 
-int32_t elevate_request(const char* reason) {
+// Queue a request with what the prompt shows, and wait for the answer.
+// SYS_OK when the user said yes; nothing is granted here.
+static int32_t ask(const char name[PROCESS_NAME_MAX], const char path[PROCESS_PATH_MAX],
+                   const char text[SYS_ELEVATE_REASON_MAX], uint32_t flags,
+                   const char by[PROCESS_NAME_MAX], uint32_t requested) {
     ProcessId self = process_current_id();
-    if (self <= 0)
-        return SYS_EPERM;
-    if (process_current_security() & SYS_SEC_ADMIN)
-        return SYS_OK;      // Nothing to ask for
-
-    // Who is asking, from the process table (interrupts on: plain copies)
-    char name[PROCESS_NAME_MAX];
-    char path[PROCESS_PATH_MAX];
-    char text[SYS_ELEVATE_REASON_MAX];
-    if (!ProcessGetImage(self, name, path))
-        return SYS_ESRCH;
-    clean_reason(reason, text);
-
     uint64_t now = timer_get_ms();
     uint32_t irq = irq_save();
 
@@ -208,11 +202,14 @@ int32_t elevate_request(const char* reason) {
     memcpy(s->name, name, sizeof(s->name));
     memcpy(s->path, path, sizeof(s->path));
     memcpy(s->reason, text, sizeof(s->reason));
+    s->flags = flags;
+    memcpy(s->by, by, sizeof(s->by));
+    s->requested = requested;
     s->state = SLOT_QUEUED;
     uint32_t id = s->id;
     irq_restore(irq);
 
-    log_request("asked by", self, path);
+    log_request((flags & SYS_ELEVATE_LAUNCH) ? "launch asked by" : "asked by", self, path);
     ipc_plat_wake_all();        // The agent waits on its input handle
 
     int32_t result;
@@ -245,6 +242,27 @@ int32_t elevate_request(const char* reason) {
 
         event_wait(&s->done, ELEVATE_POLL_MS);
     }
+    return result;
+}
+
+int32_t elevate_request(const char* reason) {
+    ProcessId self = process_current_id();
+    if (self <= 0)
+        return SYS_EPERM;
+    if (process_current_security() & SYS_SEC_ADMIN)
+        return SYS_OK;      // Nothing to ask for
+
+    // Who is asking, from the process table (interrupts on: plain copies)
+    char name[PROCESS_NAME_MAX];
+    char path[PROCESS_PATH_MAX];
+    char text[SYS_ELEVATE_REASON_MAX];
+    char by[PROCESS_NAME_MAX];
+    if (!ProcessGetImage(self, name, path))
+        return SYS_ESRCH;
+    clean_reason(reason, text);
+    memset(by, 0, sizeof(by));
+
+    int32_t result = ask(name, path, text, 0, by, SYS_SEC_ADMIN);
 
     // The grant, by the kernel on this thread: nothing the program does can
     // get here without the agent's yes for this very request
@@ -252,6 +270,43 @@ int32_t elevate_request(const char* reason) {
         if (ProcessGrantSecurity(self, SYS_SEC_ADMIN, true) != PROCESS_OK)
             result = SYS_ESRCH;
     }
+    return result;
+}
+
+int32_t elevate_request_launch(const char* image_path, uint32_t requested) {
+    ProcessId self = process_current_id();
+    if (self <= 0 || image_path == NULL || image_path[0] != '/')
+        return SYS_EPERM;
+
+    size_t length = strlen(image_path);
+    if (length >= PROCESS_PATH_MAX)
+        return SYS_ENAMETOOLONG;
+
+    // The program to be started, as the kernel resolved its path: its file
+    // name (cut to fit, as the process table would) and the path itself
+    char path[PROCESS_PATH_MAX];
+    char name[PROCESS_NAME_MAX];
+    memset(path, 0, sizeof(path));
+    memcpy(path, image_path, length + 1);
+    const char* base = strrchr(path, '/');
+    base = (base != NULL) ? base + 1 : path;
+    size_t n = strlen(base);
+    if (n >= PROCESS_NAME_MAX)
+        n = PROCESS_NAME_MAX - 1;
+    memset(name, 0, sizeof(name));
+    memcpy(name, base, n);
+
+    // And who is starting it, from the process table
+    char by[PROCESS_NAME_MAX];
+    char by_path[PROCESS_PATH_MAX];
+    if (!ProcessGetImage(self, by, by_path))
+        return SYS_ESRCH;
+
+    char text[SYS_ELEVATE_REASON_MAX];
+    memset(text, 0, sizeof(text));
+    int32_t result = ask(name, path, text, SYS_ELEVATE_LAUNCH, by, requested);
+    if (result == SYS_EACCES)
+        result = SYS_ECANCELED;     // A no, told apart from a file the caller can't use
     return result;
 }
 
@@ -318,6 +373,9 @@ int32_t elevate_agent_next(SysElevateRequest* out) {
     memcpy(out->name, pick->name, sizeof(out->name));
     memcpy(out->path, pick->path, sizeof(out->path));
     memcpy(out->reason, pick->reason, sizeof(out->reason));
+    out->flags    = pick->flags;
+    memcpy(out->by, pick->by, sizeof(out->by));
+    out->requested = pick->requested;
     irq_restore(irq);
     return 1;
 }

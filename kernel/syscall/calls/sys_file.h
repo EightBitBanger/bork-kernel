@@ -99,6 +99,89 @@ static bool sys_file_grow(SysFile* f, uint32_t new_size) {
 }
 
 //
+// Character devices (driver/chardev.h)
+//
+// A stream: no size to clamp to and nothing to grow. Each chunk goes to the
+// driver as it is; a short answer (or 0) ends the call, so a device that
+// has nothing to give right now returns what it had.
+//
+
+static int32_t sys_device_read(AddressSpace* space, File file, uint32_t user_buffer, uint32_t length) {
+    uint8_t* bounce = (uint8_t*)malloc(SYS_IO_CHUNK);
+    if (bounce == NULL)
+        return SYS_ENOMEM;
+
+    uint32_t done  = 0;
+    int32_t  error = SYS_OK;
+    while (done < length) {
+        uint32_t want = length - done;
+        if (want > SYS_IO_CHUNK)
+            want = SYS_IO_CHUNK;
+
+        int32_t got = vfs_read(file, bounce, want);
+        if (got <= 0) {
+            error = got;    // The driver's SYS_E* code, or 0 for nothing
+            break;
+        }
+        if ((uint32_t)got > want)
+            got = (int32_t)want;
+        if (!vmm_user_copy_to(space, user_buffer + done, bounce, (uint32_t)got)) {
+            error = SYS_EFAULT;
+            break;
+        }
+        done += (uint32_t)got;
+        if ((uint32_t)got < want)
+            break;
+    }
+
+    free(bounce);
+    return (done > 0) ? (int32_t)done : error;
+}
+
+static int32_t sys_device_write(AddressSpace* space, File file, uint32_t user_buffer, uint32_t length) {
+    uint8_t* bounce = (uint8_t*)malloc(SYS_IO_CHUNK);
+    if (bounce == NULL)
+        return SYS_ENOMEM;
+
+    uint32_t done  = 0;
+    int32_t  error = SYS_OK;
+    while (done < length) {
+        uint32_t want = length - done;
+        if (want > SYS_IO_CHUNK)
+            want = SYS_IO_CHUNK;
+
+        if (!vmm_user_copy_from(space, bounce, user_buffer + done, want)) {
+            error = SYS_EFAULT;
+            break;
+        }
+        int32_t wrote = vfs_write(file, bounce, want);
+        if (wrote <= 0) {
+            error = wrote;
+            break;
+        }
+        done += (uint32_t)wrote;
+        if ((uint32_t)wrote < want)
+            break;
+    }
+
+    free(bounce);
+    return (done > 0) ? (int32_t)done : error;
+}
+
+_Static_assert(VFS_IOCTL_NOT_DEVICE == SYS_ENOTTY && VFS_IOCTL_DENIED == SYS_EPERM,
+               "vfs_ioctl's own results are SYS_E* codes");
+
+// ioctl(fd, request, arg) on a descriptor from open: its character device
+static int32_t sys_ioctl_file_locked(SysProcessFiles* t, const SyscallArgs* args) {
+    SysFile* f = sys_fd_get(t, args->arg1);
+    if (f == NULL)
+        return SYS_EBADF;
+    if (f->file == VFS_INVALID_FILE)
+        return SYS_EIO;
+    return vfs_ioctl(f->file, args->arg2, args->arg3);
+}
+
+//
 // open(path, flags) -> descriptor
 //
 
@@ -145,6 +228,14 @@ static int32_t sys_open_locked(SysProcessFiles* t, const SyscallArgs* args) {
     if (result < 0) {
         free(saved);
         return result;
+    }
+
+    // A character device may ask for more clearance than reading or writing
+    uint32_t device_security = 0;
+    if (vfs_file_is_device(file, &device_security) && !sys_security_allows(device_security)) {
+        vfs_close(file);
+        free(saved);
+        return SYS_EPERM;
     }
 
     SysFile* f = &t->files[fd];
@@ -200,6 +291,9 @@ static int32_t sys_read_locked(SysProcessFiles* t, const SyscallArgs* args) {
     AddressSpace* space = process_current_space();
     if (!vmm_user_check(space, user_buffer, length, true))
         return SYS_EFAULT;
+
+    if (vfs_file_is_device(f->file, NULL))
+        return sys_device_read(space, f->file, user_buffer, length);
 
     // Clamp here rather than trust each device's end-of-file behaviour
     uint32_t size = sys_clamp_offset(vfs_get_size(f->file));
@@ -287,6 +381,9 @@ static int32_t sys_write_locked(SysProcessFiles* t, const SyscallArgs* args) {
     AddressSpace* space = process_current_space();
     if (!vmm_user_check(space, user_buffer, length, false))
         return SYS_EFAULT;
+
+    if (vfs_file_is_device(f->file, NULL))
+        return sys_device_write(space, f->file, user_buffer, length);
 
     uint32_t size = sys_clamp_offset(vfs_get_size(f->file));
     bool append = (f->flags & SYS_O_APPEND) != 0;

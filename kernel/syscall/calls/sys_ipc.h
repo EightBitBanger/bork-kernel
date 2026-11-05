@@ -7,6 +7,7 @@
 #include <kernel/syscall/calls/sys_types.h>
 #include <kernel/scheduler/process.h>
 #include <kernel/ipc/ipc.h>
+#include <kernel/syscall/calls/sys_file.h>     // sys_ioctl_file_locked
 
 //
 // IPC and input calls (ABI in syscall.h, implementation in ipc/ipc.c)
@@ -50,12 +51,13 @@ SYS_IPC_CALL(sys_input_open,      ipc_sys_input_open(&c))
 SYS_IPC_CALL(sys_input_read,      ipc_sys_input_read(&c, args->arg1, args->arg2, args->arg3))
 SYS_IPC_CALL(sys_tty_resize,      ipc_sys_tty_resize(&c, args->arg1, args->arg2, args->arg3))
 
-// ioctl(fd, request, arg): only the terminal behind 0-2 answers
+// ioctl(fd, request, arg): the terminal behind 0-2, or the character
+// device a descriptor from open is on (sys_file.h)
 static int32_t sys_ioctl(const SyscallArgs* args) {
     if (args->arg1 >= SYS_FD_MAX)
         return SYS_EBADF;
     if (args->arg1 >= SYS_FD_FIRST)
-        return SYS_ENOTTY;
+        return sys_files_call(sys_ioctl_file_locked, args);
     IpcCaller c = sys_ipc_caller();
     if (c.space == NULL)
         return SYS_EFAULT;

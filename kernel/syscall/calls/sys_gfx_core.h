@@ -7,7 +7,6 @@
 
 #include <kernel/syscall/syscall.h>
 #include <kernel/gfx/gfx.h>
-#include <kernel/resources/classes/sprite.h>
 #include <kernel/malloc.h>
 #include <kernel/util/string.h>
 
@@ -32,14 +31,6 @@ typedef struct {
     GfxContext gc;
 } SysGfxSurface;
 
-// One loaded resource (SYS_RES_LOAD): a decoded, read-only image
-typedef struct {
-    GfxSurface surface;                 // Owns its pixels
-    uint32_t   type;                    // SYS_RES_TYPE_*
-    char       name[SYS_RES_NAME_MAX];
-    char*      path;                    // Absolute path it was loaded from (malloc'd)
-} SysGfxResource;
-
 typedef struct {
     void* ctx;
 
@@ -52,10 +43,6 @@ typedef struct {
 
     // Another surface of the same process (BLIT's source), or NULL
     SysGfxSurface* (*lookup)(void* ctx, uint32_t handle);
-
-    // A resource of the same process (RESOURCE's source), or NULL. May be
-    // NULL itself: then there are no resources.
-    const SysGfxResource* (*resource)(void* ctx, uint32_t handle);
 } SysGfxEnv;
 
 #define SYS_GFX_BOUNCE_BYTES  16384     // PIXELS strips go through this much
@@ -94,52 +81,6 @@ static int32_t sys_gfx_surface_init(SysGfxSurface* s, int32_t width, int32_t hei
 
 static void sys_gfx_surface_free(SysGfxSurface* s) {
     gfx_surface_destroy(&s->surface);
-}
-
-//
-// Resources (SYS_RES_*): naming and decoding. Loading the file and the
-// per-process table are the caller's (syscall/calls/sys_resource.h).
-//
-
-// A resource's name: the last part of `path` (absolute, normalized).
-// SYS_ENAMETOOLONG past SYS_RES_NAME_MAX - 1 bytes, SYS_EINVAL for "/".
-static int32_t sys_gfx_resource_name(const char* path, char out[SYS_RES_NAME_MAX]) {
-    const char* name = path;
-    for (const char* p = path; *p != '\0'; p++) {
-        if (*p == '/')
-            name = p + 1;
-    }
-    size_t length = strlen(name);
-    if (length == 0)
-        return SYS_EINVAL;
-    if (length >= SYS_RES_NAME_MAX)
-        return SYS_ENAMETOOLONG;
-    memcpy(out, name, length + 1);
-    return SYS_OK;
-}
-
-// Pixel bytes a sprite decodes to, 0 if it can't be a surface
-static uint32_t sys_gfx_sprite_bytes(const struct Sprite* sprite) {
-    return sys_gfx_surface_bytes(sprite->width, sprite->height);
-}
-
-// Decode a sprite into r->surface. SYS_EBADFMT when its size is not
-// allowed for a surface, SYS_ENOMEM when out of memory.
-static int32_t sys_gfx_resource_from_sprite(SysGfxResource* r, const struct Sprite* sprite) {
-    if (sys_gfx_sprite_bytes(sprite) == 0)
-        return SYS_EBADFMT;
-    if (!gfx_surface_create(&r->surface, sprite->width, sprite->height))
-        return SYS_ENOMEM;
-    // A created surface's stride is its width: the bitmap fits row for row
-    sprite_get_bitmap(r->surface.pixels, sprite);
-    r->type = SYS_RES_TYPE_SPRITE;
-    return SYS_OK;
-}
-
-static void sys_gfx_resource_free(SysGfxResource* r) {
-    gfx_surface_destroy(&r->surface);
-    free(r->path);
-    r->path = NULL;
 }
 
 //
@@ -268,31 +209,6 @@ static int32_t sys_gfx_cmd_blit(SysGfxSurface* s, const int32_t* a, const SysGfx
     return SYS_OK;
 }
 
-static int32_t sys_gfx_cmd_resource(SysGfxSurface* s, const int32_t* a, const SysGfxEnv* env) {
-    const SysGfxResource* res = env->resource ? env->resource(env->ctx, (uint32_t)a[0]) : NULL;
-    if (res == NULL)
-        return SYS_EBADF;
-    if (!sys_gfx_rect_ok(&a[1]) || !sys_gfx_coord_ok(a[5]) || !sys_gfx_coord_ok(a[6]))
-        return SYS_EINVAL;
-
-    uint32_t flags = (uint32_t)a[7];
-    GfxRect rect = gfx_rect(a[1], a[2], a[3], a[4]);
-    const GfxRect* src_rect = (flags & SYS_GFX_F_WHOLE) ? NULL : &rect;
-
-    // ALPHA applies to this draw only
-    GfxBlend previous = s->gc.state.blend;
-    if (flags & SYS_GFX_F_ALPHA)
-        gfx_set_blend(&s->gc, GFX_BLEND_ALPHA);
-
-    if (flags & SYS_GFX_F_KEYED)
-        gfx_blit_keyed(&s->gc, &res->surface, src_rect, a[5], a[6], (gfx_color_t)a[8]);
-    else
-        gfx_blit(&s->gc, &res->surface, src_rect, a[5], a[6]);
-
-    gfx_set_blend(&s->gc, previous);
-    return SYS_OK;
-}
-
 static int32_t sys_gfx_cmd_text(SysGfxSurface* s, const int32_t* a, uint32_t argc) {
     uint32_t length = (uint32_t)a[5];
     if (length > SYS_GFX_TEXT_MAX || argc != 6 + (length + 3) / 4)
@@ -341,7 +257,6 @@ static int32_t sys_gfx_command(SysGfxSurface* s, uint32_t op, const int32_t* a, 
         [SYS_GFX_CMD_RECT]        = 5, [SYS_GFX_CMD_FILL_RECT]   = 5, [SYS_GFX_CMD_GRADIENT]    = 7,
         [SYS_GFX_CMD_CIRCLE]      = 4, [SYS_GFX_CMD_FILL_CIRCLE] = 4, [SYS_GFX_CMD_TEXT]        = 6,
         [SYS_GFX_CMD_CHAR]        = 6, [SYS_GFX_CMD_PIE]         = 6, [SYS_GFX_CMD_BLIT]        = 9,
-        [SYS_GFX_CMD_RESOURCE]    = 9,
         [SYS_GFX_CMD_PIXELS]      = 8, [SYS_GFX_CMD_SET_CLIP]    = 5, [SYS_GFX_CMD_INTERSECT_CLIP] = 4,
         [SYS_GFX_CMD_SET_ORIGIN]  = 2, [SYS_GFX_CMD_TRANSLATE]   = 2, [SYS_GFX_CMD_SET_BLEND]   = 1,
         [SYS_GFX_CMD_TEXT_SCALE]  = 1, [SYS_GFX_CMD_SAVE]        = 0, [SYS_GFX_CMD_RESTORE]     = 0,
@@ -408,9 +323,6 @@ static int32_t sys_gfx_command(SysGfxSurface* s, uint32_t op, const int32_t* a, 
 
         case SYS_GFX_CMD_PIXELS:
             return sys_gfx_cmd_pixels(s, a, env);
-
-        case SYS_GFX_CMD_RESOURCE:
-            return sys_gfx_cmd_resource(s, a, env);
 
         case SYS_GFX_CMD_SET_CLIP: {
             if ((uint32_t)a[4] & SYS_GFX_F_NO_CLIP) {

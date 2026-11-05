@@ -44,7 +44,7 @@ typedef struct {
     
     uint8_t permissions;                // VFS_PERMISSION_*
     uint8_t type;                       // VFS_TYPE_*
-    uint32_t certificate;
+    uint32_t policy;                    // Group policy id (POLICY_*), 0 for none
     
     // Seconds since the Unix epoch, 0 = unknown (and always 0 for kernel
     // nodes). basefs only sets them once it has a clock (fs_set_time_source).
@@ -212,7 +212,7 @@ bool vfs_device_format(const char* path);
 // first_sector: VFS_PARTITION_START_BOOT leaves room for the boot loader
 // and kernel (build-disk.sh layout); VFS_PARTITION_START_DATA is the usual
 // 1 MB alignment for a disk that will never boot.
-#define VFS_PARTITION_START_BOOT    16384ULL     // = BOOT_RESERVED_SECTORS in build-disk.sh
+#define VFS_PARTITION_START_BOOT    32768ULL     // 16 MB, = BOOT_RESERVED_SECTORS in build-bootloader.sh
 #define VFS_PARTITION_START_DATA    2048ULL
 
 VfsFormatResult vfs_device_partition(const char* path, uint64_t first_sector);
@@ -233,6 +233,15 @@ void vfs_device_prune_disk(struct BlockDevice* disk);
 // A removable disk was pulled out: detach its mounts (and its partitions')
 // without syncing and remove them from /mnt
 VfsFormatResult vfs_device_remove_disk(struct BlockDevice* disk);
+
+// Unmount `disk` so it can be pulled out (a USB stick): sync every mount on
+// it and on its partitions, flush the drive's own write cache, then detach
+// them and remove their /mnt entries. Nothing is detached while a file on
+// any of them is open (VFS_FORMAT_BUSY), or when a sync or the flush fails
+// (VFS_FORMAT_IO_ERROR: the mounts stay, try again or copy the files off).
+// VFS_FORMAT_NOT_MOUNTED when nothing of the disk is mounted. The disk is
+// mounted again when it is plugged back in, or at the next boot.
+VfsFormatResult vfs_device_unmount_disk(struct BlockDevice* disk);
 
 // The mount of a block device ("ata1", "ata0p1"), or NULL if it is not
 // mounted. Hand it to vfs_device_format_context; it stays valid for as long
@@ -296,10 +305,42 @@ uint64_t vfs_tell(File file);
 
 uint64_t vfs_get_size(File file);
 
+// Character devices (driver/chardev.h): /dev files that are a driver, not
+// data. Reads and writes go to the driver as they come; there is no size
+// (vfs_get_size is 0) and the position means nothing.
+//
+// vfs_file_is_device: true if `file` is one, with the SYS_SEC_* bits a
+// process needs to use it in *security (may be NULL).
+// vfs_ioctl: the device's ioctl(request, arg); VFS_IOCTL_NOT_DEVICE if
+// `file` is no device or the device takes no requests.
+#define VFS_IOCTL_NOT_DEVICE    (-25)   // = SYS_ENOTTY
+#define VFS_IOCTL_DENIED        (-18)   // = SYS_EPERM: the caller lacks the device's security bits
+
+bool    vfs_file_is_device(File file, uint32_t* security);
+int32_t vfs_ioctl(File file, uint32_t request, uint32_t arg);
+
 // File system
 bool vfs_mkdir(const char* path);
 bool vfs_remove(const char* path);
 bool vfs_rename(const char* path, const char* name);
+
+// Move a file, or a directory with everything inside it, to `dest` (the
+// full new path, whose name must be free) without copying anything: on a
+// volume whose filesystem can relink entries (basefs, FAT) only directory
+// entries change, however big the object is. Open handles keep working.
+// VFS_MOVE_CROSS_DEVICE when `src` and `dest` are on different volumes (or
+// not on a volume, or the filesystem cannot relink): copy, then remove.
+typedef enum {
+    VFS_MOVE_OK = 0,
+    VFS_MOVE_NOT_FOUND,         // `src`, or the directory `dest` names, is missing
+    VFS_MOVE_EXISTS,            // Something else already has `dest`
+    VFS_MOVE_DENIED,            // Permissions, clearance, or a device's root
+    VFS_MOVE_INTO_ITSELF,       // A directory moved into itself or below itself
+    VFS_MOVE_CROSS_DEVICE,      // Not on one volume: copy instead
+    VFS_MOVE_FAILED,            // Bad name, or the filesystem refused (an open FAT file)
+} VfsMoveResult;
+
+VfsMoveResult vfs_move(const char* src, const char* dest);
 bool vfs_exists(const char* path);
 bool vfs_truncate(const char* path, uint64_t new_size);
 
@@ -317,11 +358,28 @@ bool vfs_get_permissions(const char* path, uint8_t* perm);
 bool vfs_directory_check(const char* path);
 bool vfs_directory_check_mounted(const char* path);
 
-// Cryptography
-// Only files on a mounted storage device carry a certificate. Both return
-// false for anything else. vfs_file_certify rejects 0 and 0xFFFFFFFF.
-bool vfs_file_get_certificate(const char* path, uint32_t* certificate);
-bool vfs_file_certify(const char* path, uint32_t certificate);
+// Group policies (kernel/security/policy.h)
+//
+// Every object on a mounted storage device whose filesystem stores one
+// (basefs: FSBlockHeader.policy) belongs to a group policy, POLICY_NONE (0)
+// until one is set. New objects take their parent directory's.
+//
+// vfs_get_policy: the object's policy id. False if `path` is not an object
+// on a mounted device that can store one.
+//
+// vfs_set_policy: put the object in policy `policy` (POLICY_*). Its
+// security mask keeps the bits the policy holds (Policy.permissions), loses
+// the rest, and gains the policy's clearance (policy_clearance), under
+// the same rule as vfs_set_security (vfs_security_change_allowed). POLICY_NONE takes it out of its group and leaves the
+// mask alone. False for an id the kernel doesn't know, a caller not cleared
+// for the object or the way to it, or a filesystem that can't store one.
+// Only that object: what is inside a folder keeps its own policy.
+bool vfs_get_policy(const char* path, uint32_t* policy);
+bool vfs_set_policy(const char* path, uint32_t policy);
+
+// The same, changing only the group: the mask stays exactly as it is
+// (SYS_SETPOLICY, the Security tab's policy list)
+bool vfs_set_policy_only(const char* path, uint32_t policy);
 
 // Security clearance
 //
@@ -339,10 +397,11 @@ bool vfs_file_certify(const char* path, uint32_t certificate);
 // source is set, have VFS_CLEARANCE_ALL, so kernel code is never refused.
 //
 // What is checked (object mask = the object's own, parent = its directory):
-//   open, read, write, truncate, set permissions, certify    object
+//   open, read, write, truncate, set permissions, policy     object
 //   list a directory (item count / item)                     object
 //   create a file or directory                               parent
 //   rename                                                   object + parent
+//   move                                                     object + both parents
 //   remove                                                   parent + object + everything below it
 // stat, exists and get_permissions are always allowed, so a refused call
 // can say "permission denied" instead of "not found". Kernel nodes (/, /dev,
@@ -367,10 +426,17 @@ uint32_t vfs_caller_clearance(void);
 // The object's mask. False if `path` is not an object on a mounted device.
 bool vfs_get_security(const char* path, uint32_t* security);
 
-// Replace the object's mask. The caller's clearance must cover both the old
-// mask and the new one (nobody can grant or strip a bit they do not hold).
-// Only affects that object; contents keep their own masks.
+// Replace the object's mask (vfs_security_change_allowed decides). Only
+// affects that object; contents keep their own masks.
 bool vfs_set_security(const char* path, uint32_t security);
+
+// May the caller change an object's mask from old_mask to new_mask? A
+// caller holding VFS_SECURITY_ADMIN always may: an administrator can change
+// any file's security, also one it isn't cleared to open ("network",
+// "system") and to a mask it doesn't hold itself. Anyone else must be
+// cleared for old_mask and hold every bit of new_mask.
+// The caller is still checked for the way to the object (its folders).
+bool vfs_security_change_allowed(uint32_t old_mask, uint32_t new_mask);
 
 // True unless the object at `path` (or, for the parent form, the directory
 // holding it) exists and requires clearance the caller lacks. Used by the

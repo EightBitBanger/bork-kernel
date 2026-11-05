@@ -74,9 +74,8 @@
 #define SYS_IPC_INFO   41   // (handle, SysIpcInfo*)    0
 #define SYS_INPUT_OPEN 42   // ()                       input handle (exclusive)
 #define SYS_INPUT_READ 43   // (handle, SysInputEvent*, max)           events read, 0 if none
-#define SYS_RES_LOAD   44   // (path)                   0
-#define SYS_RES_GET    45   // (name)                   resource handle (>= 1)
-#define SYS_RES_INFO   46   // (handle, SysResInfo*)    0
+// 44 .. 46 unused (were res_load / res_get / res_info, the RSRC image
+// resources; images are decoded in the program now, os/image.h)
 #define SYS_GETHOME    47   // (buf, size)              home path length (system device root)
 #define SYS_TIME       48   // (uint64_t* ms)           0, milliseconds since boot
 #define SYS_INPUT_WARP 49   // (handle, x, y, SysInputEvent* scratch)  0, pointer moved
@@ -92,7 +91,28 @@
 #define SYS_TTY_RESIZE 59   // (pipe, columns, rows)    0
 #define SYS_REG_GET    60   // (path, name, buf, size)  value length    (registry, sys_registry.h)
 #define SYS_REG_KEYS   61   // (path, index, buf, size) subkey name length, 0 past the last
-#define SYS_COUNT      62
+#define SYS_SOCK_LISTEN 62  // (port, backlog)         socket handle (>= 1)     (network, sys_net.h)
+#define SYS_SOCK_CONNECT 63 // (SysSockAddr*)           socket handle, connecting
+#define SYS_SOCK_ACCEPT 64  // (listener, SysSockAddr* or 0)  socket handle, SYS_EAGAIN if none
+#define SYS_SOCK_SEND  65   // (handle, buf, length)    bytes queued, SYS_EAGAIN if the buffer is full
+#define SYS_SOCK_RECV  66   // (handle, buf, size)      bytes read, 0 once the peer closed
+#define SYS_SOCK_CLOSE 67   // (handle)                 0
+#define SYS_SOCK_WAIT  68   // (SysSockWaitItem*, count, timeout_ms)   items ready, 0 on timeout
+#define SYS_SOCK_INFO  69   // (handle, SysSockInfo*)   0
+#define SYS_DRV_LOAD   70   // (path, SysDrvInfo* or 0) 0, the driver is running   (needs ADMIN + FILE_READ)
+#define SYS_DRV_UNLOAD 71   // (name)                   0                           (needs ADMIN)
+#define SYS_REG_SET    72   // (path, name, data, size) 0               (needs FILE_WRITE; + ADMIN for hkey_root)
+#define SYS_REG_VALUES 73   // (path, index, buf, size) value name length, 0 past the last
+#define SYS_REG_DELETE 74   // (path, name or 0)        0, a value, or the key and all below it  (as REG_SET)
+#define SYS_REG_MKKEY  75   // (path)                   0               (as REG_SET)
+#define SYS_REG_RENAME 76   // (path, name or 0, new_name)  0, a value, or the key itself  (as REG_SET)
+#define SYS_DRV_CALL   77   // (SysDrvCall*)            0, the function ran (its result is in the struct)
+#define SYS_DRV_EXPORTS 78  // (driver, index, SysDrvExport*)  0, SYS_ENOENT past the last
+#define SYS_MOVE       79   // (src, dest)              0, SYS_EXDEV if not on one volume
+#define SYS_UNMOUNT    80   // (device)                 0, synced and gone from /mnt  (needs FILE_WRITE)
+#define SYS_SETPOLICY  81   // (path, policy)           0               (needs ADMIN + FILE_WRITE)
+#define SYS_SETSECURITY 82  // (path, mask)             0               (needs ADMIN + FILE_WRITE)
+#define SYS_COUNT      83
 
 #define SYS_OK               0
 #define SYS_ENOSYS          -1  // Unknown syscall number
@@ -116,10 +136,18 @@
 #define SYS_ESRCH          -19  // No such process
 #define SYS_EAGAIN         -20  // Not now: nothing to receive / queue full / try again
 #define SYS_EPIPE          -21  // The other end of the pipe is closed
-#define SYS_EBADFMT        -22  // Not a resource file / executable this kernel can load
+#define SYS_EBADFMT        -22  // Not an executable (or other file) this kernel can load
 #define SYS_E2BIG          -23  // Argument list too long (SYS_SPAWN)
 #define SYS_ETIMEDOUT      -24  // Nobody answered in time (SYS_ELEVATE)
 #define SYS_ENOTTY         -25  // Not a terminal, or a request the terminal doesn't know (SYS_IOCTL)
+#define SYS_ENETDOWN       -26  // No interface is up with an address
+#define SYS_ENETUNREACH    -27  // No route to that address
+#define SYS_EADDRINUSE     -28  // That port is taken
+#define SYS_ECONNREFUSED   -29  // The peer refused the connection
+#define SYS_ECONNRESET     -30  // The peer reset the connection
+#define SYS_ENOTCONN       -31  // Not connected (any more), or a listener
+#define SYS_EXDEV          -32  // Not on one volume: copy and remove instead (SYS_MOVE)
+#define SYS_ECANCELED      -33  // The user said no to the prompt (SYS_SPAWN with SYS_SPAWN_ELEVATE)
 
 #define SYS_ERROR_MIN       -4095
 
@@ -133,11 +161,10 @@
 // before it does anything. The mask is checked on every call, so taking a
 // bit away also stops descriptors and surfaces that are already open.
 //
-//   SYS_SEC_FILE_READ    open for reading, read, stat, fstat, readdir, chdir,
-//                        res_load (with SYS_SEC_GFX)
+//   SYS_SEC_FILE_READ    open for reading, read, stat, fstat, readdir, chdir
 //   SYS_SEC_FILE_WRITE   open for writing / create / trunc / append, write
-//                        (to a file), mkdir, remove, rename, truncate
-//                        (copy needs both file bits)
+//                        (to a file), mkdir, remove, rename, move,
+//                        truncate (copy needs both file bits)
 //   SYS_SEC_CONSOLE      print, and write to descriptors 1 and 2, on the
 //                        kernel console. A process on a terminal (see
 //                        "Terminals") uses that without it.
@@ -158,9 +185,14 @@
 //   SYS_SEC_ELEVATE      ask the user for SYS_SEC_ADMIN: SYS_ELEVATE (see
 //                        "Elevation" below). Leave it out of a child's mask
 //                        to keep it from ever asking.
+//   SYS_SEC_NET          the network: sock_listen, sock_connect,
+//                        sock_accept, sock_send, sock_recv, sock_wait,
+//                        sock_info. Listening on a port below 1024 needs
+//                        SYS_SEC_ADMIN too. Not in a default mask: a program
+//                        reaches the network only when it is given this bit.
 //
 // Always allowed: exit, yield, sleep, getpid, sbrk, close, seek, getcwd, gethome, time,
-// ipc_close, ipc_info, SYS_SEC_GET on the caller itself, ioctl, and read / write
+// ipc_close, ipc_info, sock_close, SYS_SEC_GET on the caller itself, ioctl, and read / write
 // / print on the caller's terminal.
 //
 // Files: every file and directory on a storage device carries a mask of
@@ -195,12 +227,13 @@
 #define SYS_SEC_EXEC        0x00000080u
 #define SYS_SEC_ADMIN       0x00000100u
 #define SYS_SEC_ELEVATE     0x00000200u
+#define SYS_SEC_NET         0x00000400u
 
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | \
                              SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | SYS_SEC_IPC | \
                              SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN | \
-                             SYS_SEC_ELEVATE)
+                             SYS_SEC_ELEVATE | SYS_SEC_NET)
 
 //
 // Elevation
@@ -269,6 +302,10 @@
 #define SYS_ELEVATE_COOLDOWN_MS  5000       // After a Cancel, the same process waits this long
 #define SYS_ELEVATE_ARM_MS       750        // A prompt shows this long before Allow counts
 
+// SysElevateRequest.flags
+#define SYS_ELEVATE_LAUNCH       0x0001     // SYS_SPAWN_ELEVATE: name and path are the program
+                                            // about to be started, `by` the process starting it
+
 typedef struct {
     uint32_t id;                            // For STATUS and ANSWER (never 0)
     int32_t  pid;                           // The process asking
@@ -277,6 +314,9 @@ typedef struct {
     char     name[SYS_ELEVATE_NAME_MAX];    // Kernel's record: the executable's file name
     char     path[SYS_ELEVATE_PATH_MAX];    // ... and its absolute path when it was started
     char     reason[SYS_ELEVATE_REASON_MAX];// The program's own words (printable ASCII)
+    uint32_t flags;                         // SYS_ELEVATE_*
+    char     by[SYS_ELEVATE_NAME_MAX];      // LAUNCH: file name of the process asking (pid)
+    uint32_t requested;                     // SYS_SEC_* bits the user is asked for
 } SysElevateRequest;
 
 //
@@ -358,6 +398,159 @@ typedef struct {
     char     filesystem[SYS_FORMAT_FS_MAX];  // in:  "basefs", "fat32", or "" for the default
                                     // out: the one used
 } SysFormatSpec;
+
+//
+// Unmounting
+//
+// SYS_UNMOUNT(device) gets a removable drive ready to be pulled out: every
+// volume on it is written out (cached blocks, allocation tables), the
+// drive is told to commit its own write cache, and then its volumes are
+// detached and gone from /mnt. device is a name as listed in /mnt ("usb0",
+// "usb0p1"); a partition's name unmounts the whole disk it is on, every
+// partition included. The disk mounts again when it is plugged back in, or
+// at the next boot. Needs SYS_SEC_FILE_WRITE. Logged on COM1.
+//
+// Returns SYS_OK or:
+//   SYS_EPERM      no SYS_SEC_FILE_WRITE
+//   SYS_EINVAL     bad device name
+//   SYS_ENOENT     no such device, or nothing on it is mounted
+//   SYS_EACCES     the device holding the system folders (SYS_GETHOME), or
+//                  the disk it is on
+//   SYS_EBUSY      a file on it is open, or a format is running
+//   SYS_EIO        a write failed: nothing was detached, the files are
+//                  still there
+//   SYS_EFAULT     bad device pointer
+//
+
+//
+// Drivers
+//
+// SYS_DRV_LOAD(path, SysDrvInfo* info or 0) loads a driver file and starts
+// it. A driver file is known by its first four bytes, "kdrv", not by its
+// name (the format is kernel/driver/kdrv.h; drivers that come with the
+// system are in sys/drivers/ under home). Its code runs in the kernel with
+// full access to the machine, so the call needs SYS_SEC_ADMIN, and
+// SYS_SEC_FILE_READ to read the file; a user program asks for admin first
+// (SYS_ELEVATE). The file is read once, with the caller's clearance, and
+// only that copy is checked and run.
+//
+// The driver is registered like a built-in one: it is offered every device
+// nothing holds yet, and is listed in /drv with origin "loaded". info (may
+// be 0) gets its name and version and how many devices it took.
+//
+// SYS_DRV_UNLOAD(name) stops a loaded driver: remove() runs on every device
+// it holds, then its code is freed. Needs SYS_SEC_ADMIN.
+//
+// One load or unload runs at a time, system-wide. Every load and unload is
+// logged on COM1 with the caller's pid and name.
+//
+// Returns SYS_OK or:
+//   SYS_EPERM      no SYS_SEC_ADMIN (load: or no SYS_SEC_FILE_READ)
+//   SYS_ENOENT     no such file / no loaded driver of that name
+//   SYS_EACCES     the file is not readable with the caller's clearance;
+//                  unload: a built-in driver
+//   SYS_EBADFMT    not a driver file, or a damaged one (header, tables or
+//                  checksum), or one built for another CPU, DRIVER_ABI or a
+//                  newer kernel API, or larger than SYS_DRV_FILE_MAX
+//   SYS_EEXIST     a driver of that name is registered already
+//   SYS_ENOSPC     SYS_DRV_LOADED_MAX drivers loaded, or the driver table is full
+//   SYS_EBUSY      unload: a program is in a call into the library right now
+//   SYS_ENOMEM     out of kernel memory
+//   SYS_EIO        the file could not be read, or the driver would not start
+//                  (its entry point said no or returned nonsense)
+//   SYS_EFAULT     bad path, name or info pointer
+//   SYS_ENAMETOOLONG
+
+#define SYS_DRV_NAME_MAX        16                  // == DRIVER_NAME_MAX
+#define SYS_DRV_VERSION_MAX     16
+#define SYS_DRV_FILE_MAX        (1024u * 1024u)     // == KDRV_FILE_MAX
+#define SYS_DRV_LOADED_MAX      8                   // == KDRV_LOADED_MAX
+
+// Filled by SYS_DRV_LOAD. 48 bytes.
+typedef struct {
+    char     name[SYS_DRV_NAME_MAX];        // "hello"
+    char     version[SYS_DRV_VERSION_MAX];  // "1.0", "" if it gives none
+    uint32_t image_size;                    // Kernel memory it occupies, bytes
+    uint32_t devices;                       // Devices it took when it started
+    uint32_t reserved[2];
+} SysDrvInfo;
+
+//
+// Library drivers
+//
+// A driver of type "library" (/drv/<name>/type) binds to no hardware: it is
+// a table of functions that programs call by name, like a DLL, except that
+// they run inside the kernel. It is loaded like any driver (SYS_DRV_LOAD,
+// needs admin); calling it does not need admin.
+//
+// SYS_DRV_CALL(SysDrvCall* call) calls call->function of the library
+// call->driver with call->argc arguments. Each argument says its type, and
+// they must be exactly the function's parameters (SysDrvExport.params, one
+// letter per parameter: 'i' a 32-bit number, 's' a string). String
+// arguments are copied into the kernel first, at most SYS_DRV_STRING_MAX
+// bytes each with the terminator. The function's return value comes back
+// in call->result, any int32_t, and a text answer, if it gives one, in
+// call->out (call->out_size bytes, at most SYS_DRV_OUTPUT_MAX used, always
+// terminated; call->out_length is its strlen). Nothing else in the struct
+// is written.
+//
+// A function may demand SYS_SEC_* bits (SysDrvExport.security) of the
+// caller; most ask for none. Calls run on the caller's thread and may run
+// at the same time as other calls. While one runs, the library can't be
+// unloaded (SYS_DRV_UNLOAD says SYS_EBUSY).
+//
+// SYS_DRV_EXPORTS(driver, index, SysDrvExport* out) describes the library's
+// index'th function (0, 1, ...): SYS_ENOENT past the last, so a loop until
+// SYS_ENOENT lists them all. No security bits needed.
+//
+// Returns SYS_OK or:
+//   SYS_ENOENT     no driver of that name is registered, or it has no such
+//                  function (SYS_DRV_EXPORTS: index past the last)
+//   SYS_EBADFMT    the driver is not a library (a device driver or service)
+//   SYS_EINVAL     wrong number or types of arguments for the function, or
+//                  argc over SYS_DRV_ARGS_MAX
+//   SYS_EPERM      the caller lacks the function's security bits
+//   SYS_ENAMETOOLONG  a name or string argument too long
+//   SYS_EFAULT     a bad pointer in or behind the struct
+//   SYS_ENOMEM
+
+#define SYS_DRV_ARGS_MAX        8       // == DRIVER_CALL_ARGS_MAX
+#define SYS_DRV_STRING_MAX      256     // == DRIVER_CALL_STRING_MAX, terminator included
+#define SYS_DRV_OUTPUT_MAX      1024    // == DRIVER_CALL_OUTPUT_MAX, terminator included
+#define SYS_DRV_FUNC_MAX        24      // == DRIVER_EXPORT_NAME_MAX, terminator included
+#define SYS_DRV_HELP_MAX        64      // == DRIVER_EXPORT_HELP_MAX, terminator included
+
+// SysDrvArg.type, and the letters of SysDrvExport.params
+#define SYS_DRV_ARG_INT         'i'
+#define SYS_DRV_ARG_STRING      's'
+
+// One argument. 8 bytes.
+typedef struct {
+    uint32_t type;                          // SYS_DRV_ARG_*
+    uint32_t value;                         // INT: the number (an int32_t);
+                                            // STRING: address of a NUL-terminated string
+} SysDrvArg;
+
+// SYS_DRV_CALL's one argument. Addresses are user addresses. 40 bytes.
+typedef struct {
+    uint32_t driver;                        // in:  address of the library's name
+    uint32_t function;                      // in:  address of the function's name
+    uint32_t args;                          // in:  address of SysDrvArg[argc] (0 if argc is 0)
+    uint32_t argc;                          // in
+    uint32_t out;                           // in:  address of a buffer for the text answer, or 0
+    uint32_t out_size;                      // in:  its size in bytes (0: no text wanted)
+    int32_t  result;                        // out: what the function returned
+    uint32_t out_length;                    // out: bytes of text in out, terminator not counted
+    uint32_t reserved[2];                   // 0
+} SysDrvCall;
+
+// Filled by SYS_DRV_EXPORTS. 104 bytes.
+typedef struct {
+    char     name[SYS_DRV_FUNC_MAX];        // "add"
+    char     params[SYS_DRV_ARGS_MAX + 4];  // "ii", "" for none (NUL-terminated)
+    char     help[SYS_DRV_HELP_MAX];        // One line, "" if none
+    uint32_t security;                      // SYS_SEC_* bits a caller needs
+} SysDrvExport;
 
 //
 // Files
@@ -480,7 +673,7 @@ typedef struct {
 #define SYS_GFX_CMD_TEXT_SCALE  19  // 1 .. 8
 #define SYS_GFX_CMD_SAVE        20  //
 #define SYS_GFX_CMD_RESTORE     21  //
-#define SYS_GFX_CMD_RESOURCE    22  // resource_handle sx sy sw sh x y flags key   (see "Resources")
+// 22 unused (was RESOURCE)
 
 #define SYS_GFX_CMD_HEADER(op, words)   ((uint32_t)(op) | ((uint32_t)(words) << 16))
 
@@ -490,7 +683,6 @@ typedef struct {
 #define SYS_GFX_F_WHOLE         0x01    // BLIT: the whole source (sx sy sw sh ignored)
 #define SYS_GFX_F_KEYED         0x02    // BLIT, PIXELS: skip pixels equal to key
 #define SYS_GFX_F_NO_CLIP       0x01    // SET_CLIP: clip to the whole surface
-#define SYS_GFX_F_ALPHA         0x04    // RESOURCE: blend by alpha, whatever the blend mode
 
 #define SYS_GFX_BLEND_COPY      0
 #define SYS_GFX_BLEND_ALPHA     1
@@ -640,6 +832,9 @@ typedef struct {
 // the character (ASCII, Shift applied) or one of SYS_KEY_*. `mods` holds the
 // modifier keys at the time the event is read, `x` `y` `buttons` the mouse state.
 //
+// Mouse wheel: a MOUSE event with `wheel` != 0 (notches turned since the
+// last event; + toward the user, i.e. scroll down). It may carry a move too.
+//
 
 #define SYS_INPUT_READ_MAX      32
 
@@ -688,53 +883,20 @@ typedef struct {
     int16_t  x, y;          // Mouse position, screen coordinates
     uint8_t  buttons;       // SYS_INPUT_BTN_*
     uint8_t  mods;          // SYS_INPUT_MOD_*
-    uint16_t reserved;
+    int16_t  wheel;         // MOUSE: wheel notches, + toward the user (scroll
+                            // down), - away (up); 0 when it didn't turn. KEY: 0
     uint32_t time_ms;       // Milliseconds since boot (mouse); read time (keys)
 } SysInputEvent;
 
 //
-// Resources
+// See-through color
 //
-// SYS_RES_LOAD reads a resource file (the kernel's RSRC format, see
-// resources/resource_manager.h) into this process and registers it under
-// its NAME: the file's own name, the last part of the path
-// ("/x/images/icon_folder" is "icon_folder"). SYS_RES_GET turns a name into a handle, 1 ..
-// SYS_RES_MAX, which SYS_GFX_CMD_RESOURCE draws from and SYS_RES_INFO
-// describes. Names and handles are private to the process; everything it
-// loaded is freed when it exits.
+// The window manager's images (and the programs that draw the same way)
+// treat opaque black as see-through: draw them keyed on it, alpha
+// blended. Black that must show is drawn as 0xFF010101.
 //
-// Loading the same file again is a no-op (0). Another file with the same
-// name is SYS_EEXIST. A path that is not a file is SYS_ENOENT / SYS_EISDIR;
-// a file that is not a resource, holds a type this kernel cannot load, is
-// damaged, or is larger than SYS_GFX_MAX_DIM either way is SYS_EBADFMT.
-// The decoded image counts against the same pixel budget as surfaces
-// (SYS_GFX_PROCESS_BYTES), so SYS_ENOMEM past that.
-//
-// Supported: sprites (SYS_RES_TYPE_SPRITE), decoded to 0xAARRGGBB pixels.
-// Sprites mark see-through pixels with opaque black, SYS_GFX_SPRITE_KEY;
-// draw them keyed on it and alpha blended, as the libc's
-// gfx_draw_resource* does (KEYED | ALPHA, key SYS_GFX_SPRITE_KEY).
-//
-// SYS_GFX_CMD_RESOURCE takes the same arguments as SYS_GFX_CMD_BLIT, with
-// a resource handle as the source, plus SYS_GFX_F_ALPHA.
-//
-// Load needs SYS_SEC_FILE_READ and SYS_SEC_GFX; get and info SYS_SEC_GFX.
-//
-
-#define SYS_RES_MAX             64      // Resources per process
-#define SYS_RES_NAME_MAX        64      // Name bytes, terminator included
-
-#define SYS_RES_TYPE_SPRITE     1       // = RESOURCE_TYPE_SPRITE
 
 #define SYS_GFX_SPRITE_KEY      0xFF000000u
-
-// Filled by SYS_RES_INFO. 16 bytes.
-typedef struct {
-    uint32_t type;          // SYS_RES_TYPE_*
-    uint32_t width;         // Pixels
-    uint32_t height;
-    uint32_t reserved;
-} SysResInfo;
 
 //
 // File details: SYS_FINFO, SYS_CHMOD
@@ -758,12 +920,34 @@ typedef struct {
 // it, and that folder must be writable (SYS_EACCES otherwise). A device's
 // root is SYS_EBUSY; bits outside SYS_PERM_* are SYS_EINVAL.
 //
+// SYS_SETPOLICY(path, policy) puts a file or folder in group policy
+// `policy` (SYS_POLICY_*), SYS_POLICY_NONE taking it out of its group.
+// Only the group changes: the security mask (the "allow" bits) stays
+// exactly as it is. (The kernel console's "policy set" also adds the
+// policy's clearance.) Only that object: what is in a folder keeps its
+// own. SYS_EINVAL for an id the kernel doesn't know.
+//
+// SYS_SETSECURITY(path, mask) replaces the security mask by itself (the
+// policy stays): the "allow" edits on top of a policy. Bits outside
+// SYS_SEC_VALID, or a change to a bit the object's policy doesn't hold
+// (set or clear), are SYS_EINVAL; bits already set outside it may stay.
+//
+// Both need SYS_SEC_ADMIN and SYS_SEC_FILE_WRITE (programs ask the user
+// with SYS_ELEVATE first), and what SYS_CHMOD needs (SYS_EBUSY, SYS_EACCES
+// as there) except clearance for the object itself: an admin may change
+// the security of a file it can't open ("network", "system"), and require
+// bits it doesn't hold. SYS_EACCES on a file system that keeps no mask
+// (FAT).
+//
 
 #define SYS_FINFO_DEVICE    0x0001  // A storage device's root: device_* are filled in
 #define SYS_FINFO_ACCESS    0x0002  // The caller's clearance covers `security`
 #define SYS_FINFO_CHMOD     0x0004  // SYS_CHMOD on it would be allowed for the caller
 #define SYS_FINFO_COUNTING  0x0008  // DEVICE: still counting the used space; device_used is 0
                                     // and device_percent how far it got. Ask again in a moment.
+#define SYS_FINFO_CONSOLE   0x0010  // Only without ACCESS, for an executable file: the program
+#define SYS_FINFO_WINDOWED  0x0020  // kind its ".os.kind" marks say (os/process.h), so a launcher
+                                    // that can't read it knows how to start it elevated
 
 // Filled by SYS_FINFO. 32 bytes.
 typedef struct {
@@ -774,8 +958,17 @@ typedef struct {
     uint32_t device_used_hi;    // DEVICE: high 32 bits of the two above
     uint32_t device_capacity_hi;
     uint32_t device_percent;    // DEVICE + COUNTING: how much has been counted (0..99)
-    uint32_t reserved;
+    uint32_t policy;            // SYS_POLICY_*: the group policy it belongs to (0: none)
 } SysFileInfo;
+
+// Group policies (SysFileInfo.policy, SYS_SETPOLICY). The kernel's table,
+// listed read-only in the registry under hkey_root/system/policy/<name>
+// (id, permissions, clearance, description).
+#define SYS_POLICY_NONE     0   // In no group: only the security mask counts
+#define SYS_POLICY_USER     1   // What user programs start with; any process may use it
+#define SYS_POLICY_ADMIN    2   // user + SYS_SEC_ADMIN; needs admin
+#define SYS_POLICY_SYSTEM   3   // Every permission; needs every bit user programs lack
+#define SYS_POLICY_NETWORK  4   // user + SYS_SEC_NET; needs SYS_SEC_NET
 
 //
 // SYS_SYNC() writes what every mounted file system still holds in memory
@@ -812,6 +1005,33 @@ typedef struct {
 // SYS_E2BIG, SYS_ENAMETOOLONG, SYS_EAGAIN (process table full), SYS_ENOMEM,
 // SYS_EFAULT, SYS_EINVAL, SYS_EPERM.
 //
+// Starting a program with what its file needs: SYS_SPAWN_ELEVATE in
+// `mask` (never with SYS_SPAWN_INHERIT) starts the child with the
+// executable's own security mask (the bits a process needs to use the
+// file, see "File details") added to the rest of the mask. This is how a
+// launcher (the explorer, the desktop, the console) runs a program in the
+// "admin", "network" or "system" policy, or with any other bit above what
+// user programs hold, without ever holding those bits itself:
+//
+//   - bits the file needs that the caller lacks are asked for: the caller
+//     needs SYS_SEC_ELEVATE, and the call first puts the administrator
+//     prompt in front of the user, naming the program to be started (its
+//     path, as resolved here), the caller as the one starting it
+//     (SYS_ELEVATE_LAUNCH) and the bits (`requested`), and blocks like
+//     SYS_ELEVATE. On Allow the executable is checked and loaded as if the
+//     caller held those bits, for this call only; the caller's own mask
+//     never changes. On Cancel: SYS_ECANCELED, and nothing is started.
+//     SYS_ETIMEDOUT, SYS_EAGAIN and SYS_EBUSY are as for SYS_ELEVATE.
+//   - a caller that holds every bit the file needs is not asked (it could
+//     hand them down anyway). The desktop, which draws the prompt itself,
+//     asks the user on its own first.
+//   - a child given SYS_SEC_ADMIN this way is an elevated process.
+//   - the rest of the mask follows the usual rule: only bits the caller
+//     holds (SYS_EPERM).
+//
+// The prompt only comes up for a path that exists and is a regular file;
+// the other failures are reported before anyone is asked.
+//
 // Program entry, for every process however it was started: ESP is 16-byte
 // aligned and points at
 //
@@ -825,6 +1045,7 @@ typedef struct {
 //
 
 #define SYS_SPAWN_INHERIT       0xFFFFFFFFu     // mask: the caller's own
+#define SYS_SPAWN_ELEVATE       0x80000000u     // mask flag: start it elevated (below)
 #define SYS_ARG_MAX             64              // Strings in argv
 #define SYS_ARG_BYTES           4096            // Bytes of them, terminators included
 
@@ -853,12 +1074,15 @@ typedef struct {
 // A process started any other way has no terminal; a child started by a
 // process with one does not inherit it.
 //
-// SYS_IOCTL(fd, request, arg): the Unix call, for terminals only. Request
-// numbers are Linux's, so code written for it keeps them.
+// SYS_IOCTL(fd, request, arg): the Unix call, for terminals and character
+// devices. Request numbers are Linux's, so code written for it keeps them.
+// On a descriptor from SYS_OPEN of a character device (/dev/null, ...,
+// driver/chardev.h) the request goes to its driver, which defines its own;
+// SYS_ENOTTY for any other file. On 0, 1 and 2, the terminal:
 //   SYS_TIOCGWINSZ  arg = SysWinSize*: the terminal's size
 //   SYS_FIONREAD    arg = int32_t*: bytes ready for read(0) without blocking
-// SYS_ENOTTY for a descriptor with no terminal behind it (3 and up always)
-// or a request not listed here, SYS_EBADF past SYS_FD_MAX.
+// SYS_ENOTTY for 0-2 with no terminal behind them or a request not listed
+// here, SYS_EBADF past SYS_FD_MAX.
 //
 // SYS_TTY_RESIZE(pipe, columns, rows): the host sets the size TIOCGWINSZ
 // reports, from either end of the pipe. Each 1 .. 0xFFFF (SYS_EINVAL
@@ -870,8 +1094,21 @@ typedef struct {
 // read the registry. `path` starts with the hive's root key
 // ("hkey_root/software/shell/menus/desktop"). REG_GET copies the whole value
 // (SYS_ERANGE if it does not fit), REG_KEYS names the key's index-th subkey,
-// 0 past the last. Read only; details in calls/sys_registry.h.
+// 0 past the last. Details in calls/sys_registry.h.
 //
+// SYS_REG_SET(path, name, data, size): create or replace a value (missing
+// keys on the way are made) and save the hive to its file. hkey_user takes
+// SYS_SEC_FILE_WRITE, hkey_root SYS_SEC_ADMIN too. At most
+// SYS_REG_VALUE_MAX bytes.
+//
+// SYS_REG_VALUES(path, index, buf, size) names the key's index-th value, as
+// REG_KEYS does its subkeys. SYS_REG_DELETE(path, name), SYS_REG_MKKEY(path)
+// and SYS_REG_RENAME(path, name, new_name) remove a value (or with name 0 a
+// key and all below it), make a key, and rename a value (or with name 0 the
+// key itself); each saves the hive and takes what REG_SET does.
+//
+
+#define SYS_REG_VALUE_MAX       4096
 
 #define SYS_TIOCGWINSZ          0x5413
 #define SYS_FIONREAD            0x541B
@@ -886,6 +1123,92 @@ typedef struct {
     uint16_t x_pixels;      // Always 0
     uint16_t y_pixels;      // Always 0
 } SysWinSize;
+
+//
+// Network: TCP sockets
+//
+// All of it needs SYS_SEC_NET (sock_close excepted, so a process can always
+// let go). Nothing blocks except SYS_SOCK_WAIT: the other calls return
+// SYS_EAGAIN when they would have to wait. Addresses are IPv4 in host
+// order (192.168.1.2 is 0xC0A80102), ports in host order.
+//
+// SYS_SOCK_LISTEN(port, backlog): accept connections to `port` on every
+// local address. backlog 1..SYS_SOCK_BACKLOG_MAX (0 means 1, more is cut):
+// connections still in their handshake or not yet accepted; past that new
+// ones are dropped. A port below SYS_SOCK_PORT_PRIVILEGED needs
+// SYS_SEC_ADMIN as well (SYS_EPERM). SYS_EADDRINUSE when it is taken.
+//
+// SYS_SOCK_CONNECT(SysSockAddr*): start connecting from a random local
+// port. Returns the handle at once; SYS_SOCK_WAIT for SYS_SOCK_WRITABLE (or
+// SYS_SOCK_INFO's SYS_SOCK_CONNECTED) to know it is up, SYS_SOCK_ERROR for
+// SYS_ECONNREFUSED / SYS_ETIMEDOUT. Broadcast, multicast and 0.0.0.0 are
+// SYS_EINVAL.
+//
+// SYS_SOCK_ACCEPT(listener, SysSockAddr* or 0): one connection whose
+// handshake is done, as a new handle; the peer's address in *addr.
+//
+// SYS_SOCK_SEND(handle, buf, length): copies up to SYS_SOCK_IO_MAX bytes
+// into the send buffer, returns how many. SYS_EAGAIN while connecting or
+// when the buffer is full, SYS_ENOTCONN after close or on a listener, the
+// connection's error once it failed (SYS_ECONNRESET, SYS_ETIMEDOUT, ...).
+//
+// SYS_SOCK_RECV(handle, buf, size): up to min(size, SYS_SOCK_IO_MAX) bytes;
+// 0 once the peer closed its side and everything was read; SYS_EAGAIN when
+// nothing is waiting.
+//
+// SYS_SOCK_CLOSE(handle): let go. An orderly close when everything
+// received was read, a reset otherwise. Closing a listener resets the
+// connections nobody accepted. Every socket closes when its process ends.
+//
+// SYS_SOCK_WAIT(items, count, timeout_ms): wait until one of the sockets
+// has an event asked for, the timeout passes (0 = poll,
+// SYS_SOCK_WAIT_FOREVER) or the process is ending. Fills `ready` of every
+// item, returns how many items are ready. count 1..SYS_SOCK_WAIT_MAX,
+// SYS_EBADF if a handle is not open. SYS_SOCK_ERROR is always reported.
+//
+// SYS_SOCK_INFO(handle, SysSockInfo*): both ends and the state.
+//
+// Limits: SYS_SOCK_PER_PROCESS sockets per process (SYS_EMFILE); the
+// kernel holds at most 16 connections and listeners in all (SYS_ENOMEM).
+//
+
+#define SYS_SOCK_PER_PROCESS        8
+#define SYS_SOCK_BACKLOG_MAX        8
+#define SYS_SOCK_IO_MAX             4096        // Bytes per send / recv
+#define SYS_SOCK_WAIT_MAX           16          // Items per SYS_SOCK_WAIT
+#define SYS_SOCK_WAIT_FOREVER       0xFFFFFFFFu
+#define SYS_SOCK_PORT_PRIVILEGED    1024
+
+// SysSockWaitItem.events / .ready, SysSockInfo.flags
+#define SYS_SOCK_READABLE       0x0001  // Data, the peer's close (recv says 0), or an error
+#define SYS_SOCK_WRITABLE       0x0002  // Room to send, or an error
+#define SYS_SOCK_ACCEPTABLE     0x0004  // Listener: a connection is waiting
+#define SYS_SOCK_ERROR          0x0008  // Refused, reset or timed out (SysSockInfo.error says which)
+#define SYS_SOCK_CONNECTED      0x0010  // The handshake finished (stays set)
+#define SYS_SOCK_LISTENING      0x0020  // SysSockInfo only: a listener
+
+// An IPv4 address and port. 8 bytes.
+typedef struct {
+    uint32_t ip;
+    uint16_t port;
+    uint16_t reserved;      // 0
+} SysSockAddr;
+
+// One SYS_SOCK_WAIT item. 8 bytes.
+typedef struct {
+    int32_t  handle;
+    uint16_t events;        // SYS_SOCK_READABLE | WRITABLE | ACCEPTABLE
+    uint16_t ready;         // Set by the kernel
+} SysSockWaitItem;
+
+// Filled by SYS_SOCK_INFO. 32 bytes.
+typedef struct {
+    SysSockAddr local;
+    SysSockAddr remote;     // 0 for a listener
+    uint32_t flags;         // SYS_SOCK_*
+    int32_t  error;         // SYS_E* once the connection failed, else 0
+    uint32_t reserved[2];
+} SysSockInfo;
 
 // Kernel side: set up the serial output and locks the syscalls use. The IDT
 // gate is installed by idt_init().
@@ -906,7 +1229,7 @@ struct AddressSpace;
 bool syscall_process_start(uint32_t process_id, struct AddressSpace* space, const char* cwd, void* tty);
 
 // Kernel side: close every file a process has open, free its graphics
-// surfaces, close its IPC handles and drop its descriptor table. DestroyProcess() calls it before freeing the address space, so
+// surfaces, close its IPC handles and sockets and drop its descriptor table. DestroyProcess() calls it before freeing the address space, so
 // every way a process ends (SYS_EXIT, a fatal fault, a kill) is covered;
 // nothing else needs to. Thread context with interrupts on: it may sleep.
 void syscall_process_exit(uint32_t process_id);

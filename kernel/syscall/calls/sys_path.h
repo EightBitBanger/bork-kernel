@@ -10,7 +10,7 @@
 #include <kernel/util/string.h>
 
 //
-// Path calls: stat, mkdir, remove, rename, truncate, copy
+// Path calls: stat, mkdir, remove, rename, truncate, copy, move
 //
 // Each check-then-act sequence runs under vfs_lock() (recursive), so the
 // error a call reports matches the state it acted on. copy is the exception:
@@ -217,6 +217,69 @@ static int32_t sys_copy_locked(SysProcessFiles* t, const SyscallArgs* args) {
 
 static int32_t sys_copy(const SyscallArgs* args) {
     return sys_files_call(sys_copy_locked, args);
+}
+
+//
+// move(src, dest): to a new full path on the same volume
+//
+// Relinks the directory entry (vfs_move), so nothing is copied and the time
+// does not depend on the size. SYS_EXDEV when the two paths are on
+// different volumes (or the filesystem cannot relink): the caller copies
+// and removes instead. Descriptors this process has open at or below `src`
+// follow it, as after a rename.
+//
+
+static int32_t sys_move_locked(SysProcessFiles* t, const SyscallArgs* args) {
+    AddressSpace* space = process_current_space();
+    char src[SYS_PATH_MAX];
+    char dest[SYS_PATH_MAX];
+
+    int32_t result = sys_user_path(space, t->cwd, args->arg1, src);
+    if (result < 0)
+        return result;
+    result = sys_user_path(space, t->cwd, args->arg2, dest);
+    if (result < 0)
+        return result;
+    if (strcmp(src, "/") == 0 || strcmp(dest, "/") == 0)
+        return SYS_EBUSY;
+
+    vfs_lock();
+    if (!vfs_exists(src))
+        result = SYS_ENOENT;
+    else if (vfs_directory_check_mounted(src))
+        result = SYS_EBUSY;     // Mounts are named after their device
+    else if (!vfs_check_access(src) || !vfs_check_parent_access(src))
+        result = SYS_EACCES;
+    else if (strcmp(src, dest) == 0)
+        result = SYS_OK;
+    else if (sys_path_within(dest, src))
+        result = SYS_EINVAL;    // Into itself
+    else if (vfs_exists(dest))
+        result = SYS_EEXIST;
+    else if (!sys_parent_is_directory(dest))
+        result = SYS_ENOENT;
+    else if (!vfs_check_parent_access(dest))
+        result = SYS_EACCES;
+    else {
+        switch (vfs_move(src, dest)) {
+            case VFS_MOVE_OK:
+                sys_files_rename_paths(t, src, dest);
+                result = SYS_OK;
+                break;
+            case VFS_MOVE_NOT_FOUND:     result = SYS_ENOENT; break;
+            case VFS_MOVE_EXISTS:        result = SYS_EEXIST; break;
+            case VFS_MOVE_INTO_ITSELF:   result = SYS_EINVAL; break;
+            case VFS_MOVE_CROSS_DEVICE:  result = SYS_EXDEV;  break;
+            case VFS_MOVE_DENIED:        result = SYS_EACCES; break;
+            default:                     result = SYS_EIO;    break;   // Bad name, or the volume refused (an open FAT file)
+        }
+    }
+    vfs_unlock();
+    return result;
+}
+
+static int32_t sys_move(const SyscallArgs* args) {
+    return sys_files_call(sys_move_locked, args);
 }
 
 #endif
