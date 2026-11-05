@@ -1,8 +1,6 @@
 #ifndef _KERNEL_CORE_H_
 #define _KERNEL_CORE_H_
 
-#include <kernel/device/driver.h>
-#include <kernel/device/device.h>
 #include <kernel/device/knode.h>
 #include <kernel/device/kevent.h>
 
@@ -53,7 +51,17 @@ void kernel_set_local_paths(const struct LocalPaths* paths);
 
 void kernel_init(void);
 
-struct Device* create_device(const char* name);
-void destroy_device(struct Device* device);
+// A value in the kernel node tree: an entry whose name is the value
+// ("/dev/pci/.../vendor/8086"). Kernel heap block, `name` first, so the
+// knode tree finds it by name and reading it gives the text.
+#define KPROPERTY_TEXT_MAX  16      // Including the terminator
+
+struct KProperty {
+    char name[KPROPERTY_TEXT_MAX];
+};
+
+// `text` is cut to KPROPERTY_TEXT_MAX - 1 characters
+struct KProperty* create_property(const char* text);
+void destroy_property(struct KProperty* property);
 
 #endif

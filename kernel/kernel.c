@@ -14,6 +14,7 @@ static struct LocalPaths kernel_paths;
 // /proc - running processes
 // /dev  - hardware descriptions
 // /mnt  - storage devices are mounted
+// /drv  - drivers and the devices they hold (driver/driver_tree.c)
 void kernel_init(void) {
     void* root_node = create_knode("", NULL);
     knode_set_root(root_node);
@@ -21,10 +22,12 @@ void kernel_init(void) {
     void* proc = create_knode("proc", root_node);
     void* dev  = create_knode("dev", root_node);
     void* mnt  = create_knode("mnt", root_node);
+    void* drv  = create_knode("drv", root_node);
     
     knode_set_permissions(proc, KMALLOC_PERMISSION_READ);
     knode_set_permissions(dev,  KMALLOC_PERMISSION_READ);
     knode_set_permissions(mnt,  KMALLOC_PERMISSION_READ);
+    knode_set_permissions(drv,  KMALLOC_PERMISSION_READ);
     
     struct LocalPaths fs_paths;
     memset(&fs_paths, 0, sizeof(fs_paths));
@@ -86,19 +89,19 @@ void kernel_set_local_paths(const struct LocalPaths* paths) {
     vfs_unlock();
 }
 
-struct Device* create_device(const char* name) {
+struct KProperty* create_property(const char* text) {
     // Zeroed by kmalloc
-    struct Device* device = kmalloc(sizeof(struct Device));
-    if (device == NULL)
+    struct KProperty* property = kmalloc(sizeof(struct KProperty));
+    if (property == NULL)
         return NULL;
     
-    strncpy(device->name, name, sizeof(device->name) - 1);
+    strncpy(property->name, text, sizeof(property->name) - 1);
     
-    kmalloc_set_type(device, KMALLOC_TYPE_DEVICE);
-    kmalloc_set_permissions(device, KMALLOC_PERMISSION_READ | KMALLOC_PERMISSION_WRITE);
-    return device;
+    kmalloc_set_type(property, KMALLOC_TYPE_PROPERTY);
+    kmalloc_set_permissions(property, KMALLOC_PERMISSION_READ | KMALLOC_PERMISSION_WRITE);
+    return property;
 }
 
-void destroy_device(struct Device* device) {
-    kfree(device);
+void destroy_property(struct KProperty* property) {
+    kfree(property);
 }
