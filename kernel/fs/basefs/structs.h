@@ -131,8 +131,15 @@ struct __attribute__((packed)) FSBlockHeader {
     // Seconds since the Unix epoch, 0 = unknown (no clock at the time)
     uint32_t created;
     uint32_t modified;
-    
-    uint8_t  reserved[12];          // Free for future use, zero on format
+
+    // Clearance writing needs ON TOP of `security`: a caller must hold every
+    // bit of (security | write_security) to write, create or remove inside,
+    // rename, move or change the permissions of the object (vfs_security.c).
+    // 0, which is what volumes made before this field have, means writing
+    // needs what reading needs. New objects inherit their parent's.
+    uint32_t write_security;
+
+    uint8_t  reserved[8];           // Free for future use, zero on format
 };
 
 // File header. The allocation holding it continues with file data:

@@ -95,6 +95,9 @@ static File do_open(const char* path, uint16_t flags) {
         if (!vfs_fs_node_allowed(mount, current_fs_node)) {
             return VFS_INVALID_FILE;    // Needs clearance the caller lacks
         }
+        if (modifying && !vfs_fs_node_write_allowed(mount, current_fs_node)) {
+            return VFS_INVALID_FILE;    // Readable, but writing needs more
+        }
         if (modifying) {
             // Refuse rather than open read-only and drop the request
             uint8_t perm = vfs_node_permissions(mount, current_fs_node);
@@ -258,7 +261,7 @@ static int32_t do_write(File file, const void* buffer, uint32_t size) {
         if (!mount->type->get_attr(mount, desc->address, &attr) ||
             !(attr.permissions & VFS_PERMISSION_WRITE)) 
             return -1;
-        if (!vfs_fs_node_allowed(mount, desc->address))
+        if (!vfs_fs_node_write_allowed(mount, desc->address))
             return -1;
         // Append: the end as it is now (another handle may have grown the
         // file since the last write). The write grows it from there.
@@ -346,7 +349,7 @@ static bool do_mkdir(const char* path) {
         if (!(parent_perm & VFS_PERMISSION_READ) || 
             !(parent_perm & VFS_PERMISSION_WRITE)) 
             return false;
-        if (!vfs_fs_node_allowed(mount, parent))
+        if (!vfs_fs_node_write_allowed(mount, parent))
             return false;
 
         // Names are unique within a directory (files and directories alike).
@@ -403,7 +406,7 @@ static bool do_remove(const char* path) {
             !(parent_perm & VFS_PERMISSION_WRITE)) 
             return false;
         // Clearance for the directory, the object and all it contains
-        if (!vfs_fs_node_allowed(mount, parent) || !vfs_remove_allowed(mount, address))
+        if (!vfs_fs_node_write_allowed(mount, parent) || !vfs_remove_allowed(mount, address))
             return false;
         // Never free something an open handle still points into
         if (vfs_fs_node_in_use(mount, address))
@@ -455,7 +458,11 @@ static bool do_rename(const char* path, const char* name) {
         uint8_t item_perm = vfs_node_permissions(mount, address);
         if (!(item_perm & VFS_PERMISSION_WRITE))
             return false;
-        if (!vfs_fs_node_allowed(mount, address) || !vfs_fs_node_allowed(mount, parent_address))
+        // A folder's new name is the new way to everything inside it, so the
+        // caller needs clearance for all of that too (as for a remove):
+        // otherwise a program could rename a folder holding a file it may
+        // not touch and put its own file at the old path.
+        if (!vfs_remove_allowed(mount, address) || !vfs_fs_node_write_allowed(mount, parent_address))
             return false;
         // The name lives in the parent's entry. The rename refuses a name
         // another entry already has (the VFS lock makes that atomic).
@@ -537,8 +544,10 @@ static VfsMoveResult do_move(const char* src, const char* dest) {
     uint8_t rw = VFS_PERMISSION_READ | VFS_PERMISSION_WRITE;
     if (!(item_perm & VFS_PERMISSION_WRITE) || (from_perm & rw) != rw || (to_perm & rw) != rw)
         return VFS_MOVE_DENIED;
-    if (!vfs_fs_node_allowed(mount, address) || !vfs_fs_node_allowed(mount, from) ||
-        !vfs_fs_node_allowed(mount, to))
+    // The object and everything inside it (as rename: a folder moved away
+    // takes the way to its contents with it)
+    if (!vfs_remove_allowed(mount, address) || !vfs_fs_node_write_allowed(mount, from) ||
+        !vfs_fs_node_write_allowed(mount, to))
         return VFS_MOVE_DENIED;
 
     // The name must be free where it goes (the VFS lock makes this atomic)
@@ -571,6 +580,11 @@ static VfsMoveResult do_move(const char* src, const char* dest) {
         mount->type->get_attr(mount, address, &item) && mount->type->get_attr(mount, to, &dir) &&
         (item.security | dir.security) != item.security)
         mount->type->set_security(mount, address, item.security | dir.security);
+    // And as hard to change as the directory makes what is in it
+    if (mount->type->set_write_security != NULL &&
+        mount->type->get_attr(mount, address, &item) && mount->type->get_attr(mount, to, &dir) &&
+        (item.write_security | dir.write_security) != item.write_security)
+        mount->type->set_write_security(mount, address, item.write_security | dir.write_security);
     return VFS_MOVE_OK;
 }
 
@@ -587,7 +601,7 @@ static bool do_truncate(const char* path, uint64_t new_size) {
     // The resize refuses directories and reports allocation failure (the
     // file is left unchanged in that case), so pass its result on
     if (mount) {
-        if (!vfs_fs_node_allowed(mount, address))
+        if (!vfs_fs_node_write_allowed(mount, address))
             return false;
         return mount->type->resize(mount, address, new_size);
     }
@@ -775,6 +789,20 @@ bool vfs_truncate(const char* path, uint64_t new_size) {
 bool vfs_stat(const char* path, FSFileStats* stats) {
     vfs_lock();
     bool result = do_stat(path, stats);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_node_identity(const char* path, VfsNodeIdentity* out) {
+    if (path == NULL || out == NULL || !vfs_path_fits(path))
+        return false;
+    vfs_lock();
+    uint64_t address = resolve_path_to_address(path);
+    bool result = !vfs_address_is_null(address);
+    if (result) {
+        out->mount   = vfs_device_get_context(path);
+        out->address = address;
+    }
     vfs_unlock();
     return result;
 }

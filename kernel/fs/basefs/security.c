@@ -23,6 +23,24 @@ bool fs_file_set_policy(struct FSDeviceContext* ctx, uint64_t address, uint32_t 
     return true;
 }
 
+// The extra clearance writing needs (FSBlockHeader.write_security)
+bool fs_file_get_write_security(struct FSDeviceContext* ctx, uint64_t address, uint32_t* security) {
+    if (!ctx || address == FS_NULL || security == NULL) return false;
+    struct FSBlockHeader header;
+    fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
+    *security = header.write_security;
+    return true;
+}
+
+bool fs_file_set_write_security(struct FSDeviceContext* ctx, uint64_t address, uint32_t security) {
+    if (!ctx || address == FS_NULL) return false;
+    struct FSBlockHeader header;
+    fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
+    header.write_security = security;
+    fs_mem_write(ctx, address, &header, sizeof(struct FSBlockHeader));
+    return true;
+}
+
 bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint64_t address, uint8_t* security) {
     if (!ctx || address == FS_NULL || security == NULL) return false;
     struct FSBlockHeader header;

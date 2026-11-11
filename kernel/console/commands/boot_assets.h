@@ -23,12 +23,15 @@
 // execute bit.
 //
 // Folder policies: the archive may hold ".policy" at its root (written by
-// build-assets.sh from "sys/  policy=admin" lines), one "<folder> <policy>"
-// per line, parents first. It is never written to disk. After the drop,
-// boot_apply_policies puts each folder and everything in it in that group
-// policy, with the policy's permissions as their security mask, making the
-// folder if it is missing. Install and every repair do it, so a policy
-// changed by hand inside such a folder is set back.
+// build-assets.sh from "sys/  policy=user write=admin" lines), one
+// "<folder> <policy> [<write policy>]" per line, parents first. It is never
+// written to disk. After the drop, boot_apply_policies puts each folder and
+// everything in it in that group policy, with the policy's permissions as
+// their security mask, making the folder if it is missing. A write policy
+// sets the write mask to what that policy holds beyond the first (sys/:
+// any program reads, writing needs admin); without one, writing needs what
+// reading needs. Install and every repair do it, so a policy changed by
+// hand inside such a folder is set back.
 //
 // Overwrite policy:
 //   overwrite == false  a file that already exists is kept, so a copy edited
@@ -281,10 +284,12 @@ typedef struct {
 } BootPolicyStats;
 
 // Put `path` and everything in it in `policy` with the policy's permissions
-// as the mask. `path` (cap bytes) is extended while walking and restored.
-static void boot_policy_tree(char* path, uint32_t cap, const Policy* policy,
+// as the mask, and `write` as the write mask. `path` (cap bytes) is
+// extended while walking and restored.
+static void boot_policy_tree(char* path, uint32_t cap, const Policy* policy, uint32_t write,
                              uint32_t depth, BootPolicyStats* stats) {
-    if (vfs_set_policy(path, policy->id) && vfs_set_security(path, policy->permissions)) {
+    if (vfs_set_policy(path, policy->id) && vfs_set_security(path, policy->permissions) &&
+        vfs_set_write_security(path, write)) {
         stats->objects++;
     } else {
         print("  ! cannot set policy: ");
@@ -320,7 +325,7 @@ static void boot_policy_tree(char* path, uint32_t cap, const Policy* policy,
             stats->failed++;
             continue;
         }
-        boot_policy_tree(path, cap, policy, depth + 1, stats);
+        boot_policy_tree(path, cap, policy, write, depth + 1, stats);
         path[length] = '\0';
     }
 }
@@ -343,11 +348,12 @@ static bool boot_policy_folder_ok(const char* folder) {
     return true;
 }
 
-// One line of the list: "<folder> <policy>"
+// One line of the list: "<folder> <policy> [<write policy>]"
 static void boot_policy_line(const char* root, const char* line, BootPolicyStats* stats) {
     char folder[200];
     char name[32];
-    uint32_t i = 0, f = 0, n = 0;
+    char write_name[32];
+    uint32_t i = 0, f = 0, n = 0, w = 0;
 
     while (line[i] == ' ' || line[i] == '\t') i++;
     if (line[i] == '\0')
@@ -363,13 +369,20 @@ static void boot_policy_line(const char* root, const char* line, BootPolicyStats
         name[n++] = line[i++];
     }
     name[n] = '\0';
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    while (line[i] != '\0' && line[i] != ' ' && line[i] != '\t') {
+        if (w + 1 >= sizeof(write_name)) { stats->failed++; return; }
+        write_name[w++] = line[i++];
+    }
+    write_name[w] = '\0';
 
     // A trailing '/' is the folder itself
     while (f > 0 && folder[f - 1] == '/')
         folder[--f] = '\0';
 
     const Policy* policy = policy_find_name(name);
-    if (!boot_policy_folder_ok(folder) || policy == NULL) {
+    const Policy* write_policy = (w > 0) ? policy_find_name(write_name) : policy;
+    if (!boot_policy_folder_ok(folder) || policy == NULL || write_policy == NULL) {
         print("  ! bad policy line: ");
         print(line);
         print("\n");
@@ -388,7 +401,8 @@ static void boot_policy_line(const char* root, const char* line, BootPolicyStats
         return;
     }
 
-    boot_policy_tree(path, sizeof(path), policy, 0, stats);
+    uint32_t write = (policy == write_policy) ? 0 : (write_policy->permissions & ~policy->permissions);
+    boot_policy_tree(path, sizeof(path), policy, write, 0, stats);
     stats->folders++;
 }
 

@@ -353,6 +353,16 @@ bool vfs_copy(const char* src, const char* dest);
 // Operations
 bool vfs_stat(const char* path, FSFileStats* stats);
 
+// Which object `path` names right now: its volume and its node there.
+// Two identities are equal only for the very same object, so a caller that
+// must act on the object it checked (an elevated launch, after the prompt)
+// compares them to see that nothing was put in its place meanwhile.
+typedef struct {
+    const void* mount;      // NULL for a kernel node
+    uint64_t    address;
+} VfsNodeIdentity;
+bool vfs_node_identity(const char* path, VfsNodeIdentity* out);
+
 bool vfs_set_permissions(const char* path, uint8_t perm);
 bool vfs_get_permissions(const char* path, uint8_t* perm);
 bool vfs_directory_check(const char* path);
@@ -396,13 +406,20 @@ bool vfs_set_policy_only(const char* path, uint32_t policy);
 // process_current_clearance). Kernel threads, and everything before a
 // source is set, have VFS_CLEARANCE_ALL, so kernel code is never refused.
 //
-// What is checked (object mask = the object's own, parent = its directory):
-//   open, read, write, truncate, set permissions, policy     object
-//   list a directory (item count / item)                     object
-//   create a file or directory                               parent
-//   rename                                                   object + parent
-//   move                                                     object + both parents
-//   remove                                                   parent + object + everything below it
+// Writing has its own extra mask (FsNodeAttr.write_security, basefs:
+// FSBlockHeader.write_security): the bits a caller needs on top of the
+// object's mask to change it. The write requirement is the two together;
+// 0 means writing needs what reading needs. So a folder can be readable
+// by every program and changeable only by an administrator.
+//
+// What is checked (object = the object's own mask, parent = its
+// directory's; "write" = mask | write mask):
+//   open for reading, read, list a directory                 object
+//   open for writing, write, truncate, set permissions       object write
+//   create a file or directory                               parent write
+//   rename                                                   object write + parent write
+//   move                                                     object write + both parents' write
+//   remove                                                   parent write + object write + everything below it
 // stat, exists and get_permissions are always allowed, so a refused call
 // can say "permission denied" instead of "not found". Kernel nodes (/, /dev,
 // /mnt, ...) have no mask. New objects inherit their parent's mask.
@@ -443,6 +460,16 @@ bool vfs_security_change_allowed(uint32_t old_mask, uint32_t new_mask);
 // syscalls to report SYS_EACCES; every VFS operation also checks by itself.
 bool vfs_check_access(const char* path);
 bool vfs_check_parent_access(const char* path);
+// The same for writing (the write requirement, see the top)
+bool vfs_check_write_access(const char* path);
+bool vfs_check_parent_write_access(const char* path);
+
+// The object's extra write mask (0: writing needs what reading needs).
+// False if `path` is not an object on a mounted device. Setting follows
+// vfs_security_change_allowed on the whole write requirement; it fails on
+// a filesystem that can't store one (FAT).
+bool vfs_get_write_security(const char* path, uint32_t* security);
+bool vfs_set_write_security(const char* path, uint32_t security);
 
 // Kernel nodes
 //

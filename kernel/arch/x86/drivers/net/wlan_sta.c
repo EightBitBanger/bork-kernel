@@ -6,6 +6,7 @@
 #include <kernel/crypt/aes.h>
 #include <kernel/crypt/ccmp.h>
 #include <kernel/crypt/crypt.h>
+#include <kernel/crypt/tkip.h>
 #include <kernel/crypt/wpa.h>
 #include <kernel/syscall/syscall.h>
 #include <kernel/util/string.h>
@@ -86,7 +87,11 @@
 #define EK_DATALEN          97
 #define EK_DATA             99
 
-// Our RSN element: CCMP group and pairwise, PSK
+// Our RSN element: CCMP pairwise, PSK, and the network's group cipher
+// (CCMP, or TKIP on a WPA/WPA2 mixed network: rsn_element() puts it in)
+#define RSN_GROUP_TYPE      7       // Offset of the group cipher's suite type
+#define SUITE_TKIP          0x02
+#define SUITE_CCMP          0x04
 static const uint8_t our_rsn[] = {
     IE_RSN, 20,
     0x01, 0x00,                     // Version 1
@@ -95,6 +100,13 @@ static const uint8_t our_rsn[] = {
     0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02,     // AKM: PSK
     0x00, 0x00,                     // Capabilities: no PMF
 };
+
+// Ours for this network, as association and message 2 must both send it
+static uint32_t rsn_element(const struct WlanSta* s, uint8_t* out) {
+    memcpy(out, our_rsn, sizeof(our_rsn));
+    out[RSN_GROUP_TYPE] = s->group_tkip ? SUITE_TKIP : SUITE_CCMP;
+    return sizeof(our_rsn);
+}
 
 static const uint8_t llc_snap[6]   = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 static const uint8_t llc_bridge[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0xF8 };
@@ -129,11 +141,13 @@ static void clear_keys(struct WlanSta* s) {
     crypt_wipe(&s->ptk, sizeof(s->ptk));
     crypt_wipe(&s->tk, sizeof(s->tk));
     crypt_wipe(s->gtk, sizeof(s->gtk));
+    crypt_wipe(s->gtk_tkip, sizeof(s->gtk_tkip));
     memset(s->gtk_set, 0, sizeof(s->gtk_set));
     memset(s->gtk_rsc, 0, sizeof(s->gtk_rsc));
     memset(s->rx_pn, 0, sizeof(s->rx_pn));
     s->ptk_set      = false;
     s->replay_valid = false;
+    s->anonce_set   = false;
     s->replay       = 0;
     s->tx_pn        = 0;
 }
@@ -143,11 +157,18 @@ static void fail(struct WlanSta* s, uint8_t reason) {
     bool was_up = s->state == WLAN_LINK_CONNECTED;
     s->state  = WLAN_LINK_IDLE;
     s->reason = reason;
+    s->detail = WLAN_DETAIL_NONE;
     clear_keys(s);
     crypt_wipe(s->pmk, sizeof(s->pmk));
     if (was_up && s->ops->link != NULL)
         s->ops->link(s->ctx, false);
     s->ops->tune(s->ctx, 0, NULL);
+}
+
+// Give up on security we can't do, saying which part (WLAN_DETAIL_*)
+static void refuse(struct WlanSta* s, uint8_t detail) {
+    fail(s, WLAN_REASON_UNSUPPORTED);
+    s->detail = detail;
 }
 
 void wlan_sta_init(struct WlanSta* s, const struct WlanStaOps* ops, void* ctx, const uint8_t mac[6]) {
@@ -214,10 +235,8 @@ static bool send_assoc(struct WlanSta* s) {
         memcpy(p + n, s->rates + first, s->rate_count - first);
         n += s->rate_count - first;
     }
-    if (s->secure) {
-        memcpy(p + n, our_rsn, sizeof(our_rsn));
-        n += sizeof(our_rsn);
-    }
+    if (s->secure)
+        n += rsn_element(s, p + n);
     return send(s, n);
 }
 
@@ -326,9 +345,15 @@ static const uint8_t* find_ie(const uint8_t* data, uint32_t len, uint8_t want, u
 }
 
 static bool install_gtk(struct WlanSta* s, const uint8_t* gtk, uint32_t len, uint8_t key_id, const uint8_t* rsc) {
-    if (len != 16)
-        return false;               // CCMP group keys only
-    aes128_init(&s->gtk[key_id], gtk);
+    if (s->group_tkip) {
+        if (len != TKIP_GTK_LEN)
+            return false;
+        tkip_set_group_key(&s->gtk_tkip[key_id], gtk);
+    } else {
+        if (len != 16)
+            return false;           // A CCMP group key
+        aes128_init(&s->gtk[key_id], gtk);
+    }
     s->gtk_set[key_id] = true;
     uint64_t pn = 0;
     for (int i = 5; i >= 0; i--)
@@ -361,16 +386,21 @@ static void handle_eapol(struct WlanSta* s, uint8_t* e, uint32_t len) {
         // Message 1: its nonce. The PTK follows from it and ours.
         if (s->state != WLAN_LINK_HANDSHAKE)
             return;                 // No rekeying of the PTK: the access point deauthenticates then
+        // Message 1 carries no MIC: anyone in range could have sent it. It
+        // sets the nonce and the PTK message 3 must prove, but not the
+        // replay counter: a forged one with a huge counter would otherwise
+        // make us drop the access point's real messages.
         memcpy(s->anonce, e + EK_NONCE, WPA_NONCE_LEN);
         wpa_ptk(s->pmk, s->bss.bssid, s->mac, s->anonce, s->snonce, &s->ptk);
-        s->replay       = replay;
-        s->replay_valid = true;
-        send_key(s, KI_PAIRWISE, e + EK_REPLAY, s->snonce, our_rsn, sizeof(our_rsn), false);
+        s->anonce_set = true;
+        uint8_t rsn[sizeof(our_rsn)];
+        uint32_t rsn_len = rsn_element(s, rsn);
+        send_key(s, KI_PAIRWISE, e + EK_REPLAY, s->snonce, rsn, rsn_len, false);
         return;
     }
 
     // Messages 3 and group key messages carry a MIC
-    if (!(info & KI_MIC) || !s->replay_valid)
+    if (!(info & KI_MIC) || !s->anonce_set)
         return;
     uint8_t mic[WPA_MIC_LEN], want[WPA_MIC_LEN];
     memcpy(want, e + EK_MIC, WPA_MIC_LEN);
@@ -396,6 +426,7 @@ static void handle_eapol(struct WlanSta* s, uint8_t* e, uint32_t len) {
         crypt_wipe(plain, sizeof(plain));
         if ((info & KI_INSTALL) && memcmp(e + EK_NONCE, s->anonce, WPA_NONCE_LEN) == 0) {
             s->replay = replay;
+            s->replay_valid = true;
             send_key(s, KI_PAIRWISE | KI_SECURE, e + EK_REPLAY, NULL, NULL, 0, true);
         }
         return;
@@ -415,10 +446,11 @@ static void handle_eapol(struct WlanSta* s, uint8_t* e, uint32_t len) {
         const uint8_t* gtk = find_gtk(plain, plain_len, &gtk_len, &key_id);
         if (rsn == NULL || rsn_len != s->ap_rsn_length || memcmp(rsn, s->ap_rsn, rsn_len) != 0 || gtk == NULL) {
             crypt_wipe(plain, sizeof(plain));
-            fail(s, WLAN_REASON_UNSUPPORTED);
+            refuse(s, gtk == NULL ? WLAN_DETAIL_GTK : WLAN_DETAIL_CHANGED);
             return;
         }
         s->replay = replay;
+        s->replay_valid = true;
         if (!send_key(s, KI_PAIRWISE | KI_SECURE, e + EK_REPLAY, NULL, NULL, 0, false)) {
             crypt_wipe(plain, sizeof(plain));
             fail(s, WLAN_REASON_RADIO);
@@ -430,7 +462,7 @@ static void handle_eapol(struct WlanSta* s, uint8_t* e, uint32_t len) {
         bool ok = install_gtk(s, gtk, gtk_len, key_id, e + EK_RSC);
         crypt_wipe(plain, sizeof(plain));
         if (!ok) {
-            fail(s, WLAN_REASON_UNSUPPORTED);
+            refuse(s, WLAN_DETAIL_GTK);
             return;
         }
         s->state       = WLAN_LINK_CONNECTED;
@@ -451,6 +483,7 @@ static void handle_eapol(struct WlanSta* s, uint8_t* e, uint32_t len) {
     const uint8_t* gtk = find_gtk(plain, plain_len, &gtk_len, &key_id);
     if (gtk != NULL && install_gtk(s, gtk, gtk_len, key_id, e + EK_RSC)) {
         s->replay = replay;
+        s->replay_valid = true;
         send_key(s, KI_SECURE, e + EK_REPLAY, NULL, NULL, 0, false);
     }
     crypt_wipe(plain, sizeof(plain));
@@ -477,14 +510,17 @@ static void joined(struct WlanSta* s, const uint8_t* ies, uint32_t len, uint64_t
 
     const uint8_t* rsn = find_ie(ies, len, IE_RSN, &n);
     if (s->secure) {
-        // CCMP group and pairwise, PSK, and no PMF requirement
+        // CCMP pairwise, PSK, no PMF requirement, and a group cipher of
+        // CCMP or TKIP (WPA/WPA2 mixed: group traffic is only received)
         if (rsn == NULL || n > sizeof(s->ap_rsn) || n < 2 + 2 + 4 + 2 + 4 + 2 + 4) {
-            fail(s, WLAN_REASON_UNSUPPORTED);
+            refuse(s, WLAN_DETAIL_NO_RSN);
             return;
         }
         const uint8_t* v = rsn + 2;
         uint32_t vlen = n - 2, pos = 2;
-        bool ok = memcmp(v + pos, our_rsn + 4, 4) == 0;         // Group: CCMP
+        bool ok = memcmp(v + pos, our_rsn + 4, 3) == 0 &&               // 00-0F-AC
+                  (v[pos + 3] == SUITE_CCMP || v[pos + 3] == SUITE_TKIP);
+        s->group_tkip = ok && v[pos + 3] == SUITE_TKIP;
         pos += 4;
         uint32_t count = get16le(v + pos);
         pos += 2;
@@ -500,13 +536,14 @@ static void joined(struct WlanSta* s, const uint8_t* ies, uint32_t len, uint64_t
         }
         bool pmf_required = pos + 2 <= vlen && (get16le(v + pos) & 0x0040);
         if (!ok || !ccmp || !psk || pmf_required) {
-            fail(s, WLAN_REASON_UNSUPPORTED);
+            refuse(s, !ok ? WLAN_DETAIL_GROUP : !ccmp ? WLAN_DETAIL_PAIRWISE :
+                      !psk ? WLAN_DETAIL_AKM : WLAN_DETAIL_PMF);
             return;
         }
         memcpy(s->ap_rsn, rsn, n);
         s->ap_rsn_length = (uint8_t)n;
     } else if (rsn != NULL) {
-        fail(s, WLAN_REASON_UNSUPPORTED);   // It wants a password after all
+        refuse(s, WLAN_DETAIL_OPEN);        // It wants a password after all
         return;
     }
 
@@ -614,11 +651,20 @@ static void rx_data(struct WlanSta* s, const uint8_t* f, uint32_t len) {
         }
         uint8_t key_id = (uint8_t)(f[hdr + 3] >> 6);
         bool group = is_group(dst);
-        const aes128_t* key = group ? (s->gtk_set[key_id] ? &s->gtk[key_id] : NULL) : &s->tk;
         uint64_t pn;
         uint8_t got_id;
-        body = s->rx_buffer + hdr + CCMP_HDR_LEN;
-        if (key == NULL || !ccmp_decrypt(key, s->rx_buffer, len, hdr, body, &body_len, &pn, &got_id)) {
+        body = s->rx_buffer + hdr + CCMP_HDR_LEN;      // TKIP's IV is as long: TKIP_IV_LEN
+        bool ok;
+        if (group && s->group_tkip) {
+            // WPA/WPA2 mixed: its broadcasts come TKIP encrypted
+            ok = s->gtk_set[key_id] &&
+                 tkip_decrypt(&s->gtk_tkip[key_id], s->rx_buffer, len, hdr, dst, src,
+                              (uint8_t)(qos ? tid : 0), body, &body_len, &pn, &got_id);
+        } else {
+            const aes128_t* key = group ? (s->gtk_set[key_id] ? &s->gtk[key_id] : NULL) : &s->tk;
+            ok = key != NULL && ccmp_decrypt(key, s->rx_buffer, len, hdr, body, &body_len, &pn, &got_id);
+        }
+        if (!ok) {
             s->rx_dropped++;
             return;
         }
@@ -681,9 +727,13 @@ int32_t wlan_sta_connect(struct WlanSta* s, const struct WlanBss* bss, const uin
     if (s->state != WLAN_LINK_IDLE)
         wlan_sta_disconnect(s, WLAN_REASON_USER);
     s->reason = WLAN_REASON_NONE;
+    s->detail = WLAN_DETAIL_NONE;
     if (bss->security & (WLAN_SEC_WEP | WLAN_SEC_ENTERPRISE) ||
         (bss->security != 0 && !(bss->security & WLAN_SEC_WPA2))) {
         s->reason = WLAN_REASON_UNSUPPORTED;    // WEP, WPA1 only, WPA3 only, 802.1X
+        s->detail = (bss->security & WLAN_SEC_WEP) ? WLAN_DETAIL_GROUP :
+                    (bss->security & (WLAN_SEC_ENTERPRISE | WLAN_SEC_WPA3)) ? WLAN_DETAIL_AKM :
+                    WLAN_DETAIL_NO_RSN;
         return SYS_EINVAL;
     }
     bool secure = bss->security != 0;
@@ -697,6 +747,7 @@ int32_t wlan_sta_connect(struct WlanSta* s, const struct WlanBss* bss, const uin
     s->secure     = secure;
     s->aid        = 0;
     s->ap_rsn_length = 0;
+    s->group_tkip = false;
     if (secure) {
         memcpy(s->pmk, pmk, WPA_PMK_LEN);
         s->ops->random(s->ctx, s->snonce, WPA_NONCE_LEN);
@@ -761,6 +812,7 @@ void wlan_sta_link(const struct WlanSta* s, struct WlanLink* out) {
     out->version = WLAN_LINK_VERSION;
     out->state   = s->state;
     out->reason  = s->reason;
+    out->detail  = s->detail;
     if (s->state != WLAN_LINK_IDLE || s->reason != WLAN_REASON_NONE) {
         out->channel     = s->bss.channel;
         out->rssi        = s->bss.rssi;

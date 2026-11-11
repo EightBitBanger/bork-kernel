@@ -142,6 +142,12 @@ static int32_t wlan_ioctl(struct CharDevice* cd, uint32_t request, uint32_t arg)
         return SYS_ENOTTY;
     if (!wlan_caller_allowed())
         return SYS_EPERM;
+    // Joining or leaving a network changes it for every program: the
+    // network tray's own bit, not just the network bit
+    if ((request == WLAN_IOCTL_CONNECT || request == WLAN_IOCTL_DISCONNECT) &&
+        process_current_id() != PROCESS_INVALID_ID &&
+        (process_current_security() & SYS_SEC_NET_CONFIG) != SYS_SEC_NET_CONFIG)
+        return SYS_EPERM;
     struct WlanDev* wd = (struct WlanDev*)cd->driver_data;
 
     if (request == WLAN_IOCTL_CONNECT)

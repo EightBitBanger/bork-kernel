@@ -35,7 +35,7 @@
 
 // Resources: load by path, look up by name, draw with the gfx calls
 #include <kernel/syscall/calls/sys_home.h>      // gethome
-#include <kernel/syscall/calls/sys_time.h>      // time
+#include <kernel/syscall/calls/sys_time.h>      // time clock clock_set
 #include <kernel/syscall/calls/sys_input.h>     // input_warp
 
 // Processes: start another program with arguments
@@ -56,10 +56,13 @@
 #include <kernel/syscall/calls/sys_registry.h>  // reg_get reg_keys reg_set reg_values reg_delete reg_mkkey reg_rename
 
 // Network: TCP sockets (SYS_SEC_NET)
-#include <kernel/syscall/calls/sys_net.h>       // sock_*
+#include <kernel/syscall/calls/sys_net.h>       // sock_* net_resolve
 
 // Drivers: load a driver file into the kernel (admin)
 #include <kernel/syscall/calls/sys_driver.h>    // drv_load drv_unload
+
+// Random bytes from the kernel's pool (always allowed)
+#include <kernel/syscall/calls/sys_random.h>    // random
 
 typedef struct {
     const char* name;       // For traces and reports
@@ -109,7 +112,7 @@ static const SyscallEntry syscall_table[] = {
     [SYS_GFX_READ]    = { "gfx_read",    sys_gfx_read,    GFX },
     [SYS_GFX_PRESENT] = { "gfx_present", sys_gfx_present, GFX | SYS_SEC_GFX_SCREEN },
     [SYS_SEC_GET]     = { "sec_get",     sys_sec_get,     0 },      // ADMIN for other processes
-    [SYS_SEC_SET]     = { "sec_set",     sys_sec_set,     SYS_SEC_ADMIN },
+    [SYS_SEC_SET]     = { "sec_set",     sys_sec_set,     0 },      // ADMIN, except dropping own bits
     [SYS_IPC_CLOSE]   = { "ipc_close",   sys_ipc_close,   0 },      // Always: lets a process let go
     [SYS_IPC_PIPE]    = { "ipc_pipe",    sys_ipc_pipe,    IPC },
     [SYS_IPC_PORT_CREATE] = { "ipc_port_create", sys_ipc_port_create, IPC },  // + ADMIN for "sys.*"
@@ -161,6 +164,11 @@ static const SyscallEntry syscall_table[] = {
     [SYS_UNMOUNT]     = { "unmount",     sys_unmount,     W },      // never the system disk
     [SYS_SETPOLICY]   = { "setpolicy",   sys_setpolicy,   SYS_SEC_ADMIN | W },
     [SYS_SETSECURITY] = { "setsecurity", sys_setsecurity, SYS_SEC_ADMIN | W },
+    [SYS_CLOCK]       = { "clock",       sys_clock,       0 },
+    [SYS_CLOCK_SET]   = { "clock_set",   sys_clock_set,   SYS_SEC_ADMIN },
+    [SYS_NET_RESOLVE] = { "net_resolve", sys_net_resolve, NET },
+    [SYS_SETWRITESEC] = { "setwritesec", sys_setwritesec, SYS_SEC_ADMIN | W },
+    [SYS_RANDOM]      = { "random",      sys_random,      0 },
 };
 
 #undef R

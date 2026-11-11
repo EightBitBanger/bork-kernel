@@ -93,14 +93,16 @@ static int cmd_policy_run(int arg_count, char** args) {
             vfs_get_security(path, &mask);
         }
         const Policy* p = policy_find(current);
-        char group[16], security[24];
+        char group[16], security[48];
+        uint32_t write_mask = 0;
+        vfs_get_write_security(path, &write_mask);
         if (p != NULL)
             snprintf(group, sizeof(group), "%s", p->name);
         else if (current == POLICY_NONE)
             snprintf(group, sizeof(group), "none");
         else
             snprintf(group, sizeof(group), "? (%u)", (unsigned)current);
-        snprintf(security, sizeof(security), "security 0x%08x", (unsigned)mask);
+        snprintf(security, sizeof(security), "security 0x%08x write +0x%08x", (unsigned)mask, (unsigned)write_mask);
         policy_print_line(args[i], group, security);
     }
     return result;

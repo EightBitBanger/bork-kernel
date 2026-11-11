@@ -118,6 +118,28 @@ static struct RegistryKey* sys_reg_open(const char* path) {
     return (hive != NULL) ? registry_open_key(hive->root, rest, false, 0) : NULL;
 }
 
+// Save a hive after a change; `result` stays unless it was SYS_OK and the
+// file could not be written. The caller holds the registry lock.
+//
+// The hive file is the kernel's own, not the caller's: the registry checks
+// above already decided whether the change is allowed (hkey_user is open to
+// any program with file write clearance, hkey_root takes admin). The file
+// itself lives in <home>/sys, which is "write=admin" on disk, so writing it
+// with the caller's clearance refused every save made by a program without
+// admin (the desktop settings' "could not be saved to disk"). It is written
+// with full file clearance for the length of the export, and put back.
+static int32_t sys_reg_save(struct RegistryHive* hive, int32_t result) {
+    const char* file = registry_hive_path(hive);
+    if (file[0] == '\0')
+        return result;
+    ProcessSecurity old_extra = process_current_set_clearance_extra(SYS_SEC_VALID);
+    bool saved = registry_hive_export(hive, file);
+    process_current_set_clearance_extra(old_extra);
+    if (!saved && result == SYS_OK)
+        return SYS_EIO;
+    return result;
+}
+
 static int32_t sys_reg_get(const SyscallArgs* args) {
     AddressSpace* space = process_current_space();
     uint32_t user_buffer = args->arg3;
@@ -305,9 +327,7 @@ static int32_t sys_reg_set(const SyscallArgs* args) {
         }
         // Made keys stay even when setting the value failed: save what is
         // in memory either way, so the file never lags behind it
-        const char* file = registry_hive_path(hive);
-        if (file[0] != '\0' && !registry_hive_export(hive, file) && result == SYS_OK)
-            result = SYS_EIO;
+        result = sys_reg_save(hive, result);
     }
     registry_unlock();
 
@@ -382,15 +402,6 @@ static struct RegistryHive* sys_reg_hive_for_write(const char* path, const char*
         return NULL;
     }
     return hive;
-}
-
-// Save a hive after a change; `result` stays unless it was SYS_OK and the
-// file could not be written. The caller holds the registry lock.
-static int32_t sys_reg_save(struct RegistryHive* hive, int32_t result) {
-    const char* file = registry_hive_path(hive);
-    if (file[0] != '\0' && !registry_hive_export(hive, file) && result == SYS_OK)
-        return SYS_EIO;
-    return result;
 }
 
 // Split a key path below the hive root ("a/b/c") into its parent ("a/b")

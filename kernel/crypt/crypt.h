@@ -7,6 +7,7 @@
 //   sha1.c     SHA-1, HMAC-SHA1, PBKDF2-HMAC-SHA1
 //   aes.c      AES-128 (one block at a time) and AES key unwrap (RFC 3394)
 //   ccmp.c     CCMP: AES-CCM as 802.11 uses it to encrypt data frames
+//   tkip.c     TKIP, receive only: the group traffic of WPA/WPA2 mixed networks
 //   wpa.c      WPA2-Personal keys: the PSK from a passphrase, the PTK, the
 //              EAPOL-Key MIC
 //   random.c   Random bytes for nonces, from a SHA-1 pool fed by the caller

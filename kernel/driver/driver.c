@@ -264,6 +264,9 @@ void driver_init(void) {
     // Virtual devices: /dev/null, /dev/zero (builtin/memdev.c)
     device_add_platform("mem");
 
+    // The CMOS clock: the wall clock's source (arch/x86/drivers/rtc.c)
+    device_add_platform("rtc");
+
     driver_lock();
     driver_tree_update();
     driver_unlock();

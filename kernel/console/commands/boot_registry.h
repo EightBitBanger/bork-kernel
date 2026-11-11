@@ -34,13 +34,25 @@
 //
 //     filetype/ttf    type "Font"     icon "icon_font"     fallback "icon_file"
 //     filetype/drv    type "Driver"   icon "icon_driver"   fallback "icon_system"
+//     filetype/ulib   type "Library"  icon "icon_driver"   fallback "icon_system"
 //     filetype/sh     type "Script"   icon "icon_script"   open "console --script"
 //
 // "open" names the program that opens the type's files, with the
 // arguments that go before the file (the explorer and the desktop run
-// "<home>/bin/console --script <file>" for a script). A repair that keeps
-// an existing key still adds a missing "open" to it, so scripts open on a
-// disk installed before there were openers; set it to "" to turn one off.
+// "<home>/bin/console --script <file>" for a script). "viewer" "1" says
+// that program only reads the file, so it opens files not marked
+// executable too: every image format paint reads (stb_image's) opens in
+// paint:
+//
+//     filetype/png    type "PNG"      icon "icon_image"    open "paint"   viewer "1"
+//
+// and sound files (MP3, MP2, WAV) in the media player:
+//
+//     filetype/mp3    type "MP3"      icon "icon_audio"    open "mediaplay"   viewer "1"
+//
+// A repair that keeps an existing key still adds a missing "open" (and its
+// "viewer") to it, so scripts and images open on a disk installed before
+// there were openers; set "open" to "" to turn one off.
 //
 // A file is matched by its extension first, then by what its header says
 // it is (a program with no extension is still filetype/elf). The lines are
@@ -51,7 +63,8 @@
 // value per service under "system/services", named after it, holding the
 // program's path below home:
 //
-//     system/services    netsrv "sys/services/netsrv"
+//     system/services    audiosrv "sys/services/audiosrv"
+//                        netsrv "sys/services/netsrv"
 //
 // What starts with the desktop is a way to hook every login, so the key is
 // only ever changed by an admin: hkey_root takes SYS_SEC_ADMIN to write
@@ -101,6 +114,7 @@ static const BootMenuLine boot_menu_desktop[] = {
 
 static const BootMenuLine boot_menu_icon[] = {
     { "Open",         "open" },
+    { "Edit",         "edit" },
     { "Open console here", "console" },
     { "",             "separator" },
     { "Cut",          "cut" },
@@ -154,6 +168,7 @@ typedef struct {
 
 static const BootMenuAdded boot_menu_added[] = {
     { "icon", "Unmount", "unmount", "format" },
+    { "icon", "Edit",    "edit",    "open" },   // Any file in notepad
 };
 
 #define BOOT_MENU_RETIRED_COUNT (sizeof(boot_menu_retired) / sizeof(boot_menu_retired[0]))
@@ -167,13 +182,20 @@ typedef struct {
     const char* icon;
     const char* fallback;       // NULL: none
     const char* open;           // What opens it ("console --script"), NULL: none
+    bool        viewer;         // `open` only reads the file (writes viewer "1")
 } BootFileType;
+
+// Paint, for every format stb_image reads
+#define BOOT_IMAGE_OPEN "paint", true
+// The media player, for MP3 and WAV
+#define BOOT_SOUND_OPEN "mediaplay", true
 
 static const BootFileType boot_filetypes[] = {
     // Programs and system files
     { "elf",  "Program",  "icon_executable", "icon_system"   },
     { "drv",  "Driver",   "icon_driver",     "icon_system"   },
     { "kdrv", "Driver",   "icon_driver",     "icon_system"   },
+    { "ulib", "Library",  "icon_driver",     "icon_system"   },    // sys/lib: header "ulib" (os/ulib.h)
     { "sh",   "Script",   "icon_script",     "icon_document", "console --script" },
 
     // Fonts
@@ -188,18 +210,26 @@ static const BootFileType boot_filetypes[] = {
     { "h",    "C header", "icon_header",     "icon_file"     },
     { "pdf",  "PDF",      "icon_document",   "icon_file"     },
 
-    // Images
-    { "png",  "PNG",      "icon_image",      "icon_file"     },
-    { "jpg",  "JPEG",     "icon_image",      "icon_file"     },
-    { "jpeg", "JPEG",     "icon_image",      "icon_file"     },
-    { "gif",  "GIF",      "icon_image",      "icon_file"     },
-    { "bmp",  "BMP",      "icon_image",      "icon_file"     },
+    // Images: what stb_image decodes (libc's os/image.h), opened in paint
+    { "png",  "PNG",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "jpg",  "JPEG",     "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "jpeg", "JPEG",     "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "gif",  "GIF",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "bmp",  "BMP",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "tga",  "TGA",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "psd",  "PSD",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "pic",  "PIC",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "ppm",  "PPM",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "pgm",  "PGM",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
+    { "pnm",  "PNM",      "icon_image",      "icon_file",     BOOT_IMAGE_OPEN },
 
     // Archives and audio
     { "zip",  "ZIP",      "icon_archive",    "icon_file"     },
     { "gz",   "gzip",     "icon_archive",    "icon_file"     },
     { "tar",  "tar",      "icon_archive",    "icon_file"     },
-    { "wav",  "WAV",      "icon_audio",      "icon_file"     },
+    { "wav",  "WAV",      "icon_audio",      "icon_file",     BOOT_SOUND_OPEN },
+    { "mp3",  "MP3",      "icon_audio",      "icon_file",     BOOT_SOUND_OPEN },
+    { "mp2",  "MP2",      "icon_audio",      "icon_file",     BOOT_SOUND_OPEN },
 };
 
 #define BOOT_FILETYPE_COUNT (sizeof(boot_filetypes) / sizeof(boot_filetypes[0]))
@@ -212,6 +242,7 @@ typedef struct {
 } BootService;
 
 static const BootService boot_services[] = {
+    { "audiosrv", "sys/services/audiosrv" },    // The volume icon on the taskbar
     { "netsrv", "sys/services/netsrv" },    // The Wi-Fi icon on the taskbar
 };
 
@@ -388,7 +419,8 @@ static void boot_registry_fill(struct RegistryHive* hive, bool force, BootRegist
             // Kept, but given the opener a key from before them lacks
             if (ft->open != NULL && registry_get_value(key, "open") == NULL) {
                 *changed = true;
-                if (!registry_set_string(key, "open", perms, ft->open))
+                if (!registry_set_string(key, "open", perms, ft->open) ||
+                    (ft->viewer && !registry_set_string(key, "viewer", perms, "1")))
                     stats->failed++;
             }
             stats->kept++;
@@ -399,7 +431,8 @@ static void boot_registry_fill(struct RegistryHive* hive, bool force, BootRegist
         if (registry_set_string(key, "type", perms, ft->type) &&
             registry_set_string(key, "icon", perms, ft->icon) &&
             (ft->fallback == NULL || registry_set_string(key, "fallback", perms, ft->fallback)) &&
-            (ft->open == NULL || registry_set_string(key, "open", perms, ft->open)))
+            (ft->open == NULL || registry_set_string(key, "open", perms, ft->open)) &&
+            (!ft->viewer || registry_set_string(key, "viewer", perms, "1")))
             stats->written++;
         else
             stats->failed++;
@@ -410,7 +443,22 @@ static void boot_registry_fill(struct RegistryHive* hive, bool force, BootRegist
     if (services == NULL) {
         stats->failed++;
     } else if (services->values != NULL && !force) {
-        stats->kept++;
+        // Kept as the admin left it, but a service newer than the install
+        // (the volume icon) is added when its line is missing
+        bool added = false, ok = true;
+        for (uint32_t s = 0; s < BOOT_SERVICE_COUNT; s++) {
+            if (registry_get_value(services, boot_services[s].name) != NULL)
+                continue;
+            ok = registry_set_string(services, boot_services[s].name, perms, boot_services[s].path) && ok;
+            added = true;
+        }
+        if (!ok)
+            stats->failed++;
+        else if (added) {
+            *changed = true;
+            stats->written++;
+        } else
+            stats->kept++;
     } else {
         *changed = true;
         bool ok = true;

@@ -38,6 +38,7 @@
 #define PCI_SUBCLASS_NVM            0x08    // PCI_CLASS_STORAGE (prog_if 0x02: NVMe)
 #define PCI_SUBCLASS_PCI_BRIDGE     0x04    // PCI_CLASS_BRIDGE
 #define PCI_SUBCLASS_USB            0x03    // PCI_CLASS_SERIAL_BUS
+#define PCI_SUBCLASS_HDA            0x03    // PCI_CLASS_MULTIMEDIA: High Definition Audio
 
 // USB host controller interfaces (prog_if of PCI_SUBCLASS_USB)
 #define PCI_USB_UHCI                0x00

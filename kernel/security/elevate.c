@@ -245,12 +245,19 @@ static int32_t ask(const char name[PROCESS_NAME_MAX], const char path[PROCESS_PA
     return result;
 }
 
-int32_t elevate_request(const char* reason) {
+int32_t elevate_request(const char* reason, uint32_t bits) {
     ProcessId self = process_current_id();
     if (self <= 0)
         return SYS_EPERM;
-    if (process_current_security() & SYS_SEC_ADMIN)
+    if (bits == 0 || (bits & ~SYS_SEC_VALID) != 0)
+        return SYS_EINVAL;
+    ProcessSecurity mine = process_current_security();
+    if ((mine & bits) == bits)
         return SYS_OK;      // Nothing to ask for
+    if (mine & SYS_SEC_ADMIN) {
+        // An administrator could set them itself (SYS_SEC_SET): no prompt
+        return ProcessGrantSecurity(self, bits, false) == PROCESS_OK ? SYS_OK : SYS_ESRCH;
+    }
 
     // Who is asking, from the process table (interrupts on: plain copies)
     char name[PROCESS_NAME_MAX];
@@ -262,12 +269,16 @@ int32_t elevate_request(const char* reason) {
     clean_reason(reason, text);
     memset(by, 0, sizeof(by));
 
-    int32_t result = ask(name, path, text, 0, by, SYS_SEC_ADMIN);
+    // Only the bits asked for, and the prompt lists them: a program that
+    // needs the network asks for SYS_SEC_NET, not for administration
+    uint32_t wanted = bits & ~mine;
+    int32_t result = ask(name, path, text, 0, by, wanted);
 
     // The grant, by the kernel on this thread: nothing the program does can
-    // get here without the agent's yes for this very request
+    // get here without the agent's yes for this very request. "Elevated"
+    // (the limits on admin from a prompt) only when admin is among them.
     if (result == SYS_OK) {
-        if (ProcessGrantSecurity(self, SYS_SEC_ADMIN, true) != PROCESS_OK)
+        if (ProcessGrantSecurity(self, wanted, (wanted & SYS_SEC_ADMIN) != 0) != PROCESS_OK)
             result = SYS_ESRCH;
     }
     return result;

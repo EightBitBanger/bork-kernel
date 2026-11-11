@@ -5,6 +5,7 @@
 #include <kernel/syscall/calls/sys_types.h>
 #include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
+#include <kernel/syscall/calls/sys_write.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/scheduler/process.h>
 #include <kernel/util/string.h>
@@ -48,6 +49,9 @@ static int32_t sys_mkdir_locked(SysProcessFiles* t, const SyscallArgs* args) {
     if (result < 0)
         return result;
 
+    if ((result = sys_write_check(path, true)) != SYS_OK)
+        return result;
+
     vfs_lock();
     if (vfs_exists(path))
         result = SYS_EEXIST;
@@ -78,6 +82,9 @@ static int32_t sys_remove_locked(SysProcessFiles* t, const SyscallArgs* args) {
     char path[SYS_PATH_MAX];
     int32_t result = sys_user_path(process_current_space(), t->cwd, args->arg1, path);
     if (result < 0)
+        return result;
+
+    if ((result = sys_write_check(path, true)) != SYS_OK)
         return result;
 
     vfs_lock();
@@ -124,6 +131,8 @@ static int32_t sys_rename_locked(SysProcessFiles* t, const SyscallArgs* args) {
     char renamed[SYS_PATH_MAX];
     if (!sys_sibling_path(path, name, renamed, sizeof(renamed)))
         return SYS_ENAMETOOLONG;
+    if ((result = sys_write_check(path, true)) != SYS_OK)
+        return result;
 
     vfs_lock();
     if (!vfs_exists(path))
@@ -160,6 +169,9 @@ static int32_t sys_truncate_locked(SysProcessFiles* t, const SyscallArgs* args) 
     if (result < 0)
         return result;
 
+    if ((result = sys_write_check(path, false)) != SYS_OK)
+        return result;
+
     FSFileStats st;
     vfs_lock();
     if (!vfs_stat(path, &st))
@@ -194,6 +206,8 @@ static int32_t sys_copy_locked(SysProcessFiles* t, const SyscallArgs* args) {
         return result;
     result = sys_user_path(space, t->cwd, args->arg2, dest);
     if (result < 0)
+        return result;
+    if ((result = sys_write_check(dest, true)) != SYS_OK)
         return result;
 
     if (!vfs_exists(src))
@@ -242,6 +256,8 @@ static int32_t sys_move_locked(SysProcessFiles* t, const SyscallArgs* args) {
         return result;
     if (strcmp(src, "/") == 0 || strcmp(dest, "/") == 0)
         return SYS_EBUSY;
+    if ((result = sys_write_check(src, true)) != SYS_OK || (result = sys_write_check(dest, true)) != SYS_OK)
+        return result;
 
     vfs_lock();
     if (!vfs_exists(src))

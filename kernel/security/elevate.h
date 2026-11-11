@@ -31,9 +31,11 @@
 
 #define ELEVATE_QUEUE_MAX   4       // Requests waiting at once, system wide
 
-// SYS_ELEVATE for the calling process. `reason` (kernel memory, may be NULL)
-// is copied and cleaned. Blocks; thread context. SYS_OK or a SYS_E* code.
-int32_t elevate_request(const char* reason);
+// SYS_ELEVATE for the calling process: the user is asked for `bits`
+// (SYS_SEC_* within SYS_SEC_VALID, never 0) and only those are granted.
+// `reason` (kernel memory, may be NULL) is copied and cleaned. Blocks;
+// thread context. SYS_OK or a SYS_E* code.
+int32_t elevate_request(const char* reason, uint32_t bits);
 
 // SYS_SPAWN_ELEVATE for bits the caller lacks: the same prompt, naming
 // the program at `image_path` (absolute, resolved by the kernel) as the one

@@ -8,6 +8,7 @@
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/syscall/calls/sys_print.h>
 #include <kernel/syscall/calls/sys_security.h>
+#include <kernel/syscall/calls/sys_write.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/arch/x86/virtual/vmm.h>
 #include <kernel/scheduler/process.h>
@@ -208,6 +209,10 @@ static int32_t sys_open_locked(SysProcessFiles* t, const SyscallArgs* args) {
     char path[SYS_PATH_MAX];
     int32_t result = sys_user_path(process_current_space(), t->cwd, args->arg1, path);
     if (result < 0)
+        return result;
+    // Writing needs the file's write clearance; creating, its folder's
+    if ((flags & (SYS_O_WRITE | SYS_O_CREATE)) &&
+        (result = sys_write_check(path, (flags & SYS_O_CREATE) && !vfs_exists(path))) != SYS_OK)
         return result;
 
     int32_t fd = sys_fd_alloc(t);

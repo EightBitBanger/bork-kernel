@@ -9,9 +9,9 @@
 #include <kernel/util/string.h>
 #include <kernel/util/snprint.h>
 
-// Network controllers go to the driver model (driver/device.h) as BUS_PCI
+// Network and HD Audio controllers go to the driver model (driver/device.h) as BUS_PCI
 // devices, so a driver claims them by vendor / device ID through its match
-// table (the AR9485 Wi-Fi card, drivers/net/athn_pci.c). pci_init() may run
+// table (the AR9485 Wi-Fi card, drivers/net/athn_pci.c; audio, drivers/audio/hda.c). pci_init() may run
 // twice (the F7 console, then the boot); a function already added is kept.
 static void pci_device_add(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx) {
     (void)ctx;
@@ -48,6 +48,7 @@ static const struct PCIClassDriver pci_class_drivers[] = {
     { PCI_CLASS_STORAGE,    PCI_SUBCLASS_NVM,  PCI_NVM_NVME, pci_storage_probe_nvme },
     { PCI_CLASS_SERIAL_BUS, PCI_SUBCLASS_USB,  PCI_ANY, usb_pci_probe          },
     { PCI_CLASS_NETWORK,    PCI_ANY,           PCI_ANY, pci_device_add         },
+    { PCI_CLASS_MULTIMEDIA, PCI_SUBCLASS_HDA,  PCI_ANY, pci_device_add         },
 };
 
 #define PCI_CLASS_DRIVER_COUNT  (sizeof(pci_class_drivers) / sizeof(pci_class_drivers[0]))

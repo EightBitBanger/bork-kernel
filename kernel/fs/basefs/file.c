@@ -92,12 +92,17 @@ static bool fs_file_grow(struct FSDeviceContext* ctx, uint64_t address, struct F
 // gives the default instead: the user policy with its permissions as the
 // mask, the same as SYS_SETPOLICY "user" with every allowed bit ticked.
 // Every program the desktop starts holds those, so nothing is shut out.
+// The write clearance is always the directory's, so a folder only an
+// admin may write keeps everything made in it that way.
 void fs_inherit_policy(struct FSDeviceContext* ctx, uint64_t parent_directory,
-                       uint32_t* policy, uint32_t* security) {
+                       uint32_t* policy, uint32_t* security, uint32_t* write_security) {
     uint32_t parent_policy   = POLICY_NONE;
     uint32_t parent_security = 0;
+    uint32_t parent_write    = 0;
     fs_file_get_policy(ctx, parent_directory, &parent_policy);
     fs_file_get_security(ctx, parent_directory, &parent_security);
+    fs_file_get_write_security(ctx, parent_directory, &parent_write);
+    *write_security = parent_write;
 
     if (parent_policy == POLICY_NONE) {
         *policy   = POLICY_USER;
@@ -137,10 +142,11 @@ uint64_t fs_file_create(struct FSDeviceContext* ctx, const char* name, uint8_t p
     // The directory's group policy and security mask, or the user policy
     // (0 for both when unlinked)
     if (parent_directory != FS_NULL) {
-        uint32_t policy = 0, security = 0;
-        fs_inherit_policy(ctx, parent_directory, &policy, &security);
-        file.block.policy   = policy;
-        file.block.security = security;
+        uint32_t policy = 0, security = 0, write_security = 0;
+        fs_inherit_policy(ctx, parent_directory, &policy, &security, &write_security);
+        file.block.policy         = policy;
+        file.block.security       = security;
+        file.block.write_security = write_security;
     }
 
     file.block.created     = fs_time_now();

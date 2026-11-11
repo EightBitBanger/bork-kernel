@@ -22,7 +22,7 @@
 //
 // Network calls: sock_listen, sock_connect, sock_accept, sock_send,
 // sock_recv, sock_close, sock_wait, sock_info (ABI in syscall.h), on the
-// kernel's TCP (net/tcp.c)
+// kernel's TCP (net/tcp.c), and net_resolve on its DNS resolver (net/dns.c)
 //
 // One SysNetProcess per process that has used a socket call, on a list
 // keyed by process id, created on the first call and dropped by
@@ -46,6 +46,7 @@
 _Static_assert(SYS_SOCK_READABLE == TCP_EV_READ && SYS_SOCK_WRITABLE == TCP_EV_WRITE &&
                SYS_SOCK_ACCEPTABLE == TCP_EV_ACCEPT && SYS_SOCK_ERROR == TCP_EV_ERROR &&
                SYS_SOCK_CONNECTED == TCP_EV_CONNECTED, "SYS_SOCK_* must match TCP_EV_*");
+_Static_assert(SYS_NET_NAME_MAX + 1 == DNS_NAME_MAX, "SYS_NET_NAME_MAX must match DNS_NAME_MAX");
 _Static_assert(SYS_SOCK_BACKLOG_MAX == TCP_BACKLOG_MAX, "SYS_SOCK_BACKLOG_MAX must equal TCP_BACKLOG_MAX");
 _Static_assert(sizeof(SysSockAddr) == 8 && sizeof(SysSockWaitItem) == 8 && sizeof(SysSockInfo) == 32,
                "socket structures are part of the user ABI");
@@ -80,6 +81,7 @@ static int32_t sys_net_error(int error) {
         case NET_ERR_REFUSED:   return SYS_ECONNREFUSED;
         case NET_ERR_RESET:     return SYS_ECONNRESET;
         case NET_ERR_CLOSED:    return SYS_ENOTCONN;
+        case NET_ERR_NOTFOUND:  return SYS_ENOENT;
         default:                return SYS_EINVAL;
     }
 }
@@ -407,6 +409,79 @@ static int32_t sys_sock_wait(const SyscallArgs* args) {
         }
         thread_sleep(SYS_NET_WAIT_SLICE_MS);
     }
+}
+
+// net_resolve(name, uint32_t* ip, timeout_ms) -> 0. Blocks (no table, no
+// lock held: the resolver has its own socket), and ends early when the
+// process is being killed.
+static bool sys_net_resolve_cancel(void) {
+    return process_current_kill_pending();
+}
+
+// Lookups in progress. Each holds one of the kernel's few UDP sockets for
+// up to SYS_NET_RESOLVE_TIMEOUT_MAX, so there is a cap for the system and
+// a smaller one for each process: one program can't use them all up.
+#define SYS_NET_RESOLVE_MAX         6
+#define SYS_NET_RESOLVE_PER_PROCESS 2
+
+static uint32_t sys_net_resolving[SYS_NET_RESOLVE_MAX];     // Process ids, 0 = free
+
+// A slot for the calling process, or -1 (too many lookups)
+static int sys_net_resolve_enter(void) {
+    uint32_t self = (uint32_t)process_current_id();
+    int slot = -1;
+    uint32_t mine = 0;
+    uint32_t irq_flags = irq_save();
+    for (int i = 0; i < SYS_NET_RESOLVE_MAX; i++) {
+        if (sys_net_resolving[i] == self)
+            mine++;
+        else if (sys_net_resolving[i] == 0 && slot < 0)
+            slot = i;
+    }
+    if (mine >= SYS_NET_RESOLVE_PER_PROCESS)
+        slot = -1;
+    if (slot >= 0)
+        sys_net_resolving[slot] = self;
+    irq_restore(irq_flags);
+    return slot;
+}
+
+static void sys_net_resolve_leave(int slot) {
+    uint32_t irq_flags = irq_save();
+    sys_net_resolving[slot] = 0;
+    irq_restore(irq_flags);
+}
+
+static int32_t sys_net_resolve(const SyscallArgs* args) {
+    AddressSpace* space = process_current_space();
+    if (space == NULL)
+        return SYS_EFAULT;
+    char name[DNS_NAME_MAX + 1];    // One more, to tell "too long" from "just fits"
+    int32_t length = sys_user_string(space, args->arg1, name, sizeof(name));
+    if (length == SYS_ENAMETOOLONG || length >= DNS_NAME_MAX)
+        return SYS_ENAMETOOLONG;
+    if (length < 0)
+        return length;
+    if (length == 0)
+        return SYS_EINVAL;
+    if (!vmm_user_check(space, args->arg2, sizeof(uint32_t), true))
+        return SYS_EFAULT;
+
+    uint32_t timeout = args->arg3;
+    if (timeout == 0 || timeout > SYS_NET_RESOLVE_TIMEOUT_MAX)
+        timeout = SYS_NET_RESOLVE_TIMEOUT_MAX;
+
+    int slot = sys_net_resolve_enter();
+    if (slot < 0)
+        return SYS_EAGAIN;
+    uint32_t ip = 0;
+    int result = dns_resolve(name, &ip, timeout, sys_net_resolve_cancel);
+    sys_net_resolve_leave(slot);
+    if (result != NET_OK)
+        return result == NET_ERR_PARAM ? SYS_EINVAL : sys_net_error(result);
+    if (!vmm_user_copy_to(space, args->arg2, &ip, sizeof(ip)))
+        return SYS_EFAULT;
+    return SYS_OK;
 }
 
 #endif

@@ -11,8 +11,9 @@
 // and a counter, and every read stirs the pool forward, so earlier output
 // can't be worked out from a later state.
 //
-// Not locked: callers serialise (the Wi-Fi station uses it from its one
-// thread).
+// Locked (a mutex): the Wi-Fi station, the net thread (frame arrival
+// times) and SYS_RANDOM (programs: TLS keys) all use it. Threads only, never
+// from an interrupt.
 //
 
 void crypt_random_add(const void* data, size_t n);

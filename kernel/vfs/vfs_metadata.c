@@ -23,7 +23,7 @@ static bool do_set_permissions(const char* path, uint8_t perm) {
     
     struct FsMount* mount = vfs_device_get_context(path);
     if (mount && vfs_node_type(mount, address) != FS_NODE_NONE) {
-        if (!vfs_fs_node_allowed(mount, address))
+        if (!vfs_fs_node_write_allowed(mount, address))
             return false;
         uint8_t permissions = perm & (VFS_PERMISSION_EXECUTE | VFS_PERMISSION_READ | VFS_PERMISSION_WRITE);
         mount->type->set_permissions(mount, address, permissions);

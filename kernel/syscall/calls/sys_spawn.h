@@ -184,10 +184,25 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
         ProcessSecurity added  = needs & ~mask;     // What the child gets on top
         ProcessSecurity asked  = needs & ~mine;     // ... that isn't ours to give
         if (asked != 0) {
+            // The user says yes to the file at this path as it is now. The
+            // prompt can be up for a while: if another object stands at the
+            // path afterwards, or the file asks for something else, the yes
+            // was not for it.
+            VfsNodeIdentity before, after;
             if (!(mine & SYS_SEC_ELEVATE))
                 result = SYS_EPERM;
+            else if (!vfs_node_identity(q->path, &before))
+                result = SYS_ENOENT;
             else
                 result = elevate_request_launch(q->path, asked);
+            if (result == SYS_OK) {
+                uint32_t now_needs = 0;
+                if (!vfs_get_security(q->path, &now_needs))
+                    now_needs = 0;
+                if (!vfs_node_identity(q->path, &after) || after.mount != before.mount ||
+                    after.address != before.address || (now_needs & SYS_SEC_VALID) != needs)
+                    result = SYS_EAGAIN;
+            }
             if (result == SYS_OK) {
                 old_extra = process_current_set_clearance_extra(asked);
                 boosted = true;

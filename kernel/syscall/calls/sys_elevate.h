@@ -11,7 +11,7 @@
 #include <kernel/security/elevate.h>
 
 //
-// elevate(reason or 0) -> 0 once SYS_SEC_ADMIN is held
+// elevate(reason or 0, bits or 0) -> 0 once `bits` (0: SYS_SEC_ADMIN) are held
 // elevate_agent(op, id, arg) -> by op
 //
 // ABI in syscall.h ("Elevation"), the logic in security/elevate.c.
@@ -32,7 +32,8 @@ static int32_t sys_elevate(const SyscallArgs* args) {
         if (length < 0 && length != SYS_ENAMETOOLONG)
             return length;
     }
-    return elevate_request(reason);
+    uint32_t bits = (args->arg2 != 0) ? args->arg2 : SYS_SEC_ADMIN;
+    return elevate_request(reason, bits);
 }
 
 static int32_t sys_elevate_agent(const SyscallArgs* args) {

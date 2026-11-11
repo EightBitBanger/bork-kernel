@@ -6,6 +6,7 @@
 
 #include <kernel/arch/x86/drivers/net/wlan.h>
 #include <kernel/crypt/aes.h>
+#include <kernel/crypt/tkip.h>
 #include <kernel/crypt/wpa.h>
 
 //
@@ -29,8 +30,10 @@
 // or a long silence (no beacons), ends a connection.
 //
 // Only what nearly every home network offers: open networks, and
-// WPA2-Personal (PSK) with CCMP (AES) for both pairwise and group traffic.
-// WPA3 (SAE), TKIP, WEP and enterprise (802.1X) are refused up front.
+// WPA2-Personal (PSK) with CCMP (AES) for our own (pairwise) traffic. The
+// group traffic (broadcasts) may be CCMP or, on a "WPA/WPA2 mixed" network,
+// TKIP: that is only ever received, never sent. WPA3 (SAE), TKIP-only, WEP
+// and enterprise (802.1X) are refused, with WlanLink.detail saying which.
 // Data goes out as plain (non-QoS) data frames, which access points accept
 // from stations that don't ask for QoS.
 //
@@ -69,6 +72,7 @@ struct WlanSta {
 
     uint8_t  state;             // WLAN_LINK_*
     uint8_t  reason;            // WLAN_REASON_*
+    uint8_t  detail;            // WLAN_DETAIL_* with WLAN_REASON_UNSUPPORTED
     uint8_t  retries;
     uint64_t deadline;          // The current step times out then
     uint64_t last_beacon;
@@ -80,6 +84,7 @@ struct WlanSta {
     uint8_t  rate_count;
     uint8_t  ap_rsn[64];        // Its RSN element as its beacon had it (checked again in message 3)
     uint8_t  ap_rsn_length;
+    bool     group_tkip;        // Its group cipher is TKIP (WPA/WPA2 mixed)
     uint16_t aid;
     uint16_t seq;               // Our next sequence number
 
@@ -87,14 +92,16 @@ struct WlanSta {
     uint8_t  pmk[WPA_PMK_LEN];
     uint8_t  anonce[WPA_NONCE_LEN];
     uint8_t  snonce[WPA_NONCE_LEN];
-    uint64_t replay;            // Last EAPOL-Key replay counter taken
-    bool     replay_valid;
+    uint64_t replay;            // Last EAPOL-Key replay counter taken from a frame
+    bool     replay_valid;      // whose MIC checked out (message 1 has none)
+    bool     anonce_set;        // Message 1 seen: anonce and the PTK to check message 3 with
     wpa_ptk_t ptk;
     bool     ptk_set;           // Keys installed: data is encrypted
     aes128_t tk;
     aes128_t gtk[4];
+    tkip_key_t gtk_tkip[4];     // The same keys when the group cipher is TKIP
     bool     gtk_set[4];
-    uint64_t gtk_rsc[4];        // Last group packet number per key id
+    uint64_t gtk_rsc[4];        // Last group packet number (CCMP PN / TKIP TSC) per key id
     uint64_t rx_pn[17];         // Last pairwise packet number per TID (16: non-QoS)
     uint64_t tx_pn;
 

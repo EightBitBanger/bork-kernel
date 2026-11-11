@@ -184,6 +184,18 @@ _Static_assert(sizeof(struct WlanConnect) == 108, "WlanConnect is ABI");
 #define WLAN_REASON_USER        8       // Disconnected on request
 #define WLAN_REASON_RADIO       9       // The adapter failed to send or tune
 
+// WlanLink.detail: which part of the network's security was refused (with
+// WLAN_REASON_UNSUPPORTED)
+#define WLAN_DETAIL_NONE        0
+#define WLAN_DETAIL_NO_RSN      1       // Its beacon has no usable RSN element (WPA1 only)
+#define WLAN_DETAIL_GROUP       2       // Group cipher neither CCMP nor TKIP (WEP)
+#define WLAN_DETAIL_PAIRWISE    3       // No CCMP for our own traffic (TKIP only)
+#define WLAN_DETAIL_AKM         4       // No plain PSK key management (WPA3 / SHA-256 / 802.1X only)
+#define WLAN_DETAIL_PMF         5       // It requires management frame protection
+#define WLAN_DETAIL_CHANGED     6       // Message 3's RSN element differed from its beacon's
+#define WLAN_DETAIL_GTK         7       // A group key of the wrong size for its cipher
+#define WLAN_DETAIL_OPEN        8       // Picked as open, but it wants a password
+
 // The connection. 64 bytes.
 struct WlanLink {
     uint32_t version;           // WLAN_LINK_VERSION
@@ -197,7 +209,9 @@ struct WlanLink {
     uint8_t  ssid[WLAN_SSID_MAX];
     uint32_t ip;                // From DHCP, host order; 0: none yet
     uint32_t gateway;
-    uint32_t reserved[2];
+    uint8_t  detail;            // WLAN_DETAIL_*: more on an UNSUPPORTED reason (0 on older kernels)
+    uint8_t  reserved8[3];
+    uint32_t reserved;
 };
 
 _Static_assert(sizeof(struct WlanLink) == 64, "WlanLink is ABI");

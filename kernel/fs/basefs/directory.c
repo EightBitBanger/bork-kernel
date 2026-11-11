@@ -405,10 +405,11 @@ uint64_t fs_directory_create(struct FSDeviceContext* ctx, const char* name, uint
     // The parent's group policy and security mask, or the user policy
     // (fs_inherit_policy). The root starts in no group, with no mask.
     if (parent_directory != FS_NULL) {
-        uint32_t policy = 0, security = 0;
-        fs_inherit_policy(ctx, parent_directory, &policy, &security);
-        directory.block.policy   = policy;
-        directory.block.security = security;
+        uint32_t policy = 0, security = 0, write_security = 0;
+        fs_inherit_policy(ctx, parent_directory, &policy, &security, &write_security);
+        directory.block.policy         = policy;
+        directory.block.security       = security;
+        directory.block.write_security = write_security;
     }
     directory.block.created     = fs_time_now();
     directory.block.modified    = directory.block.created;

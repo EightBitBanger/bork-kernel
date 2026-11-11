@@ -5,6 +5,7 @@
 #include <kernel/net/net.h>
 #include <kernel/net/net_internal.h>
 #include <kernel/arch/x86/drivers/rng.h>
+#include <kernel/crypt/random.h>
 
 #include <kernel/malloc.h>
 #include <kernel/mutex.h>
@@ -111,7 +112,11 @@ static void net_rekey(uint64_t sample) {
 }
 
 void net_entropy(uint64_t sample) {
-    net_rekey(sample ^ rng_cycles());
+    uint64_t cycles = rng_cycles();
+    net_rekey(sample ^ cycles);
+    // The pool programs draw on (SYS_RANDOM) gets the same timing
+    uint64_t mix[2] = { sample, cycles };
+    crypt_random_add(mix, sizeof(mix));
 }
 
 uint32_t net_random(void) {

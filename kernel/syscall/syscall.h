@@ -59,7 +59,7 @@
 #define SYS_GFX_READ   26   // (handle, SysGfxRect*, pixels, stride)  0
 #define SYS_GFX_PRESENT 27  // (handle, SysGfxRect* or 0, x, y)       0
 #define SYS_SEC_GET    28   // (pid or 0)               security mask
-#define SYS_SEC_SET    29   // (pid or 0, mask)         previous mask   (needs SYS_SEC_ADMIN)
+#define SYS_SEC_SET    29   // (pid or 0, mask)         previous mask   (needs SYS_SEC_ADMIN, except to drop own bits)
 #define SYS_IPC_CLOSE  30   // (handle)                 0
 #define SYS_IPC_PIPE   31   // (int32_t out[2])         0, two connected pipe ends in out
 #define SYS_IPC_PORT_CREATE 32 // (name)                port handle
@@ -83,7 +83,7 @@
 #define SYS_FINFO      51   // (path, SysFileInfo*)     0
 #define SYS_CHMOD      52   // (path, permissions)      0
 #define SYS_SYNC       53   // ()                       0, every file system written out
-#define SYS_ELEVATE    54   // (reason or 0)            0, SYS_SEC_ADMIN granted          (needs SYS_SEC_ELEVATE)
+#define SYS_ELEVATE    54   // (reason or 0, bits or 0) 0, the bits (0: ADMIN) granted    (needs SYS_SEC_ELEVATE)
 #define SYS_ELEVATE_AGENT 55 // (op, id, arg or buf)    by op         (needs ADMIN + INPUT + GFX_SCREEN)
 #define SYS_FORMAT     56   // (device, SysFormatSpec*) 0             (needs FILE_READ; + ADMIN, FILE_WRITE to write)
 #define SYS_SPAWN_TTY  57   // (path, argv or 0, cwd or 0, mask, pipe) process id   (needs EXEC + IPC)
@@ -112,7 +112,14 @@
 #define SYS_UNMOUNT    80   // (device)                 0, synced and gone from /mnt  (needs FILE_WRITE)
 #define SYS_SETPOLICY  81   // (path, policy)           0               (needs ADMIN + FILE_WRITE)
 #define SYS_SETSECURITY 82  // (path, mask)             0               (needs ADMIN + FILE_WRITE)
-#define SYS_COUNT      83
+#define SYS_CLOCK      83   // (uint64_t* ms)           0, milliseconds since 1970 (wall clock); SYS_ENOENT without one
+#define SYS_CLOCK_SET  84   // (const uint64_t* ms)     0, the clock chip and wall clock set   (needs ADMIN)
+#define SYS_NET_RESOLVE 85 // (name, uint32_t* ip, timeout_ms)  0, the host's IPv4 address in *ip   (network, sys_net.h)
+#define SYS_SETWRITESEC 86  // (path, mask)             0, the extra bits writing needs  (needs ADMIN + FILE_WRITE)
+#define SYS_RANDOM     87   // (buf, length)            bytes written (at most SYS_RANDOM_MAX), random bytes for keys
+#define SYS_COUNT      88
+
+#define SYS_RANDOM_MAX 256  // Bytes one SYS_RANDOM call writes at most
 
 #define SYS_OK               0
 #define SYS_ENOSYS          -1  // Unknown syscall number
@@ -180,9 +187,10 @@
 //   SYS_SEC_EXEC         start other programs: spawn, spawn_tty (with
 //                        SYS_SEC_IPC)
 //   SYS_SEC_ADMIN        configure security masks: SYS_SEC_SET on any
-//                        process (itself included) and SYS_SEC_GET on other
+//                        process (any process may only drop bits of its
+//                        own without it) and SYS_SEC_GET on other
 //                        processes; create ports named "sys.*"
-//   SYS_SEC_ELEVATE      ask the user for SYS_SEC_ADMIN: SYS_ELEVATE (see
+//   SYS_SEC_ELEVATE      ask the user for SYS_SEC_ADMIN or other bits: SYS_ELEVATE (see
 //                        "Elevation" below). Leave it out of a child's mask
 //                        to keep it from ever asking.
 //   SYS_SEC_NET          the network: sock_listen, sock_connect,
@@ -190,6 +198,11 @@
 //                        sock_info. Listening on a port below 1024 needs
 //                        SYS_SEC_ADMIN too. Not in a default mask: a program
 //                        reaches the network only when it is given this bit.
+//   SYS_SEC_NET_CONFIG   change the network itself: join or leave a Wi-Fi
+//                        network (/dev/wlanN connect, disconnect), on top
+//                        of SYS_SEC_NET. Only the network tray (netsrv) has
+//                        it, so a program that only talks over the network
+//                        can't move the machine onto another one.
 //
 // Always allowed: exit, yield, sleep, getpid, sbrk, close, seek, getcwd, gethome, time,
 // ipc_close, ipc_info, sock_close, SYS_SEC_GET on the caller itself, ioctl, and read / write
@@ -228,26 +241,32 @@
 #define SYS_SEC_ADMIN       0x00000100u
 #define SYS_SEC_ELEVATE     0x00000200u
 #define SYS_SEC_NET         0x00000400u
+#define SYS_SEC_NET_CONFIG  0x00000800u
 
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | \
                              SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | SYS_SEC_IPC | \
                              SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN | \
-                             SYS_SEC_ELEVATE | SYS_SEC_NET)
+                             SYS_SEC_ELEVATE | SYS_SEC_NET | SYS_SEC_NET_CONFIG)
 
 //
 // Elevation
 //
-// SYS_ELEVATE(reason) asks the user to give the calling process
-// SYS_SEC_ADMIN. Needs SYS_SEC_ELEVATE. The call blocks until the user
-// answers, at most SYS_ELEVATE_TIMEOUT_MS.
+// SYS_ELEVATE(reason, bits) asks the user to give the calling process
+// `bits`. Needs SYS_SEC_ELEVATE. The call blocks until the user answers, at
+// most SYS_ELEVATE_TIMEOUT_MS.
 //
 //   reason   0, or a short NUL-terminated note shown under the prompt as
 //            the program's own words (at most SYS_ELEVATE_REASON_MAX - 1
 //            bytes are kept; anything but printable ASCII shows as '?')
+//   bits     the SYS_SEC_* bits wanted (SYS_SEC_NET for the network); 0
+//            means SYS_SEC_ADMIN. The prompt lists the ones the caller
+//            lacks, and only those are granted. An administrator gets them
+//            without a prompt.
 //
-// Returns SYS_OK once SYS_SEC_ADMIN is in the caller's mask (at once when it
-// already was), or:
+// Returns SYS_OK once every bit is in the caller's mask (at once when they
+// already were), or:
+//   SYS_EINVAL     bits outside SYS_SEC_VALID
 //   SYS_EACCES     the user chose Cancel
 //   SYS_ETIMEDOUT  no answer in time
 //   SYS_EAGAIN     no desktop is running to ask the user
@@ -262,6 +281,9 @@
 // program's name and executable path as the kernel knows them, not as the
 // program tells them. The grant is made by the kernel on the requesting
 // thread itself, after the agent's answer.
+//
+// "Elevated" below means SYS_SEC_ADMIN came from the prompt (bits that
+// don't include it don't make a process elevated).
 //
 // An elevated process is an administrator like any other, with two limits:
 // a child it starts with SYS_SPAWN_INHERIT does not inherit SYS_SEC_ADMIN
@@ -932,7 +954,14 @@ typedef struct {
 // SYS_SEC_VALID, or a change to a bit the object's policy doesn't hold
 // (set or clear), are SYS_EINVAL; bits already set outside it may stay.
 //
-// Both need SYS_SEC_ADMIN and SYS_SEC_FILE_WRITE (programs ask the user
+// SYS_SETWRITESEC(path, mask) replaces the extra bits writing needs on top
+// of the security mask (SysFileInfo.write_security): writing, creating or
+// removing inside a folder, renaming, moving or changing permissions needs
+// security | write_security. 0: writing needs what reading needs. Bits
+// outside SYS_SEC_VALID are SYS_EINVAL. Only that object; new objects take
+// their folder's.
+//
+// All three need SYS_SEC_ADMIN and SYS_SEC_FILE_WRITE (programs ask the user
 // with SYS_ELEVATE first), and what SYS_CHMOD needs (SYS_EBUSY, SYS_EACCES
 // as there) except clearance for the object itself: an admin may change
 // the security of a file it can't open ("network", "system"), and require
@@ -946,10 +975,11 @@ typedef struct {
 #define SYS_FINFO_COUNTING  0x0008  // DEVICE: still counting the used space; device_used is 0
                                     // and device_percent how far it got. Ask again in a moment.
 #define SYS_FINFO_CONSOLE   0x0010  // Only without ACCESS, for an executable file: the program
+#define SYS_FINFO_WRITE     0x0040  // The caller's clearance covers writing it (security | write_security)
 #define SYS_FINFO_WINDOWED  0x0020  // kind its ".os.kind" marks say (os/process.h), so a launcher
                                     // that can't read it knows how to start it elevated
 
-// Filled by SYS_FINFO. 32 bytes.
+// Filled by SYS_FINFO. 40 bytes.
 typedef struct {
     uint32_t security;          // SYS_SEC_* bits the file requires (0: anyone)
     uint32_t flags;             // SYS_FINFO_*
@@ -959,6 +989,8 @@ typedef struct {
     uint32_t device_capacity_hi;
     uint32_t device_percent;    // DEVICE + COUNTING: how much has been counted (0..99)
     uint32_t policy;            // SYS_POLICY_*: the group policy it belongs to (0: none)
+    uint32_t write_security;    // SYS_SEC_* bits writing needs on top of `security` (0: the same as reading)
+    uint32_t reserved;          // 0
 } SysFileInfo;
 
 // Group policies (SysFileInfo.policy, SYS_SETPOLICY). The kernel's table,
@@ -1178,6 +1210,17 @@ typedef struct {
 #define SYS_SOCK_WAIT_MAX           16          // Items per SYS_SOCK_WAIT
 #define SYS_SOCK_WAIT_FOREVER       0xFFFFFFFFu
 #define SYS_SOCK_PORT_PRIVILEGED    1024
+
+// SYS_NET_RESOLVE(name, uint32_t* ip, timeout_ms): the IPv4 address of a
+// host name ("www.example.com", at most SYS_NET_NAME_MAX bytes), asked of
+// the DNS server DHCP gave (else the gateway). A dotted address and
+// "localhost" are answered at once. Blocks up to timeout_ms (0 or more than
+// SYS_NET_RESOLVE_TIMEOUT_MAX: that maximum). Needs SYS_SEC_NET.
+// SYS_ENOENT no such host (or no IPv4 address for it), SYS_ETIMEDOUT no
+// answer, SYS_ENETDOWN no interface with an address, SYS_EINVAL not a
+// host name, SYS_EIO the server failed the query.
+#define SYS_NET_NAME_MAX            253
+#define SYS_NET_RESOLVE_TIMEOUT_MAX 15000
 
 // SysSockWaitItem.events / .ready, SysSockInfo.flags
 #define SYS_SOCK_READABLE       0x0001  // Data, the peer's close (recv says 0), or an error

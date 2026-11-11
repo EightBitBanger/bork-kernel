@@ -612,36 +612,11 @@ static const struct NetIfOps athn_net_ops = {
 // Binding
 //
 
-// "AR9485 rev 1, SREV 0x..." and friends, for the log
+// One boot line: manufacturer, chip, revision ("Atheros AR9485 rev 1")
 static void athn_log_identity(const struct AthnAdapter* a) {
-    char line[112];
-    snprintf(line, sizeof(line), "%s: AR9485 rev %u at pci %u:%02x.%u (SREV 0x%08x)",
-             wlan_dev_name(a->wlan), (unsigned)a->chip.mac_rev, (unsigned)a->pci_bus,
-             (unsigned)a->pci_dev, (unsigned)a->pci_func, (unsigned)a->chip.srev);
-    athn_log(line);
-
-    if (a->chip.rom_ok) {
-        char gpio[32] = "";
-        if (a->chip.rfsilent)
-            snprintf(gpio, sizeof(gpio), ", wireless switch on GPIO %u", (unsigned)a->chip.rfsilent_pin);
-        snprintf(line, sizeof(line), "%s: ROM in %s (%u bytes, %u block%s), %uT%uR%s",
-                 wlan_dev_name(a->wlan), a->chip.rom_otp ? "OTP" : "EEPROM", (unsigned)a->chip.rom_size,
-                 (unsigned)a->chip.rom_blocks, a->chip.rom_blocks == 1 ? "" : "s",
-                 (unsigned)a->chip.txmask, (unsigned)a->chip.rxmask, gpio);
-        athn_log(line);
-    } else {
-        snprintf(line, sizeof(line), "%s: no ROM found: MAC address unknown", wlan_dev_name(a->wlan));
-        athn_log(line);
-    }
-    if (a->chip.mac_valid) {
-        const uint8_t* m = a->chip.mac;
-        snprintf(line, sizeof(line), "%s: MAC %02x:%02x:%02x:%02x:%02x:%02x", wlan_dev_name(a->wlan),
-                 m[0], m[1], m[2], m[3], m[4], m[5]);
-        athn_log(line);
-    } else if (a->chip.rom_ok) {
-        snprintf(line, sizeof(line), "%s: the ROM has no usable MAC address", wlan_dev_name(a->wlan));
-        athn_log(line);
-    }
+    char line[48];
+    snprintf(line, sizeof(line), "Atheros AR9485 rev %u\n", (unsigned)a->chip.mac_rev);
+    print(line);
 }
 
 // Stop the card touching memory: receive off, chip asleep, no bus master

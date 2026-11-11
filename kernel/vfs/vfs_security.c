@@ -9,6 +9,16 @@
 // bit of the object's mask, so a user program (SYS_SEC_ADMIN clear) cannot
 // touch an object marked VFS_SECURITY_ADMIN.
 //
+// Writing has its own clearance on top: FsNodeAttr.write_security, the
+// extra bits a caller needs to write the object, create or remove anything
+// in a directory, rename or move it, or change its permissions. The full
+// write requirement is (security | write_security), so whoever may write
+// may also read, and 0 (every volume made before the field existed) means
+// writing needs what reading needs. A folder everyone may read but only an
+// administrator may change (<home>/sys) has the user mask and
+// write_security = SYS_SEC_ADMIN. New objects inherit both from their
+// directory.
+//
 // As with Unix search permission, a directory's mask also covers the way
 // through it: path resolution (vfs_parse.c) refuses to look anything up in a
 // directory the caller is not cleared for, so whatever is inside is out of
@@ -57,9 +67,31 @@ static bool vfs_fs_node_security(struct FsMount* mount, uint64_t address, uint32
     return true;
 }
 
+// What writing a live object on `mount` needs (security | write_security)
+static bool vfs_fs_node_write_security(struct FsMount* mount, uint64_t address, uint32_t* required) {
+    if (mount == NULL || address == FS_NODE_NULL || address == 0)
+        return false;
+    FsNodeAttr attr;
+    if (!mount->type->get_attr(mount, address, &attr))
+        return false;
+    *required = attr.security | attr.write_security;
+    return true;
+}
+
 //
 // Internal checks (caller holds the VFS lock)
 //
+
+bool vfs_fs_node_write_allowed(struct FsMount* mount, uint64_t address) {
+    uint32_t clearance = vfs_caller_clearance();
+    if (clearance == VFS_CLEARANCE_ALL)
+        return true;
+
+    uint32_t required;
+    if (!vfs_fs_node_write_security(mount, address, &required))
+        return true;
+    return vfs_clearance_covers(clearance, required);
+}
 
 bool vfs_fs_node_allowed(struct FsMount* mount, uint64_t address) {
     uint32_t clearance = vfs_caller_clearance();
@@ -88,7 +120,7 @@ static bool vfs_subtree_allowed(struct FsMount* mount, uint64_t dir, uint32_t cl
             continue;
 
         uint32_t required;
-        if (!vfs_fs_node_security(mount, child, &required))
+        if (!vfs_fs_node_write_security(mount, child, &required))
             continue;
         if (!vfs_clearance_covers(clearance, required))
             return false;
@@ -102,13 +134,15 @@ static bool vfs_subtree_allowed(struct FsMount* mount, uint64_t dir, uint32_t cl
     return true;
 }
 
+// Removing, renaming or moving changes the object and the way to all it
+// holds: write clearance for each of them
 bool vfs_remove_allowed(struct FsMount* mount, uint64_t address) {
     uint32_t clearance = vfs_caller_clearance();
     if (clearance == VFS_CLEARANCE_ALL)
         return true;
 
     uint32_t required;
-    if (!vfs_fs_node_security(mount, address, &required))
+    if (!vfs_fs_node_write_security(mount, address, &required))
         return true;
     if (!vfs_clearance_covers(clearance, required))
         return false;
@@ -164,18 +198,31 @@ bool vfs_path_allowed(const char* path) {
     return vfs_fs_node_allowed(mount, address);
 }
 
-bool vfs_parent_allowed(const char* path) {
+bool vfs_path_write_allowed(const char* path) {
     if (vfs_caller_clearance() == VFS_CLEARANCE_ALL)
         return true;
     if (!vfs_path_fits(path))
         return true;
+    if (!vfs_ancestors_allowed(path))
+        return false;
 
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address))
+        return true;
+
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount == NULL)
+        return true;
+    return vfs_fs_node_write_allowed(mount, address);
+}
+
+// The directory holding `path` into parent. False when there is none.
+static bool vfs_parent_path(const char* path, char parent[VFS_PATH_MAX]) {
     // The parent's own path, so its context is looked up for the parent
     // (a device's root sits in a kernel folder)
-    char parent[VFS_PATH_MAX];
     const char* slash = strrchr(path, '/');
     if (slash == NULL)
-        return true;
+        return false;
     if (slash == path) {
         parent[0] = '/';
         parent[1] = '\0';
@@ -184,7 +231,29 @@ bool vfs_parent_allowed(const char* path) {
         memcpy(parent, path, length);     // Shorter than path: fits
         parent[length] = '\0';
     }
+    return true;
+}
+
+bool vfs_parent_allowed(const char* path) {
+    if (vfs_caller_clearance() == VFS_CLEARANCE_ALL)
+        return true;
+    if (!vfs_path_fits(path))
+        return true;
+    char parent[VFS_PATH_MAX];
+    if (!vfs_parent_path(path, parent))
+        return true;
     return vfs_path_allowed(parent);
+}
+
+bool vfs_parent_write_allowed(const char* path) {
+    if (vfs_caller_clearance() == VFS_CLEARANCE_ALL)
+        return true;
+    if (!vfs_path_fits(path))
+        return true;
+    char parent[VFS_PATH_MAX];
+    if (!vfs_parent_path(path, parent))
+        return true;
+    return vfs_path_write_allowed(parent);
 }
 
 //
@@ -201,6 +270,20 @@ bool vfs_check_access(const char* path) {
 bool vfs_check_parent_access(const char* path) {
     vfs_lock();
     bool result = vfs_parent_allowed(path);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_check_write_access(const char* path) {
+    vfs_lock();
+    bool result = vfs_path_write_allowed(path);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_check_parent_write_access(const char* path) {
+    vfs_lock();
+    bool result = vfs_parent_write_allowed(path);
     vfs_unlock();
     return result;
 }
@@ -240,6 +323,56 @@ static bool do_set_security(const char* path, uint32_t security) {
     if (mount == NULL || mount->type->set_security == NULL)
         return false;   // The filesystem cannot store a mask
     return mount->type->set_security(mount, address, security);
+}
+
+static bool do_get_write_security(const char* path, uint32_t* security) {
+    if (!vfs_path_fits(path) || security == NULL)
+        return false;
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address))
+        return false;
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount == NULL || address == FS_NODE_NULL || address == 0)
+        return false;
+    FsNodeAttr attr;
+    if (!mount->type->get_attr(mount, address, &attr))
+        return false;
+    *security = attr.write_security;
+    return true;
+}
+
+// The same rule as the read mask, on the whole write requirement: an
+// administrator may set any; anyone else must be cleared to write the
+// object now and hold every bit it would need afterwards
+static bool do_set_write_security(const char* path, uint32_t security) {
+    uint32_t read = 0, old = 0;
+    if (!do_get_security(path, &read) || !do_get_write_security(path, &old))
+        return false;
+
+    if (!vfs_parent_allowed(path) || !vfs_security_change_allowed(read | old, read | security))
+        return false;
+    if (old == security)
+        return true;
+
+    uint64_t address = resolve_path_to_address(path);
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount == NULL || mount->type->set_write_security == NULL)
+        return false;   // The filesystem cannot store one
+    return mount->type->set_write_security(mount, address, security);
+}
+
+bool vfs_get_write_security(const char* path, uint32_t* security) {
+    vfs_lock();
+    bool result = do_get_write_security(path, security);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_set_write_security(const char* path, uint32_t security) {
+    vfs_lock();
+    bool result = do_set_write_security(path, security);
+    vfs_unlock();
+    return result;
 }
 
 bool vfs_get_security(const char* path, uint32_t* security) {

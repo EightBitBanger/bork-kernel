@@ -9,6 +9,7 @@
 #include <kernel/syscall/calls/sys_procfile.h>
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/syscall/calls/sys_security.h>
+#include <kernel/syscall/calls/sys_write.h>
 #include <kernel/vfs/vfs.h>
 #include <kernel/security/policy.h>
 #include <kernel/scheduler/process.h>
@@ -20,7 +21,7 @@
 // "File details")
 //
 
-_Static_assert(sizeof(SysFileInfo) == 32, "SysFileInfo is part of the user ABI");
+_Static_assert(sizeof(SysFileInfo) == 40, "SysFileInfo is part of the user ABI");
 _Static_assert(SYS_POLICY_NONE == POLICY_NONE && SYS_POLICY_USER == POLICY_USER &&
                SYS_POLICY_ADMIN == POLICY_ADMIN && SYS_POLICY_SYSTEM == POLICY_SYSTEM &&
                SYS_POLICY_NETWORK == POLICY_NETWORK, "SYS_POLICY_* must match POLICY_*");
@@ -89,7 +90,7 @@ static int32_t sys_chmod_refusal(const char* path) {
         return SYS_EBUSY;
     if (!sys_security_allows(SYS_SEC_FILE_WRITE))
         return SYS_EPERM;
-    if (!vfs_check_access(path) || !vfs_check_parent_access(path))
+    if (!vfs_check_access(path) || !vfs_check_parent_access(path) || sys_write_check(path, false) != SYS_OK)
         return SYS_EACCES;
 
     // As the kernel properties window had it: only in a writable folder
@@ -201,11 +202,16 @@ static int32_t sys_finfo_locked(SysProcessFiles* t, const SyscallArgs* args) {
     uint32_t mask = 0;
     if (sys_finfo_get_security(path, &mask))
         info.security = mask & VFS_CLEARANCE_ALL;
+    uint32_t write_mask = 0;
+    if (vfs_get_write_security(path, &write_mask))
+        info.write_security = write_mask;
     uint32_t policy = POLICY_NONE;
     if (vfs_get_policy(path, &policy))
         info.policy = policy;
     if (vfs_check_access(path))
         info.flags |= SYS_FINFO_ACCESS;
+    if (vfs_check_access(path) && vfs_check_write_access(path))
+        info.flags |= SYS_FINFO_WRITE;
     if (sys_chmod_refusal(path) == SYS_OK)
         info.flags |= SYS_FINFO_CHMOD;
     bool device = vfs_directory_check_mounted(path);
@@ -333,6 +339,31 @@ static int32_t sys_setsecurity_locked(SysProcessFiles* t, const SyscallArgs* arg
 
 static int32_t sys_setsecurity(const SyscallArgs* args) {
     return sys_files_call(sys_setsecurity_locked, args);
+}
+
+static int32_t sys_setwritesec_locked(SysProcessFiles* t, const SyscallArgs* args) {
+    uint32_t mask = args->arg2;
+    if ((mask & ~SYS_SEC_VALID) != 0)
+        return SYS_EINVAL;
+
+    char path[SYS_PATH_MAX];
+    int32_t result = sys_user_path(process_current_space(), t->cwd, args->arg1, path);
+    if (result < 0)
+        return result;
+
+    uint32_t old_mask = 0, old_write = 0;
+    vfs_lock();
+    result = sys_secure_refusal(path, 0, true, &old_mask);
+    if (result == SYS_OK && !vfs_get_write_security(path, &old_write))
+        result = SYS_EACCES;    // A file system that keeps no write mask
+    if (result == SYS_OK && mask != old_write && !vfs_set_write_security(path, mask))
+        result = SYS_EIO;
+    vfs_unlock();
+    return result;
+}
+
+static int32_t sys_setwritesec(const SyscallArgs* args) {
+    return sys_files_call(sys_setwritesec_locked, args);
 }
 
 #endif

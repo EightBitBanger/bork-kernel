@@ -51,7 +51,9 @@ static int32_t sys_sec_get(const SyscallArgs* args) {
 //
 // sec_set(pid or 0, mask) -> previous mask
 //
-// syscall_dispatch() has already required SYS_SEC_ADMIN of the caller.
+// Needs SYS_SEC_ADMIN, except for a process only giving up bits of its
+// own (the new mask within its current one): a program that got just the
+// network bit from the prompt can still shed what it doesn't need.
 // Admin from SYS_ELEVATE does not reach the desktop that answers the
 // prompts (the elevation agent): taking its rights away and registering in
 // its place would let an elevated program answer every later prompt itself.
@@ -65,12 +67,22 @@ static int32_t sys_sec_set(const SyscallArgs* args) {
         return SYS_EINVAL;
     if (target <= 0)
         return SYS_ESRCH;
+    bool dropping = target == process_current_id() && (mask & ~process_current_security()) == 0;
+    if (!dropping && !sys_security_allows(SYS_SEC_ADMIN))
+        return SYS_EPERM;
     if (elevate_is_agent(target) && target != process_current_id() && process_current_elevated())
         return SYS_EPERM;
 
     ProcessSecurity previous = 0;
+    // Admin handed on by an elevated process stays "elevated": otherwise it
+    // could start a child without admin and raise it to admin unmarked,
+    // past the limits on elevated processes (the agent and its mask)
+    bool mark = process_current_elevated() && target != process_current_id() && (mask & SYS_SEC_ADMIN);
     switch (ProcessSetSecurity(target, mask, &previous)) {
-        case PROCESS_OK:              return (int32_t)previous;
+        case PROCESS_OK:
+            if (mark && ProcessGrantSecurity(target, 0, true) != PROCESS_OK)
+                return SYS_ESRCH;
+            return (int32_t)previous;
         case PROCESS_ERR_INVALID_ARG: return SYS_EINVAL;
         default:                      return SYS_ESRCH;
     }

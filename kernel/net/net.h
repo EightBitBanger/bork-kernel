@@ -13,6 +13,7 @@
 //   udp.c      UDP sockets for kernel code
 //   dhcp.c     DHCP client: addresses an interface once its link comes up
 //   tcp.c      TCP connections for kernel code (and the socket calls)
+//   dns.c      DNS stub resolver: host name -> IPv4 address
 //
 // No forwarding, no fragment reassembly (fragments are dropped), no IP
 // options (skipped, never acted on).
@@ -56,6 +57,7 @@
 #define NET_ERR_REFUSED     (-10)   // TCP: the peer answered with a reset
 #define NET_ERR_RESET       (-11)   // TCP: the connection was reset
 #define NET_ERR_CLOSED      (-12)   // TCP: not connected (any more)
+#define NET_ERR_NOTFOUND    (-13)   // DNS: no such name, or it has no IPv4 address
 
 //
 // Interfaces (drivers)
@@ -89,7 +91,7 @@ struct NetIf {
     uint32_t ip;                    // 0: none
     uint32_t netmask;
     uint32_t gateway;               // 0: none
-    uint32_t dns;                   // From DHCP, 0: none (nothing uses it yet)
+    uint32_t dns;                   // From DHCP, 0: none (dns.c asks the gateway then)
     struct NetIfStats stats;
 
     const struct NetIfOps* ops;
@@ -209,6 +211,22 @@ void tcp_endpoints(struct TcpSocket* s, uint32_t* local_ip, uint16_t* local_port
 // Let go of it: an orderly close (FIN) when everything was read, a reset
 // otherwise. The stack finishes the close and frees it; never use `s` again.
 void tcp_close(struct TcpSocket* s);
+
+//
+// DNS
+//
+
+#define DNS_NAME_MAX        254     // Bytes of a host name, terminator included
+
+// The IPv4 address of host `name` ("www.example.com"), asked of the DNS
+// server DHCP gave (else the gateway). A dotted address ("10.0.0.1") and
+// "localhost" are answered at once. Blocks, sleeping, up to timeout_ms;
+// `cancel` (may be NULL) is asked every slice and ends the wait early when
+// it says true. Returns NET_OK, NET_ERR_PARAM (not a host name),
+// NET_ERR_DOWN (no interface with an address), NET_ERR_NOTFOUND (no such
+// name, or no IPv4 address for it), NET_ERR_TIMEOUT, NET_ERR_IO (the server
+// failed the query) or NET_ERR_NOMEM. Not with the net lock held.
+int dns_resolve(const char* name, uint32_t* out, uint32_t timeout_ms, bool (*cancel)(void));
 
 //
 // Setup and helpers
