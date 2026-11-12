@@ -424,21 +424,47 @@ void hda_codec_stream(struct HdaController* hc, hda_verb_fn verb, struct HdaCode
     }
 }
 
+// The amps on a path other than the volume one, at 0 dB or muted. The
+// volume amp often can't mute (the ALC269's DACs have steps and no mute
+// bit; the mute is on the mixer input and the pin), so mute goes on every
+// amp along the way that can.
+static void codec_path_quiet(struct HdaController* hc, hda_verb_fn verb, struct HdaCodec* c,
+                             const struct HdaPath* p, bool quiet) {
+    for (uint32_t k = 0; k < p->length; k++) {
+        uint8_t nid = p->nid[k];
+        const struct HdaWidget* w = &c->w[nid];
+        uint32_t type = HDA_WCAP_TYPE(w->caps);
+        bool last = (k + 1 == p->length);
+        if (!last && (w->caps & HDA_WCAP_IN_AMP)) {
+            // The input the path takes, as hda_codec_setup set it
+            uint8_t index = (type == HDA_WIDGET_MIXER || w->conn_count > 1) ? p->sel[k] : 0;
+            uint32_t caps = w->amp_in_caps;
+            uint32_t gm = codec_amp_0db(caps);
+            if (quiet && (caps & HDA_AMPCAP_MUTE))
+                gm |= HDA_AMP_MUTE;
+            codec_set_amp(hc, verb, c, nid, false, index, gm);
+        }
+        if ((w->caps & HDA_WCAP_OUT_AMP) && nid != p->vol_nid) {
+            uint32_t caps = w->amp_out_caps;
+            uint32_t gm = codec_amp_0db(caps);
+            if (quiet && (caps & HDA_AMPCAP_MUTE))
+                gm |= HDA_AMP_MUTE;
+            codec_set_amp(hc, verb, c, nid, true, 0, gm);
+        }
+    }
+}
+
 void hda_codec_volume(struct HdaController* hc, hda_verb_fn verb, struct HdaCodec* c,
                       uint8_t left, uint8_t right, bool mute) {
     if (left > 100)  left = 100;
     if (right > 100) right = 100;
+    bool silent = mute || (left == 0 && right == 0);
     for (uint32_t i = 0; i < c->out_count; i++) {
         struct HdaPath* p = &c->out[i];
+        codec_path_quiet(hc, verb, c, p, silent);
         uint8_t nid = p->vol_nid;
-        if (nid == 0) {
-            // No steps anywhere: the pin's own mute is all there is
-            const struct HdaWidget* pw = &c->w[p->nid[0]];
-            if (pw->caps & HDA_WCAP_OUT_AMP)
-                codec_set_amp(hc, verb, c, p->nid[0], true, 0,
-                              (mute || (left == 0 && right == 0)) ? HDA_AMP_MUTE : codec_amp_0db(pw->amp_out_caps));
-            continue;
-        }
+        if (nid == 0)
+            continue;               // No steps anywhere: the mutes above are all there is
         uint32_t caps = c->w[nid].amp_out_caps;
         uint32_t top  = codec_amp_0db(caps);
         if (top == 0)
@@ -448,7 +474,7 @@ void hda_codec_volume(struct HdaController* hc, hda_verb_fn verb, struct HdaCode
             uint32_t v = side_vol[side];
             uint32_t g = (top * v + 50) / 100;
             uint32_t payload = HDA_AMP_OUT | (side == 0 ? HDA_AMP_LEFT : HDA_AMP_RIGHT) | HDA_AMP_GAIN(g);
-            if (mute || v == 0)
+            if ((mute || v == 0) && (caps & HDA_AMPCAP_MUTE))
                 payload |= HDA_AMP_MUTE;
             codec_cmd(hc, verb, VERB4(c->addr, nid, HDA_SET_AMP, payload));
         }
