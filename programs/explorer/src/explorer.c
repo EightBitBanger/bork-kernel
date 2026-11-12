@@ -42,6 +42,11 @@
  * pointer, else the folder the window shows. Dragged
  * with the right button, the drop asks first: Move here / Copy here /
  * Cancel.
+ *
+ * Sort By (the folder's right-click menu) orders the contents by name,
+ * type, size or date modified, ascending or descending, folders first
+ * either way. The choice, and the size of the last window closed (new
+ * windows open at it), are kept in the registry under EXPLORER_KEY.
  */
 
 #include <ctype.h>
@@ -54,6 +59,7 @@
 #include <os/filetype.h>
 #include <os/os.h>
 #include <os/process.h>
+#include <os/registry.h>
 #include <os/resource.h>
 #include <os/security.h>
 #include <os/wm_app.h>     // Not on the desktop: says so and exits before main()
@@ -342,14 +348,116 @@ int explorer_find_item(const explorer_t* s, const char* name) {
     return -1;
 }
 
-// Folders (and devices) first, then files, each by name ignoring case
+//
+// Settings (EXPLORER_KEY)
+//
+
+sort_key_t explorer_sort_key        = SORT_NAME;
+bool       explorer_sort_descending = false;
+
+static const char* const sort_names[] = { "name", "type", "size", "date" };
+#define SORT_ORDER_ASCENDING    "ascending"
+#define SORT_ORDER_DESCENDING   "descending"
+
+void explorer_load_settings(void) {
+    char text[16];
+    if (os_reg_get_string(EXPLORER_KEY, "sort", text, sizeof(text)) == 0) {
+        for (size_t i = 0; i < sizeof(sort_names) / sizeof(sort_names[0]); i++)
+            if (strcasecmp(text, sort_names[i]) == 0)
+                explorer_sort_key = (sort_key_t)i;
+    }
+    if (os_reg_get_string(EXPLORER_KEY, "order", text, sizeof(text)) == 0)
+        explorer_sort_descending = strcasecmp(text, SORT_ORDER_DESCENDING) == 0;
+}
+
+// A whole number in a string value, false if missing or not one
+static bool read_number(const char* name, int32_t* out) {
+    char text[16];
+    if (os_reg_get_string(EXPLORER_KEY, name, text, sizeof(text)) < 0)
+        return false;
+    char* end;
+    long v = strtol(text, &end, 10);
+    if (end == text || *end != '\0' || v <= 0 || v > 16384)
+        return false;
+    *out = (int32_t)v;
+    return true;
+}
+
+static void write_number(const char* name, int32_t value) {
+    char text[16];
+    snprintf(text, sizeof(text), "%d", (int)value);
+    os_reg_set_string(EXPLORER_KEY, name, text);
+}
+
+// The size new windows open at: the last one closed, kept on the screen
+static void window_size(int32_t* w, int32_t* h) {
+    *w = WINDOW_WIDTH;
+    *h = WINDOW_HEIGHT;
+    int32_t rw, rh;
+    if (read_number("width", &rw) && read_number("height", &rh)) {
+        *w = rw;
+        *h = rh;
+    }
+    int32_t sw = 0, sh = 0;
+    wm_screen_size(&sw, &sh);
+    if (sw > 0 && *w > sw) *w = sw;
+    if (sh > 0 && *h > sh) *h = sh;
+    if (*w < WINDOW_MIN_WIDTH)  *w = WINDOW_MIN_WIDTH;
+    if (*h < WINDOW_MIN_HEIGHT) *h = WINDOW_MIN_HEIGHT;
+}
+
+void explorer_save_size(const explorer_t* s) {
+    if (s->win_width < WINDOW_MIN_WIDTH || s->win_height < WINDOW_MIN_HEIGHT)
+        return;
+    int32_t w, h;
+    if (read_number("width", &w) && read_number("height", &h) &&
+        w == s->win_width && h == s->win_height)
+        return;                 // Unchanged: no need to write the hive again
+    write_number("width", s->win_width);
+    write_number("height", s->win_height);
+}
+
+void explorer_set_sort(explorer_t* s, sort_key_t key, bool descending) {
+    if (key == explorer_sort_key && descending == explorer_sort_descending)
+        return;
+    explorer_sort_key = key;
+    explorer_sort_descending = descending;
+    explorer_refresh_all();     // Re-read and re-sort, selection kept by name
+
+    if (os_reg_set_string(EXPLORER_KEY, "sort", sort_names[key]) < 0 ||
+        os_reg_set_string(EXPLORER_KEY, "order",
+                          descending ? SORT_ORDER_DESCENDING : SORT_ORDER_ASCENDING) < 0)
+        explorer_notify(s, NOTICE_LONG_MS, "Sorted, but the choice could not be saved: %s",
+                        strerror(errno));
+}
+
+static int compare_names(const struct Item* x, const struct Item* y) {
+    int c = strcasecmp(x->name, y->name);
+    return c != 0 ? c : strcmp(x->name, y->name);
+}
+
+static int compare_u32(uint32_t a, uint32_t b) {
+    return (a > b) - (a < b);
+}
+
+// Folders (and devices) first, then files, each by the sort key (ties by
+// name ignoring case); descending turns the key's order around
 static int compare_items(const void* a, const void* b) {
     const struct Item* x = (const struct Item*)a;
     const struct Item* y = (const struct Item*)b;
     if (x->is_dir != y->is_dir)
         return x->is_dir ? -1 : 1;
-    int c = strcasecmp(x->name, y->name);
-    return c != 0 ? c : strcmp(x->name, y->name);
+
+    int c = 0;
+    switch (explorer_sort_key) {
+        case SORT_NAME: c = compare_names(x, y);                    break;
+        case SORT_TYPE: c = strcasecmp(x->type, y->type);           break;  // "" for folders
+        case SORT_SIZE: c = compare_u32(x->size, y->size);          break;  // 0 for folders
+        case SORT_DATE: c = compare_u32(x->modified, y->modified);  break;
+    }
+    if (c != 0)
+        return explorer_sort_descending ? -c : c;
+    return compare_names(x, y);
 }
 
 // Where the path text turns into the mount color: just before the first
@@ -413,6 +521,7 @@ static void populate(explorer_t* s) {
         item->icon = -1;
         item->type[0] = '\0';
         item->size = item->is_dir ? 0 : st.size;
+        item->modified = st.modified;
         if (!item->is_dir && joined) {
             filetype_info_t t;
             filetype_lookup(path, &t);
@@ -428,13 +537,22 @@ static void populate(explorer_t* s) {
         explorer_notify(s, NOTICE_LONG_MS, "Showing the first %d items", MAX_ITEMS);
 }
 
+void explorer_drop_hint(explorer_t* s, const char* dir) {
+    if (strcmp(s->drop_hint, dir) == 0)
+        return;
+    strlcpy(s->drop_hint, dir, sizeof(s->drop_hint));
+    wm_set_drop_folder(s->handle, dir);
+}
+
 static void set_title(explorer_t* s) {
     if (strcmp(s->full_path, "/") == 0)
         strlcpy(s->window_title, "/", sizeof(s->window_title));
     else
         strlcpy(s->window_title, fs_basename(s->full_path), sizeof(s->window_title));
-    if (s->handle != 0)
+    if (s->handle != 0) {
         wm_window_set_title(s->handle, s->window_title);
+        explorer_drop_hint(s, s->full_path);    // The drag plate says Copy from other drives
+    }
 }
 
 bool explorer_navigate(explorer_t* s, const char* path, const char* select_name) {
@@ -553,16 +671,19 @@ static bool launch_system(explorer_t* s, const char* program, const char* arg, c
 
 void explorer_open_file(explorer_t* s, const char* path) {
     SysStat st;
-    bool program = fs_kind(path, &st) == SYS_TYPE_FILE && (st.permissions & SYS_PERM_EXECUTE);
+    bool file = fs_kind(path, &st) == SYS_TYPE_FILE;
+    bool program = file && (st.permissions & SYS_PERM_EXECUTE);
 
     char dir[PATH_MAX];
     fs_parent(path, dir, sizeof(dir));
 
-    // Its type names a program that runs it (a script: the console). Only
-    // a file marked executable is run that way; anything else opens in
-    // notepad below.
+    // Its type names a program that opens it. One that runs the file (a
+    // script: the console) is used only for a file marked executable, a
+    // viewer (an image: paint) for any; anything else opens in notepad
+    // below.
     filetype_info_t type;
-    if (program && filetype_lookup(path, &type) == 0 && type.open[0] != '\0') {
+    if (file && filetype_lookup(path, &type) == 0 && type.open[0] != '\0' &&
+        (program || type.viewer)) {
         if (filetype_open(&type, path, dir, sec_get() & LAUNCH_MASK) < 0) {
             int err = errno;
             if (err == ECANCELED)
@@ -610,6 +731,14 @@ void explorer_open_file(explorer_t* s, const char* path) {
     explorer_notify(s, NOTICE_MS, "Started %s", fs_basename(path));
 }
 
+// Edit: the file in notepad, whatever its type (a program or an image too)
+void explorer_edit_file(explorer_t* s, const char* path) {
+    char dir[PATH_MAX];
+    fs_parent(path, dir, sizeof(dir));
+    if (launch_system(s, "notepad", path, dir))
+        explorer_notify(s, NOTICE_MS, "Editing %s", fs_basename(path));
+}
+
 void explorer_show_properties(explorer_t* s, const char* path) {
     char dir[PATH_MAX];
     fs_parent(path, dir, sizeof(dir));
@@ -641,8 +770,7 @@ explorer_t* explorer_open_window(const char* path) {
     if (s == NULL)
         return NULL;
     s->selected = -1;
-    s->win_width = WINDOW_WIDTH;
-    s->win_height = WINDOW_HEIGHT;
+    window_size(&s->win_width, &s->win_height);
 
     if (!explorer_navigate(s, path, NULL) && !explorer_navigate(s, "/", NULL)) {
         free(s);
@@ -653,7 +781,7 @@ explorer_t* explorer_open_window(const char* path) {
     wm_window_desc_t d = {
         .title = s->window_title,
         .x = WM_POS_DEFAULT, .y = WM_POS_DEFAULT,
-        .width = WINDOW_WIDTH, .height = WINDOW_HEIGHT,
+        .width = s->win_width, .height = s->win_height,
         .min_width = WINDOW_MIN_WIDTH, .min_height = WINDOW_MIN_HEIGHT,
         .style = WM_STYLE_RESIZABLE | WM_STYLE_CONTEXT_MENU,   // Right clicks come here
     };
@@ -665,6 +793,7 @@ explorer_t* explorer_open_window(const char* path) {
         return NULL;
     }
     wm_window_get_size(s->handle, &s->win_width, &s->win_height);
+    explorer_drop_hint(s, s->full_path);
     windows[window_count++] = s;
 
     explorer_draw(s);           // The first commit shows the window
@@ -684,6 +813,7 @@ void explorer_forget_window(explorer_t* s) {
 }
 
 void explorer_close_window(explorer_t* s) {
+    explorer_save_size(s);      // The next window opens at this size
     wm_window_destroy(s->handle);
     explorer_forget_window(s);
 }
@@ -743,6 +873,7 @@ int main(int argc, char** argv) {
 
     load_resources();
     explorer_load_theme();
+    explorer_load_settings();
 
     if (explorer_open_window(start) == NULL) {
         fprintf(stderr, "explorer: can't open a window: %s\n", strerror(errno));

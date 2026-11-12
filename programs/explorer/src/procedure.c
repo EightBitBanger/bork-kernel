@@ -9,6 +9,8 @@
  *                  (Ctrl: adds to it)   Delete      delete the selection (asks first)
  *   double-click   open                 Ctrl+A      select everything
  *   right-click    the dwm's menu       Ctrl+C / Ctrl+X  the selection
+ *                  (on the folder: Sort By opens its submenu beside it, Name /
+ *                  Type / Size / Date Modified, Ascending / Descending)
  *   back button    parent folder
  *   drag an item   drag the selection (dwm drag and drop); with the right
  *                  button the drop asks Move here / Copy here / Cancel
@@ -35,6 +37,7 @@
 #include <os/input.h>
 #include <os/os.h>
 #include <os/process.h>
+#include <os/security.h>
 
 #include "internal.h"
 
@@ -151,6 +154,38 @@ static void start_rename(explorer_t* s, int index) {
     s->dirty = true;
 }
 
+// A change refused for clearance (a folder only an administrator may
+// change): ask the user for what `path` lacks, and if they allow it, true
+// with *got the bits to sec_drop() once the change is retried. False with
+// errno as it was when nothing can be asked or the user said no.
+static bool ask_write_access(const char* what, const char* path, bool entry, sec_mask_t* got) {
+    int err = errno;
+    *got = 0;
+    if (err != EACCES)
+        return false;
+    char reason[96];
+    snprintf(reason, sizeof(reason), "%s %s", what, fs_basename(path));
+    int bits = sec_elevate_write(reason, path, entry);
+    errno = err;
+    if (bits <= 0)
+        return false;
+    *got = (sec_mask_t)bits;
+    return true;
+}
+
+static int rename_with_access(const char* path, const char* name) {
+    if (os_rename(path, name) == 0)
+        return 0;
+    sec_mask_t got;
+    if (!ask_write_access("Rename", path, true, &got))
+        return -1;
+    int r = os_rename(path, name);
+    int err = errno;
+    sec_drop(got);
+    errno = err;
+    return r;
+}
+
 static void finish_rename(explorer_t* s, bool keep) {
     if (!s->renaming)
         return;
@@ -162,7 +197,7 @@ static void finish_rename(explorer_t* s, bool keep) {
 
     char path[PATH_MAX];
     if (fs_join(s->full_path, s->rename_name, path, sizeof(path)) < 0 ||
-        os_rename(path, s->edit.text) < 0) {
+        rename_with_access(path, s->edit.text) < 0) {
         explorer_notify(s, NOTICE_LONG_MS, "Rename: name is invalid, too long or taken");
         return;
     }
@@ -270,32 +305,6 @@ static void transfer(explorer_t* s, char* list, const char* dir, bool copy) {
 // choice back. Ids are action_t + 1 (0 stays unused).
 #define MENU_ID(a)  ((uint32_t)(a) + 1)
 
-// A right-button drop: keep it and ask what to do (MENU_COMMAND finishes it)
-static void ask_drop(explorer_t* s, char* list, const char* dir, int32_t x, int32_t y) {
-    free(s->drop_list);
-    s->drop_list = list;
-    strlcpy(s->drop_dir, dir, sizeof(s->drop_dir));
-    wm_menu_item_t items[] = {
-        { explorer_action_label(ACT_DROP_MOVE),   MENU_ID(ACT_DROP_MOVE),   0 },
-        { explorer_action_label(ACT_DROP_COPY),   MENU_ID(ACT_DROP_COPY),   0 },
-        { NULL,                                   0,                        WM_MENU_SEPARATOR },
-        { explorer_action_label(ACT_DROP_CANCEL), MENU_ID(ACT_DROP_CANCEL), 0 },
-    };
-    s->menu = MENU_DROP;
-    if (wm_menu_show(s->handle, x, y, items, sizeof(items) / sizeof(items[0])) < 0) {
-        s->menu = MENU_NONE;
-        free(s->drop_list);
-        s->drop_list = NULL;
-    }
-}
-
-static void finish_drop(explorer_t* s, action_t a) {
-    if (s->drop_list != NULL && a != ACT_DROP_CANCEL)
-        transfer(s, s->drop_list, s->drop_dir, a == ACT_DROP_COPY);
-    free(s->drop_list);
-    s->drop_list = NULL;
-}
-
 // Any of the '\n'-separated paths in `list` on another drive than `dir`
 static bool from_other_drive(const char* list, const char* dir) {
     char path[PATH_MAX];
@@ -315,6 +324,52 @@ static bool from_other_drive(const char* list, const char* dir) {
     return false;
 }
 
+// A right-button drop: keep it and ask what to do (MENU_COMMAND finishes it).
+// What a left drag would do comes first: Copy here for files from another
+// drive, Move here within one.
+static void ask_drop(explorer_t* s, char* list, const char* dir, int32_t x, int32_t y) {
+    free(s->drop_list);
+    s->drop_list = list;
+    strlcpy(s->drop_dir, dir, sizeof(s->drop_dir));
+    bool copy_first = from_other_drive(list, dir);
+    action_t first = copy_first ? ACT_DROP_COPY : ACT_DROP_MOVE;
+    action_t second = copy_first ? ACT_DROP_MOVE : ACT_DROP_COPY;
+    wm_menu_item_t items[] = {
+        { explorer_action_label(first),           MENU_ID(first),           0 },
+        { explorer_action_label(second),          MENU_ID(second),          0 },
+        { NULL,                                   0,                        WM_MENU_SEPARATOR },
+        { explorer_action_label(ACT_DROP_CANCEL), MENU_ID(ACT_DROP_CANCEL), 0 },
+    };
+    s->menu = MENU_DROP;
+    if (wm_menu_show(s->handle, x, y, items, sizeof(items) / sizeof(items[0])) < 0) {
+        s->menu = MENU_NONE;
+        free(s->drop_list);
+        s->drop_list = NULL;
+    }
+}
+
+static void finish_drop(explorer_t* s, action_t a) {
+    if (s->drop_list != NULL && a != ACT_DROP_CANCEL)
+        transfer(s, s->drop_list, s->drop_dir, a == ACT_DROP_COPY);
+    free(s->drop_list);
+    s->drop_list = NULL;
+}
+
+// Where files let go at (x, y) go: the folder under the pointer, else the
+// one shown
+static void drop_dir_at(explorer_t* s, int32_t x, int32_t y, char* dir, size_t size) {
+    int item = explorer_item_at(s, x, y);
+    if (item < 0 || !s->items[item].is_dir || !explorer_item_path(s, item, dir, size))
+        strlcpy(dir, s->full_path, size);
+}
+
+// Files dragged over the window: the dwm's plate names the folder they'd go into
+static void drag_over(explorer_t* s, const wm_event_t* ev) {
+    char dir[PATH_MAX];
+    drop_dir_at(s, ev->x, ev->y, dir, sizeof(dir));
+    explorer_drop_hint(s, dir);
+}
+
 // Files let go over the window: into the folder under the pointer, else
 // the one shown. Moved within a drive, copied from another one (or with
 // Ctrl held); a right drag asks first.
@@ -329,9 +384,8 @@ static void drop_files(explorer_t* s, const wm_event_t* ev) {
         finish_rename(s, true);
 
     char dir[PATH_MAX];
-    int item = explorer_item_at(s, ev->x, ev->y);
-    if (item < 0 || !s->items[item].is_dir || !explorer_item_path(s, item, dir, sizeof(dir)))
-        strlcpy(dir, s->full_path, sizeof(dir));
+    drop_dir_at(s, ev->x, ev->y, dir, sizeof(dir));
+    explorer_drop_hint(s, s->full_path);    // The drag is over: back to the folder shown
 
     if (ev->button == INPUT_BTN_RIGHT) {
         ask_drop(s, list, dir, ev->x, ev->y);       // Keeps the list
@@ -345,28 +399,40 @@ static void drop_files(explorer_t* s, const wm_event_t* ev) {
 // Context menus
 //
 
-static void add_item(wm_menu_item_t* items, size_t* n, action_t a, bool enabled) {
+// Menu items with room for a submenu (wm_menu_show_tree)
+static void add_item(wm_menu_node_t* items, size_t* n, action_t a, bool enabled) {
+    memset(&items[*n], 0, sizeof(items[*n]));
     items[*n].label = explorer_action_label(a);
     items[*n].id    = MENU_ID(a);
     items[*n].flags = enabled ? 0 : WM_MENU_DISABLED;
     (*n)++;
 }
 
-static void add_separator(wm_menu_item_t* items, size_t* n) {
+static void add_separator(wm_menu_node_t* items, size_t* n) {
+    memset(&items[*n], 0, sizeof(items[*n]));
     items[*n].label = NULL;
     items[*n].id    = 0;
     items[*n].flags = WM_MENU_SEPARATOR;
     (*n)++;
 }
 
+static void add_check(wm_menu_node_t* items, size_t* n, action_t a, bool checked) {
+    add_item(items, n, a, true);
+    if (checked)
+        items[*n - 1].flags |= WM_MENU_CHECKED;
+}
+
 bool explorer_open_menu(explorer_t* s, int item, int32_t x, int32_t y) {
-    wm_menu_item_t items[WM_MENU_MAX_ITEMS];
-    size_t n = 0;
+    wm_menu_node_t items[WM_MENU_MAX_ITEMS];
+    wm_menu_node_t sort[7];     // Sort By's submenu: the current key and order checked
+    size_t n = 0, ns = 0;
 
     if (item >= 0) {
         bool device = (s->items[item].icon_index == ICON_STORAGE);
         bool many = s->picked[item] && explorer_picked_count(s) > 1;
         add_item(items, &n, ACT_OPEN, true);
+        if (!s->items[item].is_dir && !device)
+            add_item(items, &n, ACT_EDIT, true);    // Any file, in notepad
         if (s->items[item].is_dir)
             add_item(items, &n, ACT_OPEN_NEW_WINDOW, true);
         add_separator(items, &n);
@@ -385,7 +451,18 @@ bool explorer_open_menu(explorer_t* s, int item, int32_t x, int32_t y) {
         s->menu = MENU_ITEM;
         strlcpy(s->context_name, s->items[item].name, sizeof(s->context_name));
     } else {
+        add_check(sort, &ns, ACT_SORT_NAME, explorer_sort_key == SORT_NAME);
+        add_check(sort, &ns, ACT_SORT_TYPE, explorer_sort_key == SORT_TYPE);
+        add_check(sort, &ns, ACT_SORT_SIZE, explorer_sort_key == SORT_SIZE);
+        add_check(sort, &ns, ACT_SORT_DATE, explorer_sort_key == SORT_DATE);
+        add_separator(sort, &ns);
+        add_check(sort, &ns, ACT_SORT_ASCENDING, !explorer_sort_descending);
+        add_check(sort, &ns, ACT_SORT_DESCENDING, explorer_sort_descending);
+
         add_item(items, &n, ACT_REFRESH, true);
+        add_item(items, &n, ACT_SORT_MENU, true);
+        items[n - 1].submenu = sort;
+        items[n - 1].submenu_count = ns;
         add_separator(items, &n);
         add_item(items, &n, ACT_NEW_FOLDER, true);
         add_item(items, &n, ACT_NEW_FILE, true);
@@ -398,12 +475,14 @@ bool explorer_open_menu(explorer_t* s, int item, int32_t x, int32_t y) {
         s->context_name[0] = '\0';
     }
 
-    if (wm_menu_show(s->handle, x, y, items, n) < 0) {
+    if (wm_menu_show_tree(s->handle, x, y, items, n) < 0) {
         s->menu = MENU_NONE;
         return false;
     }
     return true;
 }
+
+
 
 static void create_new(explorer_t* s, bool folder) {
     char path[PATH_MAX];
@@ -412,12 +491,22 @@ static void create_new(explorer_t* s, bool folder) {
         explorer_notify(s, NOTICE_LONG_MS, "Can't create %s: %s", base, strerror(errno));
         return;
     }
-    int r;
-    if (folder) {
-        r = mkdir(path, 0777);
-    } else {
-        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
-        r = (fd < 0) ? -1 : close(fd);
+    int r = -1;
+    sec_mask_t got = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (folder) {
+            r = mkdir(path, 0777);
+        } else {
+            int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+            r = (fd < 0) ? -1 : close(fd);
+        }
+        if (r == 0 || attempt > 0 || !ask_write_access("Create", path, true, &got))
+            break;
+    }
+    if (got != 0) {
+        int err = errno;
+        sec_drop(got);
+        errno = err;
     }
     if (r < 0) {
         explorer_notify(s, NOTICE_LONG_MS, "Can't create %s: %s", fs_basename(path), strerror(errno));
@@ -483,6 +572,9 @@ static void run_action(explorer_t* s, action_t a, int item) {
         case ACT_OPEN:
             if (have_path) open_item(s, item);
             break;
+        case ACT_EDIT:
+            if (have_path) explorer_edit_file(s, path);
+            break;
         case ACT_OPEN_NEW_WINDOW:
             if (have_path && explorer_open_window(path) == NULL)
                 explorer_notify(s, NOTICE_LONG_MS, "Can't open a new window: %s", strerror(errno));
@@ -538,6 +630,18 @@ static void run_action(explorer_t* s, action_t a, int item) {
         case ACT_FOLDER_PROPERTIES:
             explorer_show_properties(s, s->full_path);
             break;
+        case ACT_SORT_MENU:
+            break;                      // Opens its submenu (the dwm's), never chosen
+        case ACT_SORT_NAME:
+        case ACT_SORT_TYPE:
+        case ACT_SORT_SIZE:
+        case ACT_SORT_DATE:
+            explorer_set_sort(s, (sort_key_t)(SORT_NAME + (a - ACT_SORT_NAME)), explorer_sort_descending);
+            break;
+        case ACT_SORT_ASCENDING:
+        case ACT_SORT_DESCENDING:
+            explorer_set_sort(s, explorer_sort_key, a == ACT_SORT_DESCENDING);
+            break;
         case ACT_DROP_MOVE:
         case ACT_DROP_COPY:
         case ACT_DROP_CANCEL:
@@ -546,15 +650,23 @@ static void run_action(explorer_t* s, action_t a, int item) {
     }
 }
 
+// Which menu an action belongs to
+static menu_kind_t action_menu(action_t a) {
+    if (a >= ACT_DROP_MOVE)
+        return MENU_DROP;
+    if (a >= ACT_REFRESH)
+        return MENU_WINDOW;
+    return MENU_ITEM;
+}
+
 static void menu_command(explorer_t* s, uint32_t id) {
     menu_kind_t kind = s->menu;
     s->menu = MENU_NONE;
     if (kind == MENU_NONE || id == 0 || id > MENU_ID(ACT_LAST))
         return;                     // Stale (the folder changed since it opened)
     action_t a = (action_t)(id - 1);
-    bool drop_act = (a == ACT_DROP_MOVE || a == ACT_DROP_COPY || a == ACT_DROP_CANCEL);
-    if ((kind == MENU_DROP) != drop_act)
-        return;
+    if (action_menu(a) != kind)
+        return;                     // Not from the menu that is open
 
     int item = -1;
     if (kind == MENU_ITEM) {
@@ -766,6 +878,7 @@ void explorer_handle_event(explorer_t* s, const wm_event_t* ev) {
             explorer_close_window(s);       // s is gone after this
             return;
         case WM_EVENT_DESTROYED:
+            explorer_save_size(s);
             explorer_forget_window(s);
             return;
         case WM_EVENT_RESIZED:
@@ -788,6 +901,9 @@ void explorer_handle_event(explorer_t* s, const wm_event_t* ev) {
             break;
         case WM_EVENT_DROP:
             drop_files(s, ev);
+            break;
+        case WM_EVENT_DRAG_OVER:
+            drag_over(s, ev);
             break;
         case WM_EVENT_MOUSE_LEAVE:
             if (s->back_hover) {

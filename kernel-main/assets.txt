@@ -1,0 +1,114 @@
+# Asset archive manifest: what "boot install" / "boot repair" put on disk.
+#
+# build-assets.sh turns this into bin/assets.tar (ustar), build-bootloader.sh
+# writes that behind the kernel in the boot area, stage 2 loads it with the
+# kernel and the boot command extracts it. Adding a file is one line here;
+# the kernel does not change.
+#
+#   <path under home>                <source, relative to this file>          [mode]
+#
+# mode is octal: 755 for programs (executable on disk), 644 for data.
+# A path ending in '/' with no source is an empty folder.
+#
+#   <folder>/                        policy=<user|admin|system|network> [write=<policy>]
+#
+# puts the folder and everything in it in that group policy, with the
+# policy's permissions as their security mask, on "boot install" and on
+# every "boot repair" (a policy changed by hand inside it is set back).
+# write=<policy> lets only programs holding that policy's permissions
+# change it (write, create, delete, rename, move, permissions); without
+# it, writing needs what reading needs.
+# A folder inside it can name its own. Without a line, new files and
+# folders take their folder's policy, or "user" when it has none.
+#
+# Fonts and images go in as the files they are: no conversion step. The dwm
+# finds fonts in sys/fonts by their header and decodes the PNGs in
+# sys/images itself (libc os/image.h); a file's name without its extension
+# is the name the code asks for ("sys/images/icon_folder.png" is
+# "icon_folder", "sys/fonts/opensans.ttf" is "opensans").
+
+# Folder policies. Every program reads sys (the explorer starts
+# sys/fileop, the dwm reads sys/images, programs load sys/lib), but only
+# an administrator may change anything in it: the desktop there starts
+# with every permission at boot, and sys/hkr is the hkey_root hive.
+sys/                                 policy=user write=admin
+
+# OS core
+sys/dwm                              ../programs/dwm/dwm                      755
+sys/prop                             ../programs/prop/prop                    755
+sys/fileop                           ../programs/fileop/fileop                755
+sys/explorer                         ../programs/explorer/explorer            755
+sys/format                           ../programs/format/format                755
+sys/loadlib                          ../programs/loadlib/loadlib              755
+sys/runlib                           ../programs/runlib/runlib                755
+
+# Services
+sys/services/netsrv                  ../programs/netsrv/netsrv                755
+sys/services/audiosrv                ../programs/audiosrv/audiosrv            755
+
+# Libraries
+sys/lib/stb                          ../programs/stblib/stb                   644
+sys/lib/tls                          ../programs/tlslib/tls                   644
+
+# Settings
+sys/settings/devmgr                  ../programs/devmgr/devmgr                755
+sys/settings/desktop                 ../programs/desktop/desktop              755
+sys/settings/datetime                ../programs/datetime/datetime            755
+sys/settings/regedit                 ../programs/regedit/regedit              755
+
+# Programs
+bin/paint                            ../programs/paint/paint                  755
+bin/calc                             ../programs/calc/calc                    755
+bin/hexedit                          ../programs/hexedit/hexedit              755
+bin/charmap                          ../programs/charmap/charmap              755
+bin/console                          ../programs/console/console              755
+bin/notepad                          ../programs/notepad/notepad              755
+bin/wget                             ../programs/wget/wget                    755
+bin/httpd                            ../programs/httpd/httpd                  755
+bin/htmlview                         ../programs/htmlview/htmlview            755
+bin/play                             ../programs/play/play                    755
+bin/mediaplay                        ../programs/mediaplay/mediaplay          755
+
+# Games
+games/minesweeper                    ../programs/minesweeper/minesweeper      755
+
+# Fonts
+sys/fonts/opensans                   ../fonts/opensans.ttf                    644
+sys/fonts/RobotoMono                 ../fonts/RobotoMono.ttf                  644
+sys/fonts/oswald                     ../fonts/oswald.ttf                      644
+sys/fonts/LibreCaslonCondense        ../fonts/LibreCaslonCondense.ttf         644
+
+# Wallpapers
+sys/wallpaper/bluefade               ../bitmaps/wallpaper/bluefade.png        644
+
+# Window buttons
+sys/images/ui_back                   ../bitmaps/buttons/back.png              644
+sys/images/ui_new                    ../bitmaps/buttons/new.png               644
+sys/images/ui_close                  ../bitmaps/buttons/close_red.png         644
+sys/images/ui_minimize               ../bitmaps/buttons/minimize.png          644
+sys/images/ui_start                  ../bitmaps/buttons/start.png             644
+sys/images/ui_shutdown               ../bitmaps/buttons/shutdown.png          644
+sys/images/ui_refresh                ../bitmaps/buttons/refresh.png           644
+
+# Cursors
+sys/images/cur_angle                 ../bitmaps/cursors/angle.png             644
+sys/images/cur_edge                  ../bitmaps/cursors/edge.png              644
+sys/images/cur_pointer               ../bitmaps/cursors/pointer.png           644
+
+# Icons
+sys/images/icon_document             ../bitmaps/icons/document.png            644
+sys/images/icon_driver               ../bitmaps/icons/driver.png              644
+sys/images/icon_error                ../bitmaps/buttons/error.png             644
+sys/images/icon_executable           ../bitmaps/icons/executable.png          644
+sys/images/icon_file                 ../bitmaps/icons/file.png                644
+sys/images/icon_folder               ../bitmaps/icons/folder.png              644
+sys/images/icon_font                 ../bitmaps/icons/font.png                644
+sys/images/icon_header               ../bitmaps/icons/header.png              644
+sys/images/icon_image                ../bitmaps/icons/image.png               644
+sys/images/icon_source               ../bitmaps/icons/source.png              644
+sys/images/icon_storage              ../bitmaps/icons/storage.png             644
+sys/images/icon_storage_hdd          ../bitmaps/icons/storage_hdd.png         644
+sys/images/icon_system               ../bitmaps/icons/system.png              644
+sys/images/icon_script               ../bitmaps/icons/script.png              644
+sys/images/icon_audio                ../bitmaps/icons/audio.png               644
+sys/images/icon_archive              ../bitmaps/icons/archive.png             644

@@ -58,6 +58,7 @@
 #include <os/gfx.h>
 #include <os/input.h>
 #include <os/os.h>
+#include <os/security.h>
 #include <os/syscall.h>
 #include <os/wm.h>
 #include <os/wm_app.h>     // Not on the desktop: says so and exits before main()
@@ -1041,6 +1042,34 @@ static bool add_item(const char* src, const char* dst) {
     return true;
 }
 
+// Some folders can be read by every program but changed only with more
+// permissions (os_finfo's write_security: <home>/sys needs admin). Ask
+// the user once, before anything is touched, for whatever the whole job
+// lacks: the destination folders, and for a move or delete the items and
+// the folders they leave. Nothing is asked when nothing is missing; a
+// refusal just lets each item fail with "permission denied".
+static void ask_for_write_access(void) {
+    sec_mask_t missing = 0;
+    char dir[PATH_MAX];
+    for (size_t i = 0; i < item_count; i++) {
+        if (op != OP_COPY)
+            missing |= sec_write_missing(items[i].src, true);
+        if (op != OP_DELETE) {
+            parent_of(items[i].dst, dir, sizeof(dir));
+            missing |= sec_write_missing(dir, false);
+        }
+    }
+    if (missing == 0)
+        return;
+    const char* what = (op == OP_DELETE) ? "Delete" : (op == OP_MOVE) ? "Move" : "Copy";
+    char reason[96];
+    if (item_count == 1)
+        snprintf(reason, sizeof(reason), "%s %s", what, base_name(items[0].src));
+    else
+        snprintf(reason, sizeof(reason), "%s %u items", what, (unsigned)item_count);
+    sec_elevate_bits(reason, missing);  // Held until fileop ends
+}
+
 // fileop paste DIR: the clipboard's files. Returns the clipboard serial to
 // clear after a complete move (0: none), or -1 when there is nothing to do.
 static int64_t take_clipboard(const char* dir_arg) {
@@ -1158,6 +1187,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Copy and move ask for any permissions they lack now; delete asks
+    // after its own question (below)
+    if (op != OP_DELETE)
+        ask_for_write_access();
+
     // A move within one volume is only relinking: done before any window
     // would show. The window opens only for what has to be copied.
     bool work = true;
@@ -1174,8 +1208,10 @@ int main(int argc, char** argv) {
         free(items);
         return 3;
     }
-    if (op == OP_DELETE)
+    if (op == OP_DELETE) {
+        ask_for_write_access();
         run_delete();
+    }
     else if (work)
         run_copy();
 

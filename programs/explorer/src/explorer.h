@@ -32,7 +32,8 @@
 #define ICON_STORAGE            4       // "icon_storage"
 #define ICON_COUNT              5
 
-// Window
+// Window. The size of the last one closed is kept in the registry and new
+// windows open at it; these are for when there is none.
 #define WINDOW_WIDTH            480
 #define WINDOW_HEIGHT           350
 #define WINDOW_MIN_WIDTH        200
@@ -84,7 +85,7 @@
 // Dialogs, status bar (context menus are the dwm's). The status bar is
 // always there: a message while one shows, else what is selected (a file's
 // size) or how many items the folder holds
-#define NOTICE_H                18
+#define NOTICE_H                19
 #define NOTICE_MS               3000
 #define NOTICE_LONG_MS          5000
 
@@ -92,6 +93,14 @@
 // read with dwm_get_theme(). Kept current on WM_EVENT_THEME_CHANGED; starts
 // as the dwm's defaults in case the dwm can't be asked.
 extern wm_theme_t explorer_theme;
+
+// Settings (os/registry.h), in the user's hive; every value a string so it
+// can be read and typed by hand in regedit:
+//   sort     "name", "type", "size" or "date"   what the contents are ordered by
+//   order    "ascending" or "descending"
+//   width    "480"                               the last closed window's client size
+//   height   "350"
+#define EXPLORER_KEY            "hkey_user/control/explorer"
 
 #endif
 

@@ -17,8 +17,9 @@
  *                picking a file switches Background to Wallpaper
  *   Style        Center, Tile, Stretch, Fit or Fill
  *
- * Apply writes the values (os_reg_set, which saves <home>/sys/hku) and asks
- * the desktop to read them again (wm_settings_changed); OK does the same and
+ * Apply writes the values (os_reg_set; the kernel saves <home>/sys/hku with
+ * its own clearance, so no admin is needed) and asks the desktop to read
+ * them again (wm_settings_changed), even if saving the hive failed; OK does the same and
  * closes, Cancel / Escape / the close box close without writing. Enter
  * applies; Tab moves between the two boxes.
  *
@@ -35,6 +36,9 @@
  * Needs SEC_FILE (reading and writing the registry, browsing), SEC_GFX and
  * SEC_IPC: the desktop's launch mask has them. No admin: the settings are
  * the user's own.
+ *
+ * With nothing in the registry yet the window shows the desktop's default:
+ * the <home>/sys/wallpaper/bluefade wallpaper, stretched (os/desktop.h).
  */
 
 #include <errno.h>
@@ -105,7 +109,7 @@ static const struct {
     { OS_DESKTOP_STYLE_TILE,    "Tile" },
 };
 #define STYLE_COUNT (sizeof(styles) / sizeof(styles[0]))
-#define STYLE_DEFAULT 0             // Fill
+#define STYLE_DEFAULT 2             // Stretch (OS_DESKTOP_DEFAULT_STYLE)
 
 static const uint32_t palette[] = {
     0xFF020730, 0xFF0B1F4D, 0xFF1E4F8A, 0xFF2D7DB3, 0xFF0F5E5E,
@@ -175,16 +179,17 @@ static void read_settings(void) {
         os_desktop_parse_color(text, &color);
     set_hex_text(color);
 
-    show = SHOW_COLOR;
-    if (os_reg_get_string(OS_DESKTOP_KEY, OS_DESKTOP_BACKGROUND, text, sizeof(text)) == 0 &&
-        strcmp(text, OS_DESKTOP_SHOW_WALLPAPER) == 0)
-        show = SHOW_WALLPAPER;
+    // Nothing set yet: what the desktop shows then (os/desktop.h)
+    if (os_reg_get_string(OS_DESKTOP_KEY, OS_DESKTOP_BACKGROUND, text, sizeof(text)) < 0)
+        strlcpy(text, OS_DESKTOP_DEFAULT_SHOW, sizeof(text));
+    show = (strcmp(text, OS_DESKTOP_SHOW_WALLPAPER) == 0) ? SHOW_WALLPAPER : SHOW_COLOR;
 
     style = STYLE_DEFAULT;
     if (os_reg_get_string(OS_DESKTOP_KEY, OS_DESKTOP_STYLE, text, sizeof(text)) == 0)
         style = find_style(text);
 
-    if (os_reg_get_string(OS_DESKTOP_KEY, OS_DESKTOP_WALLPAPER, text, sizeof(text)) < 0)
+    if (os_reg_get_string(OS_DESKTOP_KEY, OS_DESKTOP_WALLPAPER, text, sizeof(text)) < 0 &&
+        os_syspath(OS_DESKTOP_DEFAULT_WALLPAPER, text, sizeof(text)) == NULL)
         text[0] = '\0';
     set_path_text(text);
     changed = false;
@@ -205,22 +210,45 @@ static const char* write_error(int error) {
     switch (error) {
         case EPERM:  return "Not allowed to change settings";
         case EACCES: return "The registry's desktop key is read-only";
-        case EIO:    return "Changed, but the registry could not be saved to disk";
+        case EIO:    return "Applied, but not saved to disk: lost on restart";
         case ENOSYS: return "This kernel can't change the registry (update it)";
         default:     return strerror(error);
     }
 }
 
-// Write everything to the registry and tell the desktop. 0, or -1 with errno.
+// One value. EIO (set, but the hive file wasn't saved) is remembered in
+// *unsaved and not a failure: the value is live, so the rest still go in.
+static bool write_value(const char* name, const char* value, bool* unsaved) {
+    if (os_reg_set_string(OS_DESKTOP_KEY, name, value) == 0)
+        return true;
+    if (errno == EIO) {
+        *unsaved = true;
+        return true;
+    }
+    return false;
+}
+
+// Write everything to the registry and tell the desktop. 0, or -1 with
+// errno. EIO means every value was set and the desktop told, but the hive
+// could not be saved, so it lasts only until a restart.
 static int write_settings(show_t s, uint32_t c, const char* path, const char* style_value) {
     char hex[OS_DESKTOP_COLOR_TEXT_MAX];
     os_desktop_format_color(c, hex);
-    if (os_reg_set_string(OS_DESKTOP_KEY, OS_DESKTOP_COLOR, hex) < 0 ||
-        (path != NULL && os_reg_set_string(OS_DESKTOP_KEY, OS_DESKTOP_WALLPAPER, path) < 0) ||
-        (style_value != NULL && os_reg_set_string(OS_DESKTOP_KEY, OS_DESKTOP_STYLE, style_value) < 0) ||
-        os_reg_set_string(OS_DESKTOP_KEY, OS_DESKTOP_BACKGROUND, shows[s].value) < 0)
+    bool unsaved = false;
+    bool ok = write_value(OS_DESKTOP_COLOR, hex, &unsaved) &&
+              (path == NULL || write_value(OS_DESKTOP_WALLPAPER, path, &unsaved)) &&
+              (style_value == NULL || write_value(OS_DESKTOP_STYLE, style_value, &unsaved)) &&
+              write_value(OS_DESKTOP_BACKGROUND, shows[s].value, &unsaved);
+    int saved_errno = errno;
+    wm_settings_changed();          // Whatever went in shows. No desktop: nothing to tell
+    if (!ok) {
+        errno = saved_errno;
         return -1;
-    wm_settings_changed();          // No desktop: nothing to tell
+    }
+    if (unsaved) {
+        errno = EIO;
+        return -1;
+    }
     return 0;
 }
 
@@ -276,8 +304,11 @@ static bool apply(void) {
         return false;
     set_path_text(path);            // As written: absolute
     if (write_settings(show, color, path, styles[style].value) < 0) {
+        bool shown = (errno == EIO);    // Live, only not saved
         set_status(true, "%s", write_error(errno));
-        return false;
+        if (shown)
+            changed = false;
+        return shown;
     }
     changed = false;
     set_status(false, show == SHOW_COLOR ? "Applied: the desktop shows the color"

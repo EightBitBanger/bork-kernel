@@ -17,9 +17,13 @@
 
 typedef enum { MENU_NONE, MENU_WINDOW, MENU_ITEM, MENU_DROP } menu_kind_t;
 
+// How a folder's contents are ordered (folders always come first)
+typedef enum { SORT_NAME, SORT_TYPE, SORT_SIZE, SORT_DATE } sort_key_t;
+
 typedef enum {
     // Item menu
     ACT_OPEN,
+    ACT_EDIT,
     ACT_OPEN_NEW_WINDOW,
     ACT_CUT,
     ACT_COPY,
@@ -34,6 +38,14 @@ typedef enum {
     ACT_PASTE,
     ACT_OPEN_CONSOLE,
     ACT_FOLDER_PROPERTIES,
+    ACT_SORT_MENU,          // Sort By: opens its submenu
+    // Sort By's submenu
+    ACT_SORT_NAME,
+    ACT_SORT_TYPE,
+    ACT_SORT_SIZE,
+    ACT_SORT_DATE,
+    ACT_SORT_ASCENDING,
+    ACT_SORT_DESCENDING,
     // After a right-button drop
     ACT_DROP_MOVE,
     ACT_DROP_COPY,
@@ -49,6 +61,7 @@ struct Item {
     int         icon;               // Files: resource handle from the file's type, -1: use icon_index
     char        type[FT_NAME_MAX];  // Files: the type's name (os/filetype.h), "" for folders
     uint32_t    size;               // Files: bytes, 0 for folders
+    uint32_t    modified;           // Seconds since the Unix epoch, 0: unknown
 };
 
 struct ExplorerWindowState {
@@ -100,6 +113,7 @@ struct ExplorerWindowState {
     // A right-button drop, waiting for its Move / Copy menu
     char*       drop_list;          // malloc'd paths ('\n' between), NULL: none
     char        drop_dir[PATH_MAX];
+    char        drop_hint[PATH_MAX];  // Last folder told to the dwm (wm_set_drop_folder)
 
     // Status bar message (stands in for dwm_notify)
     char        notice[NOTICE_LEN];
@@ -122,6 +136,7 @@ void explorer_refresh_all(void);
 bool explorer_item_path(const explorer_t* s, int index, char* out, size_t size);
 int  explorer_find_item(const explorer_t* s, const char* name);
 void explorer_open_file(explorer_t* s, const char* path);
+void explorer_edit_file(explorer_t* s, const char* path);           // <home>/sys/notepad, any file
 void explorer_show_properties(explorer_t* s, const char* path);     // <home>/sys/prop
 void explorer_format(explorer_t* s, const char* path);              // <home>/sys/format
 // <program> from <home>/sys or <home>/bin with arguments (argv[0] is filled in), started in `cwd`
@@ -129,6 +144,14 @@ bool explorer_run_system(explorer_t* s, const char* program, const char* const* 
                          const char* cwd);
 
 void explorer_load_theme(void);
+
+// Settings kept in the registry (EXPLORER_KEY): the sort order, shared by
+// every window, and the size the last closed window had
+extern sort_key_t explorer_sort_key;
+extern bool       explorer_sort_descending;
+void explorer_load_settings(void);
+void explorer_set_sort(explorer_t* s, sort_key_t key, bool descending);    // Saves, re-sorts every window
+void explorer_save_size(const explorer_t* s);
 bool explorer_open_menu(explorer_t* s, int item, int32_t x, int32_t y);
 
 void explorer_notify(explorer_t* s, uint32_t ms, const char* fmt, ...)
@@ -181,6 +204,8 @@ bool    explorer_back_hit(int32_t x, int32_t y);
 void    explorer_place_rename(explorer_t* s);      // The rename box over its tile (s->edit.rect)
 
 const char* explorer_action_label(action_t action);
+// Tell the dwm drops at the pointer go into `dir` (once per change)
+void        explorer_drop_hint(explorer_t* s, const char* dir);
 
 
 //

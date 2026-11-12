@@ -113,17 +113,12 @@ static bool net_permission(void) {
         print("net: this console has no network permission\n");
         return false;
     }
-    bool was_admin = sec_is_admin();
-    if (!was_admin && sec_elevate("Give this console network access (list Wi-Fi networks)") < 0) {
+    // The network bit only (an administrator takes it without a prompt)
+    if (sec_elevate_bits("Give this console network access (list Wi-Fi networks)", SEC_NET) < 0) {
         print(errno == EACCES ? "net: cancelled\n" : "net: can't ask for network permission\n");
         return false;
     }
-    bool ok = sec_grant(0, SEC_NET) == 0;
-    if (!was_admin)
-        sec_drop(SEC_ADMIN);
-    if (!ok)
-        print("net: could not take the network permission\n");
-    return ok;
+    return true;
 }
 
 // /dev/wlan<index>, or -1 (message printed)

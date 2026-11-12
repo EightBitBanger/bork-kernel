@@ -108,6 +108,7 @@ bool explorer_back_hit(int32_t x, int32_t y) {
 const char* explorer_action_label(action_t a) {
     switch (a) {
         case ACT_OPEN:              return "Open";
+        case ACT_EDIT:              return "Edit";
         case ACT_OPEN_NEW_WINDOW:   return "Open in New Window";
         case ACT_CUT:               return "Cut";
         case ACT_COPY:              return "Copy";
@@ -121,6 +122,13 @@ const char* explorer_action_label(action_t a) {
         case ACT_PASTE:             return "Paste";
         case ACT_OPEN_CONSOLE:      return "Open Console Here";
         case ACT_FOLDER_PROPERTIES: return "Properties";
+        case ACT_SORT_MENU:         return "Sort By";      // The dwm draws the ">"
+        case ACT_SORT_NAME:         return "Name";
+        case ACT_SORT_TYPE:         return "Type";
+        case ACT_SORT_SIZE:         return "Size";
+        case ACT_SORT_DATE:         return "Date Modified";
+        case ACT_SORT_ASCENDING:    return "Ascending";
+        case ACT_SORT_DESCENDING:   return "Descending";
         case ACT_DROP_MOVE:         return "Move here";
         case ACT_DROP_COPY:         return "Copy here";
         case ACT_DROP_CANCEL:       return "Cancel";
@@ -381,16 +389,18 @@ static void status_text(const explorer_t* s, char* out, size_t size) {
                  s->truncated ? " shown" : "");
     } else if (picked == 1) {
         const struct Item* item = &s->items[s->selected >= 0 && s->picked[s->selected] ? s->selected : other];
-        const char* what = item->is_dir ? (item->icon_index == ICON_STORAGE ? "Drive" : "Folder") : sz;
-        snprintf(out, size, "%s  %s", item->name, what);
+        const char* what = item->is_dir ? (item->icon_index == ICON_STORAGE ? "drive" : "folder") : sz;
+        snprintf(out, size, "%s %s", item->name, what);
     } else if (files == 0) {
         snprintf(out, size, "%d items selected", picked);
     } else {
-        snprintf(out, size, "%d items selected  %s%s", picked, sz, files < picked ? " in files" : "");
+        snprintf(out, size, "%d items selected %s%s", picked, sz, files < picked ? " in files" : "");
     }
 }
 
-// The status bar: a message while one shows, else status_text, cut to fit
+// The status bar: a message while one shows, else status_text, cut to fit.
+// The text is centred in the bar's lower NOTICE_H - 1 pixels: one pixel
+// higher than it was on the 18 pixel bar.
 static void draw_status(explorer_t* s, gfx_surface_t* g) {
     int32_t y = explorer_grid_bottom(s), fw = gfx_char_width(g);
     gfx_fill_rect(g, 0, y, s->win_width, s->win_height - y, T.button.fill);
@@ -404,7 +414,7 @@ static void draw_status(explorer_t* s, gfx_surface_t* g) {
         status_text(s, text, sizeof(text));
     size_t fit = (size_t)max32((s->win_width - 16) / fw, 4);
     ui_fit_text(text, fit, line, sizeof(line));
-    gfx_draw_text(g, 8, gfx_text_y(g, y, NOTICE_H) + 1, line, notice ? T.client.text : T.client.text_soft);
+    gfx_draw_text(g, 8, gfx_text_y(g, y + 1, NOTICE_H - 1), line, notice ? T.client.text : T.client.text_soft);
 }
 
 void explorer_draw(explorer_t* s) {
