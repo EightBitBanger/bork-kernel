@@ -236,7 +236,27 @@ typedef struct {
     const char* const* argv;        // argc strings (kernel memory), copied onto the new stack
     bool               elevated;    // Admin handed down from an elevated process (sys_spawn)
     void*              tty;         // Pipe end for descriptors 0-2 (sys_spawn_tty), or NULL
+    uint8_t            trust;       // PROCESS_TRUST_*: is the new process a trusted launcher
+    bool               exec_permissions;    // Apply the image file's per-program permissions
+    ProcessSecurity    exec_allow;  // ... its Allow bits count only within these
 } ProcessLaunch;
+
+// Trusted launchers
+//
+// A program file's "Allow" (per-program permissions, SYS_SETEXECPERM) gives
+// the program a gated bit without a prompt. If that held whoever started
+// it, any program could borrow the bit by starting the allowed one with
+// arguments of its own choosing (wget with a URL, rec with a file name).
+// So Allow counts only when the one starting the program holds the bit
+// itself (it could have passed it on anyway), or is trusted: started by
+// the kernel, or by a trusted process from a file only an administrator
+// can change (its write requirement has SYS_SEC_ADMIN: <home>/sys and
+// <home>/bin). That is the chain the user's own clicks and commands go
+// down: kernel, desktop, explorer or console, program. A program from
+// anywhere else ends the chain for what it starts. Deny always counts.
+#define PROCESS_TRUST_NONE      0   // Not trusted
+#define PROCESS_TRUST_IMAGE     1   // Trusted when the image is an administrator's file
+#define PROCESS_TRUST_KERNEL    2   // Trusted: the kernel starts it (boot, kernel console)
 
 // Load and start an ELF executable with arguments. Same rules and errors as
 // CreateProcessWithSecurity(), plus PROCESS_ERR_TOO_BIG for too many
@@ -317,6 +337,10 @@ ProcessSecurity process_current_security(void);
 
 // ProcessIsElevated() for the calling thread's process (false: kernel thread)
 bool process_current_elevated(void);
+
+// The calling thread's process is a trusted launcher (PROCESS_TRUST_*
+// above). False for a kernel thread.
+bool process_current_trusted(void);
 
 // File-system clearance of the calling thread (the VFS's clearance source,
 // installed by syscall_init): VFS_CLEARANCE_ALL (every bit) for a kernel

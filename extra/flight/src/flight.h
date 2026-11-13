@@ -858,10 +858,13 @@ bool menu_in_rect(const rect_t* r, int32_t x, int32_t y);
 // only when the aircraft is down safe on the ground and Escape ends the
 // flight. A crash, being shot down or ejecting loses it; a crash or being
 // shot down (not ejecting) also kills the pilot, who stays listed but can't
-// fly. The rank follows the pilot's score (the table in pilot.c). Pilots are
-// kept in the registry, PILOT_KEY: value "pilots" (a line
-// "name<TAB>score<TAB>rank" each, "<TAB>KIA" after it for a dead one) and
-// "last" (the one flown last).
+// fly. The rank follows the pilot's score, the career total (the table in
+// pilot.c); the best single flight is kept too, and one flight's score can
+// earn a medal, each held once (the other table there). Pilots are kept in
+// the registry, PILOT_KEY: value "pilots" (a line
+// "name<TAB>score<TAB>rank<TAB>fate<TAB>best<TAB>medals" each, fate "KIA"
+// for a dead one; older, shorter lines still read) and "last" (the one
+// flown last).
 //
 
 #define PILOT_KEY       "hkey_user/software/flight"

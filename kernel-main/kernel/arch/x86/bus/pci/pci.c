@@ -11,7 +11,7 @@
 
 // Network and HD Audio controllers go to the driver model (driver/device.h) as BUS_PCI
 // devices, so a driver claims them by vendor / device ID through its match
-// table (the AR9485 Wi-Fi card, drivers/net/athn_pci.c; audio, drivers/audio/hda.c). pci_init() may run
+// table (the AR9485 Wi-Fi card, the driver file sys/drivers/athn-pci; audio, sys/drivers/hda). pci_init() may run
 // twice (the F7 console, then the boot); a function already added is kept.
 static void pci_device_add(const struct PCIDeviceInfo* info, struct PCIScanContext* ctx) {
     (void)ctx;

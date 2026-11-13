@@ -402,6 +402,14 @@ void sync(void) {
     (void)os_sync();
 }
 
+int os_poweroff(void) {
+    return __sys_ret(syscall1(SYS_POWER, SYS_POWER_OFF));
+}
+
+int os_restart(void) {
+    return __sys_ret(syscall1(SYS_POWER, SYS_POWER_RESTART));
+}
+
 int os_set_permissions(const char* path, uint32_t permissions) {
     return __sys_ret(syscall2(SYS_CHMOD, (uint32_t)path, permissions));
 }
@@ -428,6 +436,14 @@ int os_set_write_security(const char* path, uint32_t mask) {
         return -1;
     }
     return __sys_ret(syscall2(SYS_SETWRITESEC, (uint32_t)path, mask));
+}
+
+int os_set_exec_permissions(const char* path, uint32_t allow, uint32_t deny) {
+    if (path == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    return __sys_ret(syscall3(SYS_SETEXECPERM, (uint32_t)path, allow, deny));
 }
 
 const char* os_policy_name(uint32_t policy) {

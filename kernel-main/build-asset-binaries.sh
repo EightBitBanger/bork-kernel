@@ -41,6 +41,8 @@
 (cd ../programs/htmlview && ./build.sh)
 (cd ../programs/httpd    && ./build.sh)
 (cd ../programs/mediaplay && ./build.sh)
+(cd ../programs/play      && ./build.sh)
+(cd ../programs/rec       && ./build.sh)
 
 # Games
 

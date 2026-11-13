@@ -30,6 +30,7 @@ static const struct {
     { SEC_ELEVATE,    "elevate",               NULL         },
     { SEC_NET,        "network",               NULL         },
     { SEC_NET_CONFIG, "network settings",      "net_config" },
+    { SEC_MICROPHONE, "microphone",            "mic"        },
 };
 
 #define SEC_NAME_COUNT  (sizeof(sec_names) / sizeof(sec_names[0]))

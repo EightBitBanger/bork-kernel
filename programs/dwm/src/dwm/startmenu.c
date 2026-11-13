@@ -13,9 +13,10 @@
  *
  * Between the list and the search box, at the right end, is the shut down
  * button (dwm_start_set_shutdown): "ui_shutdown" from <home>/sys/images,
- * a drawn power sign while that isn't installed. It sits apart from the
- * list on purpose: a click must go down and come up on it, and no key
- * reaches it, so it isn't hit by accident.
+ * a drawn power sign while that isn't installed. The restart button
+ * (dwm_start_set_restart, "ui_restart" or a drawn arrow) sits to its left.
+ * They sit apart from the list on purpose: a click must go down and come
+ * up on one, and no key reaches them, so they aren't hit by accident.
  *
  * The same panel serves a tray icon too (dwm_start_open_tray): mirrored
  * against the right edge, a little smaller, a heading and the rows the
@@ -58,9 +59,15 @@
 
 // The shut down button
 #define POWER_IMAGE     "ui_shutdown"
-#define POWER_LABEL     "Shut down"     // Shown next to it while the pointer is on it
-#define POWER_SIZE      24              // The image, drawn at its size
-#define POWER_PAD       3               // Around it: the highlight
+#define POWER_LABEL     "Shut down"     // Shown left of the buttons while the pointer is on it
+#define RESTART_IMAGE   "ui_restart"
+#define RESTART_LABEL   "Restart"
+#define POWER_SIZE      24              // The images, drawn at their size
+#define POWER_PAD       3               // Around each: the highlight
+#define POWER_GAP       4               // Between the two
+
+// The power buttons, right to left
+typedef enum { PWR_NONE = 0, PWR_OFF, PWR_RESTART } power_button_t;
 
 // The tray panel
 #define TRAY_W          300     // Start's is PANEL_W
@@ -95,6 +102,7 @@ static item_t             items[DWM_START_MAX_ITEMS];
 static size_t             item_count;
 static dwm_start_action_t open_path;
 static dwm_start_action_t shutdown_action;     // NULL: no button
+static dwm_start_action_t restart_action;      // NULL: no button
 
 static struct {
     bool      open;
@@ -112,8 +120,8 @@ static struct {
     int       row_down;         // The clickable row a press went down on, -1: none
     uint32_t  prompt_seen;      // The prompt the box was made for (its serial)
     bool      prompt_on;        // The box is the prompt's
-    bool      power_hot;        // The pointer is on the shut down button
-    bool      power_down;       // The left button went down on it, still held
+    power_button_t power_hot;   // The power button the pointer is on
+    power_button_t power_down;  // The one the left button went down on, still held
     tray_button_t btn_hot;      // The tray panel's button under the pointer
     tray_button_t btn_down;     // The one the left button went down on, still held
 } m = { .hot = -1, .row_down = -1 };
@@ -148,9 +156,10 @@ static int32_t search_area_h(void) {
     return m.box.rect.h > 0 ? m.box.rect.h + 2 * PAD : dwm_text_height() + 8 + 2 * PAD;
 }
 
-// The row the shut down button sits in, between the list and the search box
+// The row the power buttons sit in, between the list and the search box
 static int32_t power_area_h(void) {
-    return (shutdown_action != NULL && !m.tray) ? POWER_SIZE + 2 * POWER_PAD + PAD : 0;
+    return ((shutdown_action != NULL || restart_action != NULL) && !m.tray)
+           ? POWER_SIZE + 2 * POWER_PAD + PAD : 0;
 }
 
 static int32_t list_h(void) {
@@ -185,16 +194,24 @@ static gfx_rect_t list_rect(void) {
     return gfx_rect(content_x(), y, content_w(), p.y + p.h - BORDER - search_area_h() - power_area_h() - y);
 }
 
-// The shut down button, highlight included: right-aligned with the search
-// box, in the row above it. Empty when there is none.
-static gfx_rect_t power_rect(void) {
-    if (power_area_h() == 0)
+static dwm_start_action_t power_action(power_button_t which) {
+    return which == PWR_OFF ? shutdown_action : which == PWR_RESTART ? restart_action : NULL;
+}
+
+// A power button, highlight included: shut down right-aligned with the
+// search box in the row above it, restart to its left (or there itself
+// without a shut down button). Empty when it isn't there.
+static gfx_rect_t power_rect(power_button_t which) {
+    if (power_area_h() == 0 || power_action(which) == NULL)
         return gfx_rect(0, 0, 0, 0);
     gfx_rect_t l = list_rect();
     int32_t size = POWER_SIZE + 2 * POWER_PAD;
     int32_t right = content_x() + content_w() - PAD;        // The box's right edge
+    if (which == PWR_RESTART && shutdown_action != NULL)
+        right -= size + POWER_GAP;
     return gfx_rect(right - size, l.y + l.h + PAD / 2 + 1, size, size);
 }
+
 
 // Place the box (it moves with the panel). Its rect stays valid until the
 // next call.
@@ -234,6 +251,12 @@ static gfx_rect_t result_rect(size_t i) {
 
 static bool contains(gfx_rect_t r, int32_t x, int32_t y) {
     return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
+}
+
+static power_button_t power_at(int32_t x, int32_t y) {
+    if (contains(power_rect(PWR_OFF), x, y))     return PWR_OFF;
+    if (contains(power_rect(PWR_RESTART), x, y)) return PWR_RESTART;
+    return PWR_NONE;
 }
 
 static size_t line_count(void) {
@@ -679,13 +702,21 @@ void dwm_start_set_open(dwm_start_action_t open) {
     open_path = open;
 }
 
-void dwm_start_set_shutdown(dwm_start_action_t action) {
+static void set_power_action(dwm_start_action_t* slot, dwm_start_action_t action) {
     invalidate_panel();             // Its old size
-    shutdown_action = action;
-    m.power_hot = m.power_down = false;
+    *slot = action;
+    m.power_hot = m.power_down = PWR_NONE;
     if (m.open && !m.tray)
         place_box();
     invalidate_panel();             // Its new size
+}
+
+void dwm_start_set_shutdown(dwm_start_action_t action) {
+    set_power_action(&shutdown_action, action);
+}
+
+void dwm_start_set_restart(dwm_start_action_t action) {
+    set_power_action(&restart_action, action);
 }
 
 void dwm_start_set_search_roots(const char* const* roots, size_t count) {
@@ -738,8 +769,8 @@ static void start_open_panel(void) {
     m.sb_drag  = false;
     m.row_down  = -1;
     m.prompt_on = false;
-    m.power_hot  = false;
-    m.power_down = false;
+    m.power_hot  = PWR_NONE;
+    m.power_down = PWR_NONE;
     m.btn_hot    = TBTN_NONE;
     m.btn_down   = TBTN_NONE;
     place_box();
@@ -760,8 +791,8 @@ void dwm_start_close(void) {
     m.sb_drag = false;
     m.row_down = -1;
     m.prompt_on = false;
-    m.power_hot = false;
-    m.power_down = false;
+    m.power_hot = PWR_NONE;
+    m.power_down = PWR_NONE;
     m.btn_hot = TBTN_NONE;
     m.btn_down = TBTN_NONE;
     search_cancel();
@@ -865,7 +896,7 @@ bool start_mouse(int32_t x, int32_t y, bool moved, uint8_t pressed, uint8_t rele
         } else if (in_panel) {
             set_hot(line_at(x, y));
         }
-        bool power_hot = !m.box_drag && contains(power_rect(), x, y);
+        power_button_t power_hot = m.box_drag ? PWR_NONE : power_at(x, y);
         if (power_hot != m.power_hot) {
             m.power_hot = power_hot;
             invalidate_panel();         // The button and its label
@@ -880,8 +911,8 @@ bool start_mouse(int32_t x, int32_t y, bool moved, uint8_t pressed, uint8_t rele
             return contains(taskbar_start_hit_rect(), x, y);
         }
         m.pressed = true;
-        if ((pressed & INPUT_BTN_LEFT) && contains(power_rect(), x, y)) {
-            m.power_down = true;
+        if ((pressed & INPUT_BTN_LEFT) && power_at(x, y) != PWR_NONE) {
+            m.power_down = power_at(x, y);
             invalidate_panel();
             return true;
         }
@@ -902,12 +933,13 @@ bool start_mouse(int32_t x, int32_t y, bool moved, uint8_t pressed, uint8_t rele
             return in_panel;        // The press that opened it (or one before): nothing
         if (held == 0)
             m.pressed = false;
-        if ((released & INPUT_BTN_LEFT) && m.power_down) {
-            // Down and up on the button: let go anywhere else, nothing
-            m.power_down = false;
+        if ((released & INPUT_BTN_LEFT) && m.power_down != PWR_NONE) {
+            // Down and up on the same button: let go anywhere else, nothing
+            power_button_t which = m.power_down;
+            m.power_down = PWR_NONE;
             invalidate_panel();
-            if (contains(power_rect(), x, y) && shutdown_action != NULL) {
-                dwm_start_action_t action = shutdown_action;
+            dwm_start_action_t action = power_action(which);
+            if (power_at(x, y) == which && action != NULL) {
                 dwm_start_close();
                 action("");
             }
@@ -1010,30 +1042,57 @@ static void draw_power_sign(gfx_surface_t* s, int32_t x, int32_t y, int32_t size
     gfx_fill_rect(s, cx - 1, y + 1, 2, size / 2, c);           // The bar
 }
 
-static void paint_power(gfx_surface_t* s, gfx_rect_t area) {
-    gfx_rect_t b = power_rect();
-    if (b.w == 0 || !rect_overlaps(area, gfx_rect(content_x(), b.y, content_w(), b.h)))
+// A restart arrow, for while "ui_restart" isn't installed: a ring open at
+// the top right, an arrow head on its upper end
+static void draw_restart_sign(gfx_surface_t* s, int32_t x, int32_t y, int32_t size, uint32_t c, uint32_t bg) {
+    int32_t cx = x + size / 2, cy = y + size / 2 + 1, r = size / 2 - 3;
+    gfx_draw_circle(s, cx, cy, r, c);
+    gfx_draw_circle(s, cx, cy, r - 1, c);
+    gfx_fill_rect(s, cx + 1, cy - r - 1, r + 1, r - 1, bg);    // The gap
+    int32_t hx = cx + r - 1, hy = cy - 3;                     // The head: up from the ring's end
+    for (int32_t i = 0; i < 5; i++)
+        gfx_draw_hline(s, hx - i, hy - 4 + i, 2 * i + 1, c);
+}
+
+static void paint_power_button(gfx_surface_t* s, power_button_t which) {
+    gfx_rect_t b = power_rect(which);
+    if (b.w == 0)
         return;
     const dwm_theme_t* t = dwm_theme();
     uint32_t bg = t->menu.background | 0xFF000000u;
-    if (m.power_hot || m.power_down) {
+    if (m.power_hot == which || m.power_down == which) {
         gfx_fill_rect(s, b.x, b.y, b.w, b.h, t->menu.highlight);
         bg = t->menu.highlight | 0xFF000000u;
-        if (m.power_down && m.power_hot)
+        if (m.power_down == which && m.power_hot == which)
             gfx_draw_rect(s, b.x, b.y, b.w, b.h, t->menu.border);
     }
     int32_t ix = b.x + POWER_PAD, iy = b.y + POWER_PAD;
-    const image_t* image = imagelib_get(POWER_IMAGE);
+    const image_t* image = imagelib_get(which == PWR_OFF ? POWER_IMAGE : RESTART_IMAGE);
     if (image != NULL)
         small_image_draw(s, image, ix, iy, POWER_SIZE);
-    else
+    else if (which == PWR_OFF)
         draw_power_sign(s, ix, iy, POWER_SIZE, t->menu.text, bg);
+    else
+        draw_restart_sign(s, ix, iy, POWER_SIZE, t->menu.text, bg);
+}
 
-    // What it does, to its left, while the pointer is on it
-    if (m.power_hot) {
+static void paint_power(gfx_surface_t* s, gfx_rect_t area) {
+    if (power_area_h() == 0)
+        return;
+    gfx_rect_t off = power_rect(PWR_OFF), restart = power_rect(PWR_RESTART);
+    gfx_rect_t left = restart.w != 0 ? restart : off;     // The leftmost button
+    if (!rect_overlaps(area, gfx_rect(content_x(), left.y, content_w(), left.h)))
+        return;
+    paint_power_button(s, PWR_OFF);
+    paint_power_button(s, PWR_RESTART);
+
+    // What the one under the pointer does, left of the buttons
+    if (m.power_hot != PWR_NONE) {
+        const dwm_theme_t* t = dwm_theme();
+        const char* label = (m.power_hot == PWR_OFF) ? POWER_LABEL : RESTART_LABEL;
         int32_t lh = dwm_text_height();
-        int32_t w = dwm_text_width(POWER_LABEL, strlen(POWER_LABEL));
-        dwm_text_draw(s, b.x - PAD - w, b.y + (b.h - lh) / 2, POWER_LABEL, strlen(POWER_LABEL),
+        int32_t w = dwm_text_width(label, strlen(label));
+        dwm_text_draw(s, left.x - PAD - w, left.y + (left.h - lh) / 2, label, strlen(label),
                       t->client.text_muted);
     }
 }

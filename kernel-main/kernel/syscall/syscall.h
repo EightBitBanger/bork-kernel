@@ -117,9 +117,14 @@
 #define SYS_NET_RESOLVE 85 // (name, uint32_t* ip, timeout_ms)  0, the host's IPv4 address in *ip   (network, sys_net.h)
 #define SYS_SETWRITESEC 86  // (path, mask)             0, the extra bits writing needs  (needs ADMIN + FILE_WRITE)
 #define SYS_RANDOM     87   // (buf, length)            bytes written (at most SYS_RANDOM_MAX), random bytes for keys
-#define SYS_COUNT      88
+#define SYS_SETEXECPERM 88  // (path, allow, deny)      0, a program's per-program permissions  (needs ADMIN + FILE_WRITE)
+#define SYS_POWER      89   // (op)                     does not return: SYS_POWER_OFF / SYS_POWER_RESTART  (needs ADMIN)
+#define SYS_COUNT      90
 
 #define SYS_RANDOM_MAX 256  // Bytes one SYS_RANDOM call writes at most
+
+#define SYS_POWER_OFF       0   // SYS_POWER: file systems written out, then ACPI soft off
+#define SYS_POWER_RESTART   1   // SYS_POWER: file systems written out, then reset
 
 #define SYS_OK               0
 #define SYS_ENOSYS          -1  // Unknown syscall number
@@ -203,6 +208,10 @@
 //                        of SYS_SEC_NET. Only the network tray (netsrv) has
 //                        it, so a program that only talks over the network
 //                        can't move the machine onto another one.
+//   SYS_SEC_MICROPHONE   record sound from a microphone: open and read
+//                        /dev/micN (the HDA driver's input). Not in a
+//                        default mask, like SYS_SEC_NET. Playing sound
+//                        needs no bit of its own.
 //
 // Always allowed: exit, yield, sleep, getpid, sbrk, close, seek, getcwd, gethome, time,
 // ipc_close, ipc_info, sock_close, SYS_SEC_GET on the caller itself, ioctl, and read / write
@@ -242,12 +251,19 @@
 #define SYS_SEC_ELEVATE     0x00000200u
 #define SYS_SEC_NET         0x00000400u
 #define SYS_SEC_NET_CONFIG  0x00000800u
+#define SYS_SEC_MICROPHONE  0x00001000u
 
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_RW | SYS_SEC_CONSOLE | \
                              SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | SYS_SEC_IPC | \
                              SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN | \
-                             SYS_SEC_ELEVATE | SYS_SEC_NET | SYS_SEC_NET_CONFIG)
+                             SYS_SEC_ELEVATE | SYS_SEC_NET | SYS_SEC_NET_CONFIG | \
+                             SYS_SEC_MICROPHONE)
+
+// Per-program permissions: the bits a program file can be given, or kept
+// from, by itself (SysFileInfo.exec_allow / exec_deny, SYS_SETEXECPERM).
+// The rest are decided only by who starts it and by the prompt.
+#define SYS_SEC_PROGRAM_GATED   (SYS_SEC_NET | SYS_SEC_MICROPHONE | SYS_SEC_INPUT)
 
 //
 // Elevation
@@ -961,7 +977,24 @@ typedef struct {
 // outside SYS_SEC_VALID are SYS_EINVAL. Only that object; new objects take
 // their folder's.
 //
-// All three need SYS_SEC_ADMIN and SYS_SEC_FILE_WRITE (programs ask the user
+// SYS_SETEXECPERM(path, allow, deny) sets a program file's per-program
+// permissions, kept with the file (basefs: FSBlockHeader.exec_allow /
+// exec_deny). Both are masks of SYS_SEC_PROGRAM_GATED bits (others are
+// SYS_EINVAL, and so is a bit in both). When the program starts (spawn,
+// spawn_tty) it never gets the `deny` bits, even when it would have
+// inherited them; SYS_ELEVATE asking for a denied bit is SYS_EPERM without
+// a prompt. It gets the `allow` bits when whoever starts it holds them, or
+// is a trusted launcher: the desktop, and programs started down from it
+// that are files only an administrator can change (<home>/sys, <home>/bin;
+// scheduler/process.h, PROCESS_TRUST_*). Started by any other program an
+// allowed bit is "ask", so a program can't borrow it by starting the
+// allowed one. A bit in neither ("ask") is decided the usual ways. Opening
+// the file for writing, writing to it or truncating it clears both, so new
+// contents start with none, and a copy starts with none. SYS_EISDIR on a folder,
+// SYS_EACCES on a file system that can't store them (FAT). SysFileInfo
+// shows them to anyone (they are 0 on FAT).
+//
+// All four need SYS_SEC_ADMIN and SYS_SEC_FILE_WRITE (programs ask the user
 // with SYS_ELEVATE first), and what SYS_CHMOD needs (SYS_EBUSY, SYS_EACCES
 // as there) except clearance for the object itself: an admin may change
 // the security of a file it can't open ("network", "system"), and require
@@ -979,7 +1012,7 @@ typedef struct {
 #define SYS_FINFO_WINDOWED  0x0020  // kind its ".os.kind" marks say (os/process.h), so a launcher
                                     // that can't read it knows how to start it elevated
 
-// Filled by SYS_FINFO. 40 bytes.
+// Filled by SYS_FINFO. 48 bytes.
 typedef struct {
     uint32_t security;          // SYS_SEC_* bits the file requires (0: anyone)
     uint32_t flags;             // SYS_FINFO_*
@@ -990,6 +1023,8 @@ typedef struct {
     uint32_t device_percent;    // DEVICE + COUNTING: how much has been counted (0..99)
     uint32_t policy;            // SYS_POLICY_*: the group policy it belongs to (0: none)
     uint32_t write_security;    // SYS_SEC_* bits writing needs on top of `security` (0: the same as reading)
+    uint32_t exec_allow;        // Program file: SYS_SEC_PROGRAM_GATED bits it is given when started (SYS_SETEXECPERM)
+    uint32_t exec_deny;         // ... and never given
     uint32_t reserved;          // 0
 } SysFileInfo;
 

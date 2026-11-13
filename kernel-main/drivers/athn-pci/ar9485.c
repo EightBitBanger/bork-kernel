@@ -2,13 +2,13 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include <kernel/arch/x86/drivers/net/ar9485.h>
-#include <kernel/arch/x86/drivers/net/ar9485_regs.h>
-#include <kernel/arch/x86/drivers/net/ar9485_tables.h>
+#include "kshim.h"
+#include "ar9485.h"
+#include "ar9485_regs.h"
+#include "ar9485_tables.h"
+
 #include <kernel/arch/x86/drivers/net/wlan.h>
 #include <kernel/arch/x86/drivers/net/wlan_scan.h>
-
-#include <kernel/util/string.h>
 
 //
 // Atheros AR9485 (see ar9485.h)

@@ -149,6 +149,11 @@ struct Device* device_find(const char* name) {
 }
 void device_remove(struct Device* dev) { (void)dev; }
 
+// HDA codec drivers (KAPI 3): the loader only passes these on
+struct HdaCodecDriver;
+bool hda_codec_register(const struct HdaCodecDriver* d) { (void)d; return false; }
+void hda_codec_unregister(const struct HdaCodecDriver* d) { (void)d; }
+
 static const struct Driver* registered[DRIVER_MAX];
 static uint32_t registered_n = 0;
 static const struct Driver builtin = { .name = "memdev", .abi = DRIVER_ABI, .flags = DRIVER_BUILTIN };

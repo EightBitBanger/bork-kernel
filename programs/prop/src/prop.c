@@ -14,6 +14,12 @@
  *   Permissions   readable / writeable / executable. Click a box to change
  *                 it, when allowed: the folder holding the file must be
  *                 writable, and this program needs file write clearance.
+ *                 Under them, for a program file, its program permissions
+ *                 (os_set_exec_permissions): Network, Microphone and Input,
+ *                 each Allow (given every time it starts), Ask (decided by
+ *                 whoever starts it and the permission prompt) or Deny
+ *                 (never given). A click asks the user for admin first.
+ *                 Greyed for a file that isn't executable.
  *   Security      who may read and who may write it, by group. On top the
  *                 groups (the group policies, read from the registry,
  *                 hkey_root/system/policy); the file's policy is in bold
@@ -113,6 +119,22 @@ static const struct { uint32_t bit; const char* label; int32_t y; } perm_boxes[]
     { SYS_PERM_EXECUTE, "Executable", 110 },
 };
 #define PERM_BOXES  (sizeof(perm_boxes) / sizeof(perm_boxes[0]))
+
+// Program permissions, under the boxes: one row per gated bit, a box per
+// choice
+static const struct { sec_mask_t bit; const char* label; } exec_rows[] = {
+    { SEC_NET,        "Network" },
+    { SEC_MICROPHONE, "Microphone" },
+    { SEC_INPUT,      "Input" },
+};
+#define EXEC_ROWS       (sizeof(exec_rows) / sizeof(exec_rows[0]))
+enum { EXEC_ALLOW, EXEC_ASK, EXEC_DENY, EXEC_CHOICES };
+static const char* const exec_choice_names[EXEC_CHOICES] = { "Allow", "Ask", "Deny" };
+#define EXEC_HEAD_Y     145
+#define EXEC_LIST_Y     (EXEC_HEAD_Y + 16)
+#define EXEC_ROW        20
+#define EXEC_COL_X      190         // Centre of the first choice's column
+#define EXEC_COL_W      45
 
 // Security tab: the policy list, then the mask list under it
 #define LIST_X          LABEL_X
@@ -547,6 +569,21 @@ static gfx_rect_t modify_rect(void) {
     return gfx_rect(BUTTON_X, MODIFY_Y, BUTTON_W, BUTTON_H);
 }
 
+static gfx_rect_t exec_list_rect(void) {
+    return gfx_rect(LIST_X, EXEC_LIST_Y, LIST_W, (int32_t)EXEC_ROWS * EXEC_ROW + LIST_PAD * 2);
+}
+
+static gfx_rect_t exec_row_rect(size_t i) {
+    gfx_rect_t l = exec_list_rect();
+    return gfx_rect(l.x + 1, l.y + LIST_PAD + (int32_t)i * EXEC_ROW, l.w - 2, EXEC_ROW);
+}
+
+// The box for choice `c` on row `i`, with room around it to click
+static gfx_rect_t exec_box_rect(size_t i, int c) {
+    gfx_rect_t r = exec_row_rect(i);
+    return gfx_rect(EXEC_COL_X + c * EXEC_COL_W - BOX / 2, r.y + (r.h - BOX) / 2, BOX, BOX);
+}
+
 static gfx_rect_t policy_list_rect(void) {
     return gfx_rect(LIST_X, POLICY_LIST_Y, LIST_W, (int32_t)policy_count * LIST_ROW + LIST_PAD * 2);
 }
@@ -740,11 +777,47 @@ static void draw_general(gfx_surface_t* s) {
     }
 }
 
+// A program file: its program permissions mean something
+static bool exec_applies(void) {
+    return P.what == WHAT_FILE && P.have_fi && (P.st.permissions & SYS_PERM_EXECUTE) != 0;
+}
+
+// Which choice row `i` has now
+static int exec_choice(size_t i) {
+    if (P.fi.exec_allow & exec_rows[i].bit) return EXEC_ALLOW;
+    if (P.fi.exec_deny & exec_rows[i].bit)  return EXEC_DENY;
+    return EXEC_ASK;
+}
+
+static void list_frame(gfx_surface_t* s, gfx_rect_t r);
+
 static void draw_permissions(gfx_surface_t* s) {
     for (size_t i = 0; i < PERM_BOXES; i++) {
         gfx_rect_t b = box_rect(i);
         checkbox(s, b.x, b.y, (P.st.permissions & perm_boxes[i].bit) != 0, 1);
         gfx_draw_text(s, BOX_LABEL_X, b.y + 2, perm_boxes[i].label, theme.client.text);
+    }
+
+    // Program permissions: files only (a folder never runs)
+    if (P.what != WHAT_FILE || !P.have_fi)
+        return;
+    bool on = exec_applies();
+    uint32_t label = on ? theme.client.text : theme.client.text_muted;
+    gfx_draw_text(s, LABEL_X, EXEC_HEAD_Y, "Program permissions", label);
+    for (int c = 0; c < EXEC_CHOICES; c++) {
+        int32_t w = (int32_t)strlen(exec_choice_names[c]) * cw;
+        gfx_draw_text(s, EXEC_COL_X + c * EXEC_COL_W - w / 2, EXEC_HEAD_Y, exec_choice_names[c],
+                      theme.client.text_muted);
+    }
+    list_frame(s, exec_list_rect());
+    for (size_t i = 0; i < EXEC_ROWS; i++) {
+        gfx_rect_t r = exec_row_rect(i);
+        gfx_draw_text(s, r.x + 6, gfx_text_y(s, r.y, r.h), exec_rows[i].label, label);
+        int chosen = exec_choice(i);
+        for (int c = 0; c < EXEC_CHOICES; c++) {
+            gfx_rect_t b = exec_box_rect(i, c);
+            checkbox(s, b.x, b.y, c == chosen, on);
+        }
     }
 }
 
@@ -811,12 +884,6 @@ static void draw_security(gfx_surface_t* s) {
 
     gfx_rect_t l = sec_list_rect();
     y = l.y + l.h + 8;
-    gfx_draw_text(s, LABEL_X, y, "Read: open, list and run it", theme.client.text_muted);
-    y += ROW_H;
-    gfx_draw_text(s, LABEL_X, y, "Write: change, add to, delete, rename,", theme.client.text_muted);
-    y += ROW_H;
-    gfx_draw_text(s, LABEL_X, y, "move it or change its permissions", theme.client.text_muted);
-    y += ROW_H;
     sec_mask_t unknown = write_need() & ~SEC_ALL;
     if (unknown != 0) {
         text(s, LABEL_X, y, theme.client.text_muted, "+ unknown bits 0x%x", (unsigned)unknown);
@@ -890,6 +957,28 @@ static void start_modify(void) {
     modifying = true;
 }
 
+// Program permissions: row `i` to choice `c`, after the user's yes for admin
+static void set_exec_choice(size_t i, int c) {
+    if (!exec_applies() || c == exec_choice(i))
+        return;
+    if (!modifying) {
+        start_modify();     // The same prompt as the Security tab's "Modify"
+        if (!modifying)
+            return;
+    }
+    sec_mask_t bit = exec_rows[i].bit;
+    uint32_t allow = P.fi.exec_allow & ~bit, deny = P.fi.exec_deny & ~bit;
+    if (c == EXEC_ALLOW) allow |= bit;
+    if (c == EXEC_DENY)  deny  |= bit;
+    if (os_set_exec_permissions(P.path, allow, deny) < 0) {
+        const char* why = (errno == EACCES) ? "This drive can't keep program permissions"
+                        : (errno == EPERM)  ? "No administrator permission"
+                        :                     strerror(errno);
+        wm_notify_ex(WM_NOTIFY_ERROR, "Program permissions unchanged", why, WM_NOTIFY_DEFAULT_MS);
+    }
+    refresh_finfo();
+}
+
 static void security_failed(void) {
     const char* why = (errno == EPERM)  ? "Not cleared for it, or no administrator permission"
                     : (errno == EACCES) ? "Its folder isn't writable, or it can't keep a security mask"
@@ -960,6 +1049,16 @@ static bool mouse_down(const wm_event_t* ev) {
             if (in_rect(b, ev->x, ev->y)) {
                 toggle_permission(i);
                 return false;
+            }
+        }
+        for (size_t i = 0; i < EXEC_ROWS && exec_applies(); i++) {
+            for (int c = 0; c < EXEC_CHOICES; c++) {
+                gfx_rect_t b = exec_box_rect(i, c);
+                b = gfx_rect(b.x - 6, b.y - 4, b.w + 12, b.h + 8);     // Easier to hit
+                if (in_rect(b, ev->x, ev->y)) {
+                    set_exec_choice(i, c);
+                    return false;
+                }
             }
         }
     }

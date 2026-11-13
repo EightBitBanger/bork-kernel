@@ -53,6 +53,7 @@
 #include <kernel/console/commands/kill.h>
 #include <kernel/console/commands/net.h>
 #include <kernel/console/commands/drvload.h>
+#include <kernel/console/commands/power.h>
 
 // Indexed by id, so console_command_run() needs no search and a missing or
 // misplaced row is caught at compile time (array size) or by the NULL check.
@@ -94,7 +95,10 @@ static const ConsoleCommand command_table[] = {
     [CONSOLE_CMD_NET]     = { "net",    CONSOLE_CMD_NET,     console_cmd_net,     CONSOLE_CMD_FLAG_BUILTIN, "net [scan | list] [wlanN], wireless networks" },
 
     [CONSOLE_CMD_LOAD]    = { "load",   CONSOLE_CMD_LOAD,    console_cmd_load,    CONSOLE_CMD_FLAG_BUILTIN, "load [driver file], start a driver; no file lists them" },
-    [CONSOLE_CMD_UNLOAD]  = { "unload", CONSOLE_CMD_UNLOAD,  console_cmd_unload,  CONSOLE_CMD_FLAG_BUILTIN, "unload <driver>, stop a loaded driver" }
+    [CONSOLE_CMD_UNLOAD]  = { "unload", CONSOLE_CMD_UNLOAD,  console_cmd_unload,  CONSOLE_CMD_FLAG_BUILTIN, "unload <driver>, stop a loaded driver" },
+
+    [CONSOLE_CMD_SHUTDOWN] = { "shutdown", CONSOLE_CMD_SHUTDOWN, console_cmd_shutdown, CONSOLE_CMD_FLAG_BUILTIN, "write disks out and turn the machine off" },
+    [CONSOLE_CMD_RESTART]  = { "restart",  CONSOLE_CMD_RESTART,  console_cmd_restart,  CONSOLE_CMD_FLAG_BUILTIN, "write disks out and restart" }
 };
 
 _Static_assert(sizeof(command_table) / sizeof(command_table[0]) == CONSOLE_CMD_COUNT,

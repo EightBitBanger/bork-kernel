@@ -27,11 +27,9 @@
 # is the name the code asks for ("sys/images/icon_folder.png" is
 # "icon_folder", "sys/fonts/opensans.ttf" is "opensans").
 
-# Folder policies. Every program reads sys (the explorer starts
-# sys/fileop, the dwm reads sys/images, programs load sys/lib), but only
-# an administrator may change anything in it: the desktop there starts
-# with every permission at boot, and sys/hkr is the hkey_root hive.
+# Directory security
 sys/                                 policy=user write=admin
+bin/                                 policy=user write=admin
 
 # OS core
 sys/dwm                              ../programs/dwm/dwm                      755
@@ -49,6 +47,13 @@ sys/services/audiosrv                ../programs/audiosrv/audiosrv            75
 # Libraries
 sys/lib/stb                          ../programs/stblib/stb                   644
 sys/lib/tls                          ../programs/tlslib/tls                   644
+
+# Drivers
+sys/drivers/hda                      bin/drivers/hda                          644
+sys/drivers/hda-10ec0221             bin/drivers/hda-10ec0221                 644
+sys/drivers/hda-10ec0269             bin/drivers/hda-10ec0269                 644
+sys/drivers/athn-pci                 bin/drivers/athn-pci                     644
+sys/drivers/rtw-usb                  bin/drivers/rtw-usb                      644
 
 # Settings
 sys/settings/devmgr                  ../programs/devmgr/devmgr                755
@@ -68,6 +73,7 @@ bin/httpd                            ../programs/httpd/httpd                  75
 bin/htmlview                         ../programs/htmlview/htmlview            755
 bin/play                             ../programs/play/play                    755
 bin/mediaplay                        ../programs/mediaplay/mediaplay          755
+bin/rec                              ../programs/rec/rec                      755
 
 # Games
 games/minesweeper                    ../programs/minesweeper/minesweeper      755
@@ -88,6 +94,7 @@ sys/images/ui_close                  ../bitmaps/buttons/close_red.png         64
 sys/images/ui_minimize               ../bitmaps/buttons/minimize.png          644
 sys/images/ui_start                  ../bitmaps/buttons/start.png             644
 sys/images/ui_shutdown               ../bitmaps/buttons/shutdown.png          644
+sys/images/ui_restart                ../bitmaps/buttons/restart.png           644
 sys/images/ui_refresh                ../bitmaps/buttons/refresh.png           644
 
 # Cursors

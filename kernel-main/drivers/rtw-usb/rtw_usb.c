@@ -2,26 +2,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include <kernel/arch/x86/bus/usb/usb.h>
-#include <kernel/arch/x86/bus/usb/usb_internal.h>
-#include <kernel/arch/x86/drivers/net/wlan.h>
-#include <kernel/arch/x86/drivers/net/wlan_scan.h>
-#include <kernel/arch/x86/drivers/net/wlan_dev.h>
-#include <kernel/arch/x86/drivers/net/rtw8192e.h>
-#include <kernel/driver/driver.h>
-#include <kernel/driver/device.h>
-#include <kernel/driver/chardev.h>
-#include <kernel/net/net.h>
-
-#include <kernel/kernel.h>
-#include <kernel/malloc.h>
-#include <kernel/mutex.h>
-#include <kernel/scheduler/process.h>
-#include <kernel/scheduler/scheduler.h>
-#include <kernel/syscall/syscall.h>
-#include <kernel/util/string.h>
-#include <kernel/util/timer.h>
-#include <kernel/vfs/vfs.h>
+#include "kshim.h"
+#include "rtw8192e.h"
+#include "rtw_devices.h"
+#include "rtw_rx.h"
 
 //
 // Realtek USB Wi-Fi adapters: a thin driver
@@ -29,6 +13,11 @@
 //   RTL8811AU / RTL8821AU  802.11ac "AC600" (TP-Link Archer T2U, Edimax EW-7811UTC, ...)
 //   RTL8811CU / RTL8821CU  802.11ac "AC600" (most cheap AC600 sticks since ~2019)
 //   RTL8192EU              802.11n 2x2 "300M" (TP-Link TL-WN822N v4, D-Link DWA-131 E1, ...)
+//
+// A driver file, sys/drivers/rtw-usb: the kernel loads it when one of these
+// sticks is plugged in (driver/autoload.c, rtw_devices.h), and has none of
+// this built in. The wlanN names, beacon parsing and the IP stack stay in
+// the kernel and are called through the driver table (kshim.h).
 //
 // What it does: binds the adapter's vendor interface, checks its
 // descriptors, reads the chip's version register, reads the efuse (the
@@ -106,67 +95,6 @@
 // Families (WLAN_FAMILY_* in wlan.h) plus the CD-ROM mode
 #define RTW_ZEROCD              0x80
 
-//
-// Devices handled. One list builds both the match table and the family
-// lookup, so the two can't drift apart. From the Linux rtw88 and
-// rtl8821cu / rtl8812au tables.
-//
-#define RTW_DEVICES(X) \
-    /* RTL8811AU / RTL8821AU */ \
-    X(0x0BDA, 0x0811, WLAN_FAMILY_RTL8821A)     /* Realtek reference */ \
-    X(0x0BDA, 0x0820, WLAN_FAMILY_RTL8821A) \
-    X(0x0BDA, 0x0821, WLAN_FAMILY_RTL8821A) \
-    X(0x0BDA, 0x0823, WLAN_FAMILY_RTL8821A) \
-    X(0x0BDA, 0xA811, WLAN_FAMILY_RTL8821A) \
-    X(0x0411, 0x0242, WLAN_FAMILY_RTL8821A)     /* Buffalo WI-U2-433DM */ \
-    X(0x0411, 0x029B, WLAN_FAMILY_RTL8821A)     /* Buffalo WI-U2-433DHP */ \
-    X(0x04BB, 0x0953, WLAN_FAMILY_RTL8821A)     /* I-O DATA WN-AC433UK */ \
-    X(0x056E, 0x4007, WLAN_FAMILY_RTL8821A)     /* Elecom WDC-433DU2HBK */ \
-    X(0x056E, 0x400E, WLAN_FAMILY_RTL8821A)     /* Elecom WDC-433SU2M */ \
-    X(0x056E, 0x400F, WLAN_FAMILY_RTL8821A)     /* Elecom WDC-433SU2M2 */ \
-    X(0x0846, 0x9052, WLAN_FAMILY_RTL8821A)     /* Netgear A6100 */ \
-    X(0x0E66, 0x0023, WLAN_FAMILY_RTL8821A)     /* Hawking HD65U */ \
-    X(0x2001, 0x3314, WLAN_FAMILY_RTL8821A)     /* D-Link DWA-171 rev B1 */ \
-    X(0x2001, 0x3318, WLAN_FAMILY_RTL8821A)     /* D-Link DWA-172 */ \
-    X(0x2019, 0xAB32, WLAN_FAMILY_RTL8821A)     /* Planex GW-450S */ \
-    X(0x2357, 0x011E, WLAN_FAMILY_RTL8821A)     /* TP-Link Archer T2U Nano */ \
-    X(0x2357, 0x011F, WLAN_FAMILY_RTL8821A)     /* TP-Link Archer T2U Nano */ \
-    X(0x2357, 0x0120, WLAN_FAMILY_RTL8821A)     /* TP-Link Archer T2U Plus */ \
-    X(0x2357, 0x0122, WLAN_FAMILY_RTL8821A)     /* TP-Link Archer T2U Nano */ \
-    X(0x3823, 0x6249, WLAN_FAMILY_RTL8821A)     /* Obihai OBiWiFi */ \
-    X(0x7392, 0xA811, WLAN_FAMILY_RTL8821A)     /* Edimax EW-7811UTC */ \
-    X(0x7392, 0xA812, WLAN_FAMILY_RTL8821A)     /* Edimax EW-7811UTC */ \
-    X(0x7392, 0xA813, WLAN_FAMILY_RTL8821A)     /* Edimax EW-7811UAC */ \
-    X(0x7392, 0xB611, WLAN_FAMILY_RTL8821A)     /* Edimax EW-7611UCB */ \
-    /* RTL8811CU / RTL8821CU */ \
-    X(0x0BDA, 0x2006, WLAN_FAMILY_RTL8821C)     /* Realtek reference */ \
-    X(0x0BDA, 0x8731, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0x8811, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xB820, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xB82B, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xC80C, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xC811, WLAN_FAMILY_RTL8821C)     /* Most generic AC600 sticks */ \
-    X(0x0BDA, 0xC820, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xC821, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xC82A, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xC82B, WLAN_FAMILY_RTL8821C) \
-    X(0x0BDA, 0xC82C, WLAN_FAMILY_RTL8821C) \
-    X(0x2001, 0x331D, WLAN_FAMILY_RTL8821C)     /* D-Link DWA-171 rev D1 */ \
-    X(0x7392, 0xC811, WLAN_FAMILY_RTL8821C)     /* Edimax EW-7811ULC */ \
-    X(0x7392, 0xD811, WLAN_FAMILY_RTL8821C)     /* Edimax EW-7811UTC */ \
-    /* RTL8192EU */ \
-    X(0x0BDA, 0x818B, WLAN_FAMILY_RTL8192E)     /* Realtek reference, most generic 300M sticks */ \
-    X(0x0BDA, 0x818C, WLAN_FAMILY_RTL8192E) \
-    X(0x2001, 0x3319, WLAN_FAMILY_RTL8192E)     /* D-Link DWA-131 rev E1 */ \
-    X(0x2019, 0xAB33, WLAN_FAMILY_RTL8192E)     /* Planex GW-300S-KATANA */ \
-    X(0x2357, 0x0107, WLAN_FAMILY_RTL8192E)     /* TP-Link TL-WN821N v5 */ \
-    X(0x2357, 0x0108, WLAN_FAMILY_RTL8192E)     /* TP-Link TL-WN822N v4 */ \
-    X(0x2357, 0x0109, WLAN_FAMILY_RTL8192E)     /* TP-Link TL-WN823N v2 */ \
-    X(0x7392, 0xB722, WLAN_FAMILY_RTL8192E)     /* Edimax EW-7722UTn v3 */
-
-#define RTW_ZEROCD_VENDOR       0x0BDA
-#define RTW_ZEROCD_PRODUCT      0x1A2B
-
 struct RtwId {
     uint16_t vendor;
     uint16_t product;
@@ -228,6 +156,12 @@ struct RtwAdapter {
 // adapters[] and the fields above, except while `busy`. Never held while
 // taking another lock: ioctl takes it with the VFS lock held.
 static mutex_t rtw_lock;
+
+const struct KernelApi* kapi;
+
+// The kernel log (COM1), "drv: rtw-usb: ...". Not the screen: a stick may
+// be plugged in while the desktop owns it.
+#define rtw_log(...)    kapi->log("rtw-usb: " __VA_ARGS__)
 static bool rtw_ready = false;
 static struct RtwAdapter* adapters[RTW_MAX_ADAPTERS];
 
@@ -585,24 +519,16 @@ static bool rtw_bulk_size_ok(uint8_t speed, uint16_t size) {
 }
 
 static void rtw_print_ids(const char* what, const struct RtwAdapter* a) {
-    usb_print("rtw-usb: ");
-    usb_print_hex16(a->vendor);
-    usb_print(":");
-    usb_print_hex16(a->product);
-    usb_print(" ");
-    usb_print(what);
-    usb_print("\n");
+    rtw_log("%04x:%04x %s", (unsigned)a->vendor, (unsigned)a->product, what);
 }
 
 static int rtw_probe(struct Device* dev) {
-    if (!rtw_ready) {
-        mutex_init(&rtw_lock);
-        rtw_ready = true;
-    }
+    if (!rtw_ready)
+        return PROBE_FAILED;
 
-    struct UsbDevice* udev = usb_dev(dev);
+    uint8_t speed = kapi->usb_speed(dev);
     const struct UsbInterface* itf = usb_dev_interface(dev);
-    if (udev == NULL || itf == NULL)
+    if (speed == 0 || itf == NULL)
         return PROBE_NOT_MINE;
     uint8_t family = rtw_family_of(dev->vendor, dev->product);
     if (family == 0)
@@ -611,8 +537,8 @@ static int rtw_probe(struct Device* dev) {
     // The descriptors are the device's say-so: a bulk pair of sizes its
     // speed allows, or nothing here talks to it
     if (itf->bulk_in_endpoint == 0 || itf->bulk_out_endpoint == 0 ||
-        !rtw_bulk_size_ok(udev->speed, itf->bulk_in_max_packet) ||
-        !rtw_bulk_size_ok(udev->speed, itf->bulk_out_max_packet))
+        !rtw_bulk_size_ok(speed, itf->bulk_in_max_packet) ||
+        !rtw_bulk_size_ok(speed, itf->bulk_out_max_packet))
         return PROBE_FAILED;
 
     struct RtwAdapter* a = (struct RtwAdapter*)malloc(sizeof(struct RtwAdapter));
@@ -621,7 +547,7 @@ static int rtw_probe(struct Device* dev) {
     memset(a, 0, sizeof(*a));
     a->dev     = dev;
     a->family  = family;
-    a->speed   = udev->speed;
+    a->speed   = speed;
     a->vendor  = dev->vendor;
     a->product = dev->product;
     a->crystalcap = 0x20;           // RTL8192E default, until the efuse says
@@ -675,8 +601,8 @@ static int rtw_probe(struct Device* dev) {
     a->netif = netif_register(wlan_dev_name(a->wlan), &rtw_net_ops, a, NULL, NET_MTU_DEFAULT);
 
     rtw_print_ids(rtw_chip_name(a), a);
-    if (udev->speed == USB_SPEED_FULL)
-        usb_print("rtw-usb: on a USB 1.1 port: 12 Mbit/s at most\n");
+    if (speed == USB_SPEED_FULL)
+        rtw_log("on a USB 1.1 port: 12 Mbit/s at most");
 
     // The efuse takes a few hundred register round trips: poll() does it
     mutex_lock(&rtw_lock);
@@ -750,40 +676,6 @@ static uint64_t rtw_bus_now(void) {
     return timer_get_ms();
 }
 
-// <home>/sys/firmware/<name> into a new buffer, or NULL. The file is size
-// checked before anything is allocated; its contents only go to the chip.
-static uint8_t* rtw_load_firmware(const char* name, uint32_t max, uint32_t* length) {
-    struct LocalPaths paths;
-    kernel_get_local_paths(&paths);
-    char path[VFS_PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/sys/firmware/%s", paths.home, name);
-    if (n <= 0 || n >= (int)sizeof(path))
-        return NULL;
-
-    File f = vfs_open(path, VFS_OPEN_READ);
-    if (f == VFS_INVALID_FILE)
-        return NULL;
-    uint64_t size = vfs_get_size(f);
-    uint8_t* data = NULL;
-    if (size > 0 && size <= max) {
-        data = (uint8_t*)malloc((uint32_t)size);
-        uint32_t got = 0;
-        while (data != NULL && got < (uint32_t)size) {
-            int32_t r = vfs_read(f, data + got, (uint32_t)size - got);
-            if (r <= 0)
-                break;
-            got += (uint32_t)r;
-        }
-        if (data != NULL && got != (uint32_t)size) {
-            free(data);
-            data = NULL;
-        }
-        *length = (uint32_t)size;
-    }
-    vfs_close(f);
-    return data;
-}
-
 static bool rtw_radio_up(struct RtwAdapter* a) {
     if (a->radio == NULL) {
         a->radio = (struct R92eRadio*)malloc(sizeof(struct R92eRadio));
@@ -809,26 +701,25 @@ static bool rtw_radio_up(struct RtwAdapter* a) {
             a->rx_pipe = usb_pipe_open_bulk(a->dev, itf->bulk_in_endpoint, true);
     }
     if (a->rx_buffer == NULL || a->rx_pipe == NULL) {
-        usb_print("rtw-usb: no receive pipe\n");
+        rtw_log("no receive pipe");
         return false;
     }
 
     uint32_t fw_length = 0;
-    uint8_t* fw = rtw_load_firmware(R92E_FW_NAME, R92E_FW_MAX, &fw_length);
+    // <home>/sys/firmware/rtl8192eu_nic.bin, read by the kernel: its
+    // contents only go to the chip
+    uint8_t* fw = (uint8_t*)kapi->firmware_load(R92E_FW_NAME, R92E_FW_MAX, &fw_length);
     bool have_fw = fw != NULL;
     bool ok = r92e_radio_on(r, fw, fw_length);
     free(fw);
 
-    usb_print("rtw-usb: ");
-    usb_print(wlan_dev_name(a->wlan));
     if (ok) {
-        usb_print(r->fw_loaded ? ": radio on (firmware loaded)\n"
-                               : (have_fw ? ": radio on (firmware rejected, running without)\n"
-                                             : ": radio on (no sys/firmware/" R92E_FW_NAME ", running without)\n"));
+        rtw_log("%s: radio on (%s)", wlan_dev_name(a->wlan),
+                r->fw_loaded ? "firmware loaded"
+                             : (have_fw ? "firmware rejected, running without"
+                                        : "no sys/firmware/" R92E_FW_NAME ", running without"));
     } else {
-        usb_print(": radio failed: ");
-        usb_print(r->error != NULL ? r->error : "?");
-        usb_print("\n");
+        rtw_log("%s: radio failed: %s", wlan_dev_name(a->wlan), r->error != NULL ? r->error : "?");
     }
     return ok;
 }
@@ -876,7 +767,7 @@ static bool rtw_scan_channel(struct RtwAdapter* a, uint8_t channel) {
         // Frames are never split across transfers we keep: a full buffer
         // means one ran past it, and the next transfer is its tail
         if (!skip_rest)
-            wlan_rx_walk(a->rx_buffer, (uint32_t)n, a->radio->cck_hipwr, rtw_scan_frame, &ctx);
+            rtw_rx_walk(a->rx_buffer, (uint32_t)n, a->radio->cck_hipwr, rtw_scan_frame, &ctx);
         skip_rest = n == USB_PIPE_MAX;
     }
     return true;
@@ -967,12 +858,27 @@ static void rtw_poll(void) {
 static const struct Driver rtw_usb_driver = {
     .name    = "rtw-usb",
     .abi     = DRIVER_ABI,
-    .flags   = DRIVER_BUILTIN | DRIVER_HOTPLUG,
-    .version = "0.3",
+    .flags   = DRIVER_HOTPLUG,
+    .version = "0.4",
     .match   = rtw_match,
     .probe   = rtw_probe,
     .remove  = rtw_remove,
     .poll    = rtw_poll,
     .poll_ms = RTW_POLL_MS,
 };
-DRIVER_BUILTIN_DECLARE(rtw_usb_driver);
+
+// Loaded by the kernel from <home>/sys/drivers/rtw-usb when one of its
+// sticks is plugged in (driver/autoload.c), or by "load" in the console.
+// The kernel then offers it the stick.
+KDRV_ENTRY(api) {
+    kapi = api;
+    if (api->version < 5 || api->size < sizeof(struct KernelApi) || api->usb_control == NULL)
+        return NULL;
+    if (!rtw_ready) {
+        rtw_lock = api->mutex_create();
+        if (rtw_lock == NULL)
+            return NULL;
+        rtw_ready = true;
+    }
+    return &rtw_usb_driver;
+}

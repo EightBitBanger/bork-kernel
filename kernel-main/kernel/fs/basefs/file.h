@@ -72,6 +72,11 @@ void fs_inherit_policy(struct FSDeviceContext* ctx, uint64_t parent_directory,
 // The extra clearance writing needs (FSBlockHeader.write_security)
 bool fs_file_get_write_security(struct FSDeviceContext* ctx, uint64_t address, uint32_t* security);
 bool fs_file_set_write_security(struct FSDeviceContext* ctx, uint64_t address, uint32_t security);
+// Per-program permissions (FSBlockHeader.exec_allow / exec_deny)
+bool fs_file_get_exec_permissions(struct FSDeviceContext* ctx, uint64_t address,
+                                  uint32_t* allow, uint32_t* deny);
+bool fs_file_set_exec_permissions(struct FSDeviceContext* ctx, uint64_t address,
+                                  uint32_t allow, uint32_t deny);
 bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint64_t address, uint8_t* security);  // Low byte only
 
 // The full 32-bit security mask (files and directories alike)

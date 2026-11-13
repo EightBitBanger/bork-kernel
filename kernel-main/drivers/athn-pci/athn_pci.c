@@ -2,29 +2,9 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include <kernel/arch/x86/bus/pci/pci.h>
-#include <kernel/arch/x86/drivers/net/ar9485.h>
-#include <kernel/arch/x86/drivers/net/wlan.h>
-#include <kernel/arch/x86/drivers/net/wlan_dev.h>
-#include <kernel/arch/x86/drivers/net/wlan_scan.h>
-#include <kernel/arch/x86/drivers/net/wlan_sta.h>
-#include <kernel/arch/x86/io.h>
-#include <kernel/arch/x86/virtual/vmm.h>
-#include <kernel/driver/driver.h>
-#include <kernel/driver/device.h>
-#include <kernel/net/net.h>
-
-#include <kernel/console/print.h>
-#include <kernel/crypt/random.h>
-#include <kernel/kernel.h>
-#include <kernel/malloc.h>
-#include <kernel/mutex.h>
-#include <kernel/scheduler/process.h>
-#include <kernel/scheduler/scheduler.h>
-#include <kernel/syscall/syscall.h>
-#include <kernel/util/snprint.h>
-#include <kernel/util/string.h>
-#include <kernel/util/timer.h>
+#include "kshim.h"
+#include "ar9485.h"
+#include "knet.h"
 
 //
 // Atheros AR9485 PCIe Wi-Fi (the AR5B125 Mini PCIe card, 168c:0032)
@@ -33,11 +13,17 @@
 // its ROM for the MAC address, and offers /dev/wlanN (wlan_dev.c) and a
 // network interface of the same name. A scan tunes channels 1-13 one at a
 // time and listens for beacons (passive: nothing is transmitted). A
-// connect joins one network, open or WPA2-Personal: wlan_sta.c does the
+// connect joins one network, open or WPA2-Personal: the kernel's wlan_sta.c does the
 // joining and the encryption, this file gives it the card. Once the
 // station says it is connected, the interface gets link and DHCP starts;
 // Ethernet frames from the IP stack go out as 802.11 data frames, and data
 // frames in come back as Ethernet frames. The card needs no firmware.
+//
+// A driver file, sys/drivers/athn-pci: the kernel loads it at boot when it
+// finds the card (driver/autoload.c), and has none of this built in. What
+// has no hardware in it stays in the kernel and is called through the
+// driver table (kshim.h, knet.h): the wlanN names, beacon parsing, the
+// station, the IP stack.
 //
 // The chip itself is ar9485.c. This file is the PCI side: registers, DMA
 // pages, the scan, the station's hardware, and what goes in the kernel
@@ -107,6 +93,10 @@ struct AthnAdapter {
 // adapters[] and the fields above, except while `busy`. Never held while
 // taking another lock: the wlan ops take it with the VFS or wlan lock held.
 static mutex_t athn_lock;
+
+#ifndef ATHN_HOST_TEST
+const struct KernelApi* kapi;
+#endif
 static bool athn_ready = false;
 static struct AthnAdapter* adapters[ATHN_MAX_ADAPTERS];
 
@@ -273,7 +263,7 @@ static int32_t athn_wlan_scan_start(void* ctx) {
         a->scan_count   = 0;
         memset(a->scan, 0, sizeof(a->scan));
         // Kernel console (no process): say what happens as it happens
-        a->verbose = process_current_id() == PROCESS_INVALID_ID;
+        a->verbose = kshim_from_console();
     }
     mutex_unlock(&athn_lock);
     return result;
@@ -629,11 +619,12 @@ static void athn_quiesce(struct AthnAdapter* a) {
 
 static int athn_probe(struct Device* dev) {
     if (!athn_ready) {
-        mutex_init(&athn_lock);
+        if (!kshim_mutex_make(&athn_lock))
+            return PROBE_FAILED;
         athn_ready = true;
     }
-    const struct PCIDeviceInfo* pci = (const struct PCIDeviceInfo*)dev->bus_data;
-    if (dev->bus != BUS_PCI || pci == NULL)
+    uint8_t bus, slot, func;
+    if (!kshim_pci_location(dev, &bus, &slot, &func))
         return PROBE_NOT_MINE;
 
     struct AthnAdapter* a = (struct AthnAdapter*)malloc(sizeof(struct AthnAdapter));
@@ -641,9 +632,13 @@ static int athn_probe(struct Device* dev) {
         return PROBE_FAILED;
     memset(a, 0, sizeof(*a));
     a->dev      = dev;
-    a->pci_bus  = pci->bus;
-    a->pci_dev  = pci->dev;
-    a->pci_func = pci->func;
+    a->pci_bus  = bus;
+    a->pci_dev  = slot;
+    a->pci_func = func;
+    if (!kshim_mutex_make(&a->sta_lock)) {
+        free(a);
+        return PROBE_FAILED;
+    }
 
     // Memory decoding on, its interrupt line off (polled). Bus mastering
     // waits until there are receive buffers for the card to write to.
@@ -655,6 +650,7 @@ static int athn_probe(struct Device* dev) {
     if (a->regs == NULL) {
         athn_log("168c:0032: BAR 0 could not be mapped (unassigned, or above 4 GB)");
         athn_quiesce(a);
+        kshim_mutex_drop(&a->sta_lock);
         free(a);
         return PROBE_FAILED;
     }
@@ -662,7 +658,6 @@ static int athn_probe(struct Device* dev) {
     a->chip.bus.read     = ATHN_REG_READ;
     a->chip.bus.write    = ATHN_REG_WRITE;
     a->chip.bus.delay_us = athn_delay_us;
-    mutex_init(&a->sta_lock);
 
     char line[112];
     if (!ar9485_identify(&a->chip)) {
@@ -670,6 +665,7 @@ static int athn_probe(struct Device* dev) {
                  a->chip.error != NULL ? a->chip.error : "?", (unsigned)a->chip.srev);
         athn_log(line);
         athn_quiesce(a);
+        kshim_mutex_drop(&a->sta_lock);
         free(a);
         return PROBE_FAILED;
     }
@@ -689,6 +685,7 @@ static int athn_probe(struct Device* dev) {
     if (index < 0) {
         athn_log("168c:0032: ignored: too many adapters");
         athn_quiesce(a);
+        kshim_mutex_drop(&a->sta_lock);
         free(a);
         return PROBE_FAILED;
     }
@@ -700,6 +697,7 @@ static int athn_probe(struct Device* dev) {
         adapters[index] = NULL;
         mutex_unlock(&athn_lock);
         athn_quiesce(a);
+        kshim_mutex_drop(&a->sta_lock);
         free(a);
         return PROBE_FAILED;
     }
@@ -775,6 +773,7 @@ static void athn_remove(struct Device* dev) {
     netif_unregister(a->netif);
     // Revokes open handles, and waits out a call in progress
     wlan_unregister(a->wlan);
+    kshim_mutex_drop(&a->sta_lock);
     free(a);
 }
 
@@ -907,12 +906,22 @@ static void athn_poll(void) {
 static const struct Driver athn_pci_driver = {
     .name    = "athn-pci",
     .abi     = DRIVER_ABI,
-    .flags   = DRIVER_BUILTIN,
-    .version = "0.1",
+    .version = "0.2",
     .match   = athn_match,
     .probe   = athn_probe,
     .remove  = athn_remove,
     .poll    = athn_poll,
     .poll_ms = ATHN_POLL_MS,
 };
-DRIVER_BUILTIN_DECLARE(athn_pci_driver);
+
+#ifndef ATHN_HOST_TEST
+// Loaded by the kernel from <home>/sys/drivers/athn-pci when it finds the
+// card (driver/autoload.c), or by "load" in the console. The kernel then
+// offers it the card.
+KDRV_ENTRY(api) {
+    kapi = api;
+    if (api->version < 5 || api->size < sizeof(struct KernelApi) || api->wlan_register == NULL)
+        return NULL;
+    return &athn_pci_driver;
+}
+#endif

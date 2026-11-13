@@ -110,9 +110,14 @@
 #define SYS_NET_RESOLVE 85 // (name, uint32_t* ip, timeout_ms)  0, the host's IPv4 address (needs NET)
 #define SYS_SETWRITESEC 86  // (path, mask)             0, the extra bits writing needs  (needs ADMIN + FILE_WRITE)
 #define SYS_RANDOM     87   // (buf, length)            bytes written (at most SYS_RANDOM_MAX), random bytes for keys
-#define SYS_COUNT      88
+#define SYS_SETEXECPERM 88  // (path, allow, deny)      0, a program's per-program permissions  (needs ADMIN + FILE_WRITE)
+#define SYS_POWER      89   // (op)                     does not return: SYS_POWER_OFF / SYS_POWER_RESTART (needs ADMIN)
+#define SYS_COUNT      90
 
 #define SYS_RANDOM_MAX 256  // Bytes one SYS_RANDOM call writes at most
+
+#define SYS_POWER_OFF       0   // SYS_POWER: file systems written out, then soft off
+#define SYS_POWER_RESTART   1   // SYS_POWER: file systems written out, then reset
 
 #define SYS_REG_VALUE_MAX       4096        // SYS_REG_SET: bytes in one value, at most
 
@@ -221,11 +226,14 @@ typedef struct {
 #define SYS_SEC_ELEVATE     0x00000200u
 #define SYS_SEC_NET         0x00000400u
 #define SYS_SEC_NET_CONFIG  0x00000800u     // Join / leave Wi-Fi networks (with SYS_SEC_NET)
+#define SYS_SEC_MICROPHONE  0x00001000u     // Record from a microphone (/dev/micN)
 #define SYS_SEC_NONE        0x00000000u
 #define SYS_SEC_VALID       (SYS_SEC_FILE_READ | SYS_SEC_FILE_WRITE | SYS_SEC_CONSOLE | \
                              SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | SYS_SEC_IPC | \
                              SYS_SEC_INPUT | SYS_SEC_EXEC | SYS_SEC_ADMIN | SYS_SEC_ELEVATE | \
-                             SYS_SEC_NET | SYS_SEC_NET_CONFIG)
+                             SYS_SEC_NET | SYS_SEC_NET_CONFIG | SYS_SEC_MICROPHONE)
+/* Per-program permissions: the bits a program file can be given, or kept from (SYS_SETEXECPERM) */
+#define SYS_SEC_PROGRAM_GATED   (SYS_SEC_NET | SYS_SEC_MICROPHONE | SYS_SEC_INPUT)
 
 /* SYS_ELEVATE / SYS_ELEVATE_AGENT: see "Elevation" in the kernel's syscall.h */
 #define SYS_ELEVATE_OP_REGISTER  1
@@ -404,10 +412,12 @@ typedef struct {
     uint32_t device_percent;    // DEVICE + COUNTING: how much has been counted (0..99)
     uint32_t policy;            // SYS_POLICY_*: the group policy it belongs to (0: none)
     uint32_t write_security;    // SYS_SEC_* bits writing needs on top of `security` (0: the same as reading)
+    uint32_t exec_allow;        // Program file: SYS_SEC_PROGRAM_GATED bits it is given when started (SYS_SETEXECPERM)
+    uint32_t exec_deny;         // ... and never given
     uint32_t reserved;          // 0
 } SysFileInfo;
 
-_Static_assert(sizeof(SysFileInfo) == 40, "SysFileInfo is part of the kernel ABI");
+_Static_assert(sizeof(SysFileInfo) == 48, "SysFileInfo is part of the kernel ABI");
 
 // Group policies (SysFileInfo.policy, SYS_SETPOLICY). The kernel's table,
 // listed read-only in the registry under hkey_root/system/policy/<name>

@@ -2,9 +2,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include <kernel/arch/x86/drivers/net/rtw8192e.h>
-#include <kernel/arch/x86/drivers/net/rtw8192e_tables.h>
-#include <kernel/util/string.h>
+#include <kdrv_module.h>
+
+#include "rtw8192e.h"
+#include "rtw8192e_tables.h"
 
 //
 // RTL8192EU bring-up for receiving. The sequence and values follow

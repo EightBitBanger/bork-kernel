@@ -176,6 +176,11 @@ static File do_open(const char* path, uint16_t flags) {
             return VFS_INVALID_FILE;
         }
         desc->offset = mount->type->tell(desc->handle);
+        
+        // A program's contents may be about to change: its per-program
+        // permissions belonged to the old contents, so they go
+        if (target_mode & VFS_OPEN_WRITE)
+            vfs_exec_permissions_clear_node(mount, desc->address);
     }
     
     if (!list_append(&open_files_head, &open_files_tail, desc)) {
@@ -269,6 +274,11 @@ static int32_t do_write(File file, const void* buffer, uint32_t size) {
             mount->type->seek(desc->handle, attr.size);
         int32_t written = (int32_t)mount->type->write(desc->handle, buffer, size);
         desc->offset = mount->type->tell(desc->handle);
+        // New contents: the per-program permissions belonged to the old
+        // ones. The open already dropped them, but they may have been set
+        // again since, with this handle still open.
+        if ((attr.exec_allow | attr.exec_deny) != 0)
+            vfs_exec_permissions_clear_node(mount, desc->address);
         return written;
     } else {
         uint8_t parent_perm = 0;
@@ -603,7 +613,10 @@ static bool do_truncate(const char* path, uint64_t new_size) {
     if (mount) {
         if (!vfs_fs_node_write_allowed(mount, address))
             return false;
-        return mount->type->resize(mount, address, new_size);
+        if (!mount->type->resize(mount, address, new_size))
+            return false;
+        vfs_exec_permissions_clear_node(mount, address);   // New contents: no grants (vfs_exec_permissions)
+        return true;
     }
     return false;
 }
@@ -676,6 +689,21 @@ static uint64_t do_get_size(File file) {
     } else {
         return kmalloc_get_size(desc->knode);
     }
+}
+
+// An open file's per-program permissions and what writing it needs
+// (security | write_security), from the object the handle is on
+static bool do_file_exec_info(File file, uint32_t* allow, uint32_t* deny, uint32_t* write_required) {
+    OpenFileDescriptor* desc = vfs_file_find_open(file);
+    if (!desc || !desc->in_file_system || desc->mount == NULL)
+        return false;
+    FsNodeAttr attr;
+    if (!desc->mount->type->get_attr(desc->mount, desc->address, &attr))
+        return false;
+    if (allow != NULL)          *allow = attr.exec_allow;
+    if (deny != NULL)           *deny  = attr.exec_deny;
+    if (write_required != NULL) *write_required = attr.security | attr.write_security;
+    return true;
 }
 
 static bool do_file_device(File file, uint32_t* security) {
@@ -810,6 +838,13 @@ bool vfs_node_identity(const char* path, VfsNodeIdentity* out) {
 uint64_t vfs_get_size(File file) {
     vfs_lock();
     uint64_t result = do_get_size(file);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_file_exec_info(File file, uint32_t* allow, uint32_t* deny, uint32_t* write_required) {
+    vfs_lock();
+    bool result = do_file_exec_info(file, allow, deny, write_required);
     vfs_unlock();
     return result;
 }

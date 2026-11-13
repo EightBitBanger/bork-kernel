@@ -10,6 +10,20 @@
 #include <kernel/driver/kdrv.h>
 #include <kernel/driver/kapi.h>
 #include <kernel/driver/kdrv_loader.h>
+#ifdef KERNEL_PLATFORM_X86
+#include <kernel/arch/x86/drivers/audio/hda_codec_driver.h>
+#include <kernel/arch/x86/bus/pci/pci.h>
+#include <kernel/arch/x86/bus/usb/usb.h>
+#include <kernel/arch/x86/drivers/net/wlan_dev.h>
+#include <kernel/arch/x86/drivers/net/wlan_scan.h>
+#include <kernel/arch/x86/drivers/net/wlan_sta.h>
+#include <kernel/crypt/random.h>
+#include <kernel/net/net.h>
+#include <kernel/kernel.h>
+#endif
+#include <kernel/driver/autoload.h>
+#include <kernel/console/print.h>
+#include <kernel/scheduler/process.h>
 #include <kernel/driver/drvcall.h>
 
 #include <kernel/malloc.h>
@@ -51,6 +65,134 @@ static int32_t kapi_driver_call(const char* driver, const char* function, struct
 static void* kapi_malloc(size_t size) { return malloc(size); }
 static void  kapi_free(void* ptr)     { free(ptr); }
 
+// --- KAPI 4 ---
+
+static void* kapi_mutex_create(void) {
+    mutex_t* m = (mutex_t*)malloc(sizeof(mutex_t));
+    if (m != NULL)
+        mutex_init(m);
+    return m;
+}
+static void kapi_mutex_destroy(void* m) { free(m); }
+static void kapi_mutex_lock(void* m)    { mutex_lock((mutex_t*)m); }
+static void kapi_mutex_unlock(void* m)  { mutex_unlock((mutex_t*)m); }
+
+static uint32_t kapi_caller_process(char* name, uint32_t size) {
+    ProcessId pid = process_current_id();
+    if (name != NULL && size > 0) {
+        name[0] = '\0';
+        char own[PROCESS_NAME_MAX];
+        char* path = (char*)malloc(PROCESS_PATH_MAX);
+        if (pid != PROCESS_INVALID_ID && path != NULL && ProcessGetImage(pid, own, path)) {
+            strncpy(name, own, size - 1);
+            name[size - 1] = '\0';
+        } else {
+            strncpy(name, pid == PROCESS_INVALID_ID ? "kernel" : "?", size - 1);
+            name[size - 1] = '\0';
+        }
+        if (path != NULL)
+            free(path);
+    }
+    return pid == PROCESS_INVALID_ID ? 0 : (uint32_t)pid;
+}
+
+static void* kapi_dma_alloc(uint32_t pages)          { return vmm_alloc_pages(pages); }
+static void  kapi_dma_free(void* addr, uint32_t pages) { vmm_free_pages(addr, pages); }
+static uint32_t kapi_dma_phys(const void* addr)      { return vmm_get_phys_addr((void*)addr); }
+
+#ifdef KERNEL_PLATFORM_X86
+static bool kapi_pci_location(const struct Device* dev, uint8_t* bus, uint8_t* slot, uint8_t* func) {
+    if (dev == NULL || dev->bus != BUS_PCI || dev->bus_data == NULL)
+        return false;
+    const struct PCIDeviceInfo* p = (const struct PCIDeviceInfo*)dev->bus_data;
+    if (bus)  *bus  = p->bus;
+    if (slot) *slot = p->dev;
+    if (func) *func = p->func;
+    return true;
+}
+static void* kapi_pci_map_bar(uint8_t bus, uint8_t slot, uint8_t func, uint8_t bar, uint32_t bytes, bool uncached) {
+    return pci_map_bar(bus, slot, func, bar, bytes, VM_PRESENT | VM_READWRITE | (uncached ? VM_PCD : 0));
+}
+
+// The HDA controller driver (a file since KAPI 4) and its codec-driver calls
+static const struct Driver* hda_owner;
+static bool (*hda_reg)(const struct HdaCodecDriver* d);
+static void (*hda_unreg)(const struct HdaCodecDriver* d);
+
+static char hda_owner_name[DRIVER_NAME_MAX];     // A copy: the owner's own may be freed
+
+static void kapi_hda_provider_set(const struct Driver* owner, bool (*reg)(const struct HdaCodecDriver* d),
+                                  void (*unreg)(const struct HdaCodecDriver* d)) {
+    hda_owner_name[0] = '\0';
+    if (owner != NULL) {
+        strncpy(hda_owner_name, owner->name, sizeof(hda_owner_name) - 1);
+        hda_owner_name[sizeof(hda_owner_name) - 1] = '\0';
+    }
+    hda_owner = owner;
+    hda_reg   = reg;
+    hda_unreg = unreg;
+}
+
+// Its code may be gone (kdrv_unload clears it, but be sure): only while it
+// is registered under its name
+static bool hda_provider_live(void) {
+    return hda_owner != NULL && driver_find(hda_owner_name) == hda_owner;
+}
+
+static bool kapi_hda_codec_register(const struct HdaCodecDriver* d) {
+    return hda_provider_live() && hda_reg != NULL && hda_reg(d);
+}
+static void kapi_hda_codec_unregister(const struct HdaCodecDriver* d) {
+    if (hda_provider_live() && hda_unreg != NULL)
+        hda_unreg(d);
+}
+
+// --- KAPI 5 ---
+
+static uint8_t kapi_usb_speed(const struct Device* dev) {
+    const struct UsbDevice* udev = usb_dev(dev);
+    return udev != NULL ? udev->speed : 0;
+}
+
+// <home>/sys/firmware/<name> into a new buffer, or NULL. The file is size
+// checked before anything is allocated.
+static void* kapi_firmware_load(const char* name, uint32_t max, uint32_t* length) {
+    if (name == NULL || length == NULL || name[0] == '\0' || strchr(name, '/') != NULL)
+        return NULL;
+    struct LocalPaths paths;
+    kernel_get_local_paths(&paths);
+    if (paths.home[0] != '/')
+        return NULL;
+    char path[VFS_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/sys/firmware/%s", paths.home, name);
+    if (n <= 0 || n >= (int)sizeof(path))
+        return NULL;
+
+    File f = vfs_open(path, VFS_OPEN_READ);
+    if (f == VFS_INVALID_FILE)
+        return NULL;
+    uint64_t size = vfs_get_size(f);
+    uint8_t* data = NULL;
+    if (size > 0 && size <= max) {
+        data = (uint8_t*)malloc((uint32_t)size);
+        uint32_t got = 0;
+        while (data != NULL && got < (uint32_t)size) {
+            int32_t r = vfs_read(f, data + got, (uint32_t)size - got);
+            if (r <= 0)
+                break;
+            got += (uint32_t)r;
+        }
+        if (data != NULL && got != (uint32_t)size) {
+            free(data);
+            data = NULL;
+        }
+        *length = (uint32_t)size;
+    }
+    vfs_close(f);
+    return data;
+}
+#endif
+
 static const struct KernelApi kernel_api = {
     .version                = KAPI_VERSION,
     .size                   = sizeof(struct KernelApi),
@@ -68,6 +210,61 @@ static const struct KernelApi kernel_api = {
     .chardev_copy_from_user = chardev_copy_from_user,
     .chardev_copy_to_user   = chardev_copy_to_user,
     .driver_call            = kapi_driver_call,
+#ifdef KERNEL_PLATFORM_X86
+    .hda_codec_register     = kapi_hda_codec_register,
+    .hda_codec_unregister   = kapi_hda_codec_unregister,
+#endif
+    .console_print          = print,
+    .mutex_create           = kapi_mutex_create,
+    .mutex_destroy          = kapi_mutex_destroy,
+    .mutex_lock             = kapi_mutex_lock,
+    .mutex_unlock           = kapi_mutex_unlock,
+#ifdef KERNEL_PLATFORM_X86
+    .pci_location           = kapi_pci_location,
+    .pci_read8              = pci_config_read8,
+    .pci_read16             = pci_config_read16,
+    .pci_read32             = pci_config_read,
+    .pci_write8             = pci_config_write8,
+    .pci_write16            = pci_config_write16,
+    .pci_write32            = pci_config_write,
+    .pci_enable             = pci_enable_command_bits,
+    .pci_map_bar            = kapi_pci_map_bar,
+#endif
+    .dma_alloc              = kapi_dma_alloc,
+    .dma_free               = kapi_dma_free,
+    .dma_phys               = kapi_dma_phys,
+    .caller_process         = kapi_caller_process,
+    .system_driver_load     = driver_autoload_file,
+#ifdef KERNEL_PLATFORM_X86
+    .hda_provider_set       = kapi_hda_provider_set,
+    .wlan_register          = wlan_register,
+    .wlan_dev_name          = wlan_dev_name,
+    .wlan_unregister        = wlan_unregister,
+    .wlan_parse_beacon      = wlan_parse_beacon,
+    .wlan_scan_merge        = wlan_scan_merge,
+    .wlan_sta_init          = wlan_sta_init,
+    .wlan_sta_connect       = wlan_sta_connect,
+    .wlan_sta_disconnect    = wlan_sta_disconnect,
+    .wlan_sta_rx            = wlan_sta_rx,
+    .wlan_sta_tick          = wlan_sta_tick,
+    .wlan_sta_send          = wlan_sta_send,
+    .wlan_sta_link          = wlan_sta_link,
+    .netif_register         = netif_register,
+    .netif_unregister       = netif_unregister,
+    .netif_set_link         = netif_set_link,
+    .netif_set_mac          = netif_set_mac,
+    .netif_rx               = netif_rx,
+    .random_add             = crypt_random_add,
+    .random_bytes           = crypt_random_bytes,
+    .usb_speed              = kapi_usb_speed,
+    .usb_interface          = usb_dev_interface,
+    .usb_control            = usb_dev_control,
+    .usb_pipe_open_bulk     = usb_pipe_open_bulk,
+    .usb_pipe_transfer      = usb_pipe_transfer,
+    .usb_pipe_clear_halt    = usb_pipe_clear_halt,
+    .usb_pipe_close         = usb_pipe_close,
+    .firmware_load          = kapi_firmware_load,
+#endif
 };
 
 const struct KernelApi* kapi_get(void) {
@@ -475,6 +672,10 @@ KdrvResult kdrv_unload(const char* name) {
     } else {
         // remove() has run on every device it held and its poll has
         // returned: nothing in the kernel points into it any more
+#ifdef KERNEL_PLATFORM_X86
+        if (hda_owner == module->driver)
+            kapi_hda_provider_set(NULL, NULL, NULL);
+#endif
         vmm_free_pages(module->base, module->pages);
         module->used   = false;
         module->driver = NULL;

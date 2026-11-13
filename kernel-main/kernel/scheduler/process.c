@@ -64,6 +64,7 @@ typedef struct {
     ProcessSecurity security;   // SYS_SEC_* mask, checked by every syscall
     bool elevated;              // SYS_SEC_ADMIN came from the user's yes (SYS_ELEVATE),
                                 // or from a parent that had it that way
+    bool trusted;               // A trusted launcher (process.h, PROCESS_TRUST_*)
     ProcessSecurity clearance_extra;    // Counted as file clearance only, for one
                                         // syscall (process_current_set_clearance_extra)
     char name[PROCESS_NAME_MAX];
@@ -542,6 +543,9 @@ static int process_load_flat(Process* p, void* ctx) {
 typedef struct {
     File     file;
     uint32_t size;
+    bool     exec_checked;      // Per-program permissions were applied: they must
+    uint32_t exec_allow;        // still read like this once the image is loaded
+    uint32_t exec_deny;
 } ElfSource;
 
 // ELF executable: every PT_LOAD segment where it was linked (resources/classes/elf.c)
@@ -562,6 +566,20 @@ static int process_load_elf(Process* p, void* ctx) {
             case ELF_ERR_IO:          return PROCESS_ERR_LOAD_FAILED;
             case ELF_ERR_UNSUPPORTED: return PROCESS_ERR_UNSUPPORTED;
             default:                  return PROCESS_ERR_BAD_IMAGE;
+        }
+    }
+
+    // The image was given its file's per-program permissions. Writing to
+    // the file drops them (vfs_file.c), so if they read differently now,
+    // somebody changed the file while it was being loaded: what is in
+    // memory is not what the permissions were set on.
+    if (src->exec_checked) {
+        uint32_t allow = 0, deny = 0;
+        if (!vfs_file_exec_info(src->file, &allow, &deny, NULL) ||
+            allow != src->exec_allow || deny != src->exec_deny) {
+            process_log_prefix(p->pid);
+            serial_puts("not started: the program file changed while loading\n");
+            return PROCESS_ERR_LOAD_FAILED;
         }
     }
 
@@ -647,7 +665,7 @@ _Static_assert(PROCESS_ARG_BYTES + (PROCESS_ARG_MAX + 3) * 4 + 64 < PROCESS_STAC
 // (working directory `cwd`) and the main thread.
 static ProcessId process_build(const char* name, const char* path, const char* cwd,
                                ThreadPriority priority, ProcessSecurity security, bool elevated,
-                               uint32_t argc, const char* const* argv, void* tty,
+                               bool trusted, uint32_t argc, const char* const* argv, void* tty,
                                ProcessLoadFn load, void* ctx) {
     if (priority < PRIORITY_IDLE || priority > PRIORITY_REALTIME)
         return PROCESS_ERR_INVALID_ARG;
@@ -667,6 +685,7 @@ static ProcessId process_build(const char* name, const char* path, const char* c
     p->priority = priority;
     p->security = security;         // Before the main thread exists: its first syscall is checked
     p->elevated = elevated;         // ... and so is this (sys_spawn, SYS_ELEVATE_AGENT)
+    p->trusted  = trusted;
     copy_string(p->name, (name && name[0]) ? name : "process", PROCESS_NAME_MAX);
     copy_string(p->image_path, path, PROCESS_PATH_MAX);
 
@@ -780,7 +799,7 @@ ProcessId CreateProcessFromImageWithSecurity(const char* name, const ProcessImag
 
     // No file to be next to: start at the top. argv = { name }.
     const char* arg0 = (name && name[0]) ? name : "process";
-    return process_build(name, "<memory>", "/", priority, security, false, 1, &arg0, NULL,
+    return process_build(name, "<memory>", "/", priority, security, false, false, 1, &arg0, NULL,
                          process_load_flat, (void*)image);
 }
 
@@ -846,14 +865,37 @@ ProcessId CreateProcessLaunch(const ProcessLaunch* launch) {
     if (file == VFS_INVALID_FILE)
         return PROCESS_ERR_LOAD_FAILED;
 
-    ElfSource source = { file, vfs_get_size(file) };
+    ElfSource source = { file, vfs_get_size(file), false, 0, 0 };
+
+    // What the file itself says, read from the open handle: the object
+    // that is loaded below, not whatever stands at the path a moment later
+    uint32_t allow = 0, deny = 0, write_required = 0;
+    bool has_info = vfs_file_exec_info(file, &allow, &deny, &write_required);
+
+    // Per-program permissions (SYS_SETEXECPERM), only the gated bits.
+    // Allow within what the launcher may hand out; Deny always.
+    if (launch->exec_permissions && has_info) {
+        allow &= SYS_SEC_PROGRAM_GATED;
+        deny  &= SYS_SEC_PROGRAM_GATED;
+        security |= (ProcessSecurity)(allow & launch->exec_allow);
+        security &= ~(ProcessSecurity)deny;
+        source.exec_checked = true;
+        source.exec_allow   = allow;
+        source.exec_deny    = deny;
+    }
+
+    // A trusted launcher: the kernel's own start, or a trusted parent's
+    // start of a file only an administrator can change
+    bool trusted = launch->trust == PROCESS_TRUST_KERNEL ||
+                   (launch->trust == PROCESS_TRUST_IMAGE && has_info &&
+                    (write_required & SYS_SEC_ADMIN) != 0);
 
     // Strip path from filename
     const char* name = strrchr(image_path, '/');
     name = (name != NULL) ? name + 1 : image_path;
 
-    ProcessId pid = process_build(name, image_path, cwd, priority, security, launch->elevated, argc, argv,
-                                  launch->tty, process_load_elf, &source);
+    ProcessId pid = process_build(name, image_path, cwd, priority, security, launch->elevated, trusted,
+                                  argc, argv, launch->tty, process_load_elf, &source);
 
     vfs_close(file);
     return pid;
@@ -1122,6 +1164,17 @@ bool process_current_kill_pending(void) {
 bool process_current_elevated(void) {
     ProcessId pid = process_current_id();
     return pid != PROCESS_INVALID_ID && ProcessIsElevated(pid);
+}
+
+bool process_current_trusted(void) {
+    ProcessId pid = process_current_id();
+    if (pid == PROCESS_INVALID_ID)
+        return false;
+    uint32_t irq = irq_save();
+    Process* p = process_lookup(pid);
+    bool trusted = p != NULL && p->trusted;
+    irq_restore(irq);
+    return trusted;
 }
 
 uint32_t process_current_clearance(void) {

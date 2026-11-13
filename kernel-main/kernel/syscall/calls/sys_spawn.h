@@ -218,6 +218,15 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
     if (result == SYS_OK && !vfs_check_access(q->path))
         result = SYS_EACCES;
 
+    // Per-program permissions, kept with the program file (SYS_SETEXECPERM),
+    // are applied by CreateProcessLaunch() from the file it opens, so they
+    // are those of the image that is loaded. Denied bits the program never
+    // gets. Allowed ones it gets when we hold them ourselves or are a
+    // trusted launcher (process.h, PROCESS_TRUST_*): otherwise any program
+    // could borrow them by starting the allowed one, and it asks instead.
+    bool trusted = process_current_trusted();
+    ProcessSecurity exec_allow = trusted ? SYS_SEC_PROGRAM_GATED : (mine & SYS_SEC_PROGRAM_GATED);
+
     if (result == SYS_OK) {
         ProcessLaunch launch = {
             .image_path = q->path,
@@ -228,6 +237,9 @@ static int32_t sys_spawn_launch(const SyscallArgs* args, void* tty) {
             .argv       = q->argv,
             .elevated   = elevated,
             .tty        = tty,
+            .trust      = trusted ? PROCESS_TRUST_IMAGE : PROCESS_TRUST_NONE,
+            .exec_permissions = true,
+            .exec_allow = exec_allow,
         };
         ProcessId pid = CreateProcessLaunch(&launch);
         result = (pid > 0) ? (int32_t)pid : sys_spawn_error(pid);

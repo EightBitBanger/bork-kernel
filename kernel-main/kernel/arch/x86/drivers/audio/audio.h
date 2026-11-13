@@ -48,6 +48,42 @@
 // Volume (AUDIO_IOCTL_SET_VOLUME) is the codec's own output amplifier, in
 // 0..100 per side, and a mute. It does not touch the samples.
 //
+// Sound input: /dev/micN
+//
+// The same controller's microphone (or line in), recorded from one of its
+// input streams into a ring of its own. Opening it needs SYS_SEC_MICROPHONE
+// (CharDevice.security, checked again on every read and ioctl, so taking
+// the bit away stops a handle already open). One handle at a time
+// (SYS_EBUSY while another program has it). Read-only.
+//
+//   ioctl(fd, AUDIO_IOCTL_SET_FORMAT, &f);      // rate and S16 / S32 stereo
+//   ioctl(fd, AUDIO_IOCTL_START, 0);            // or just read: that starts it
+//   read(fd, frames, bytes);                    // what has come in, whole frames
+//                                               // (0: nothing yet, try later)
+//
+// read never waits. What the program doesn't read within the ring
+// (AudioInfo.buffer_bytes, about 680 ms at 48 kHz 16-bit) is overwritten:
+// the oldest goes first and AudioStatus.underruns counts the times. STOP
+// (or close) ends the recording and powers the input path down; PAUSE is
+// the same as STOP here.
+//
+// On /dev/micN the shared structs mean:
+//   AudioInfo.rates / formats   what the ADC takes
+//   AudioInfo.outputs           AUDIO_IN_* the codec has wired up
+//   AudioInfo.hw_volume         1: SET_VOLUME has steps (the capture gain)
+//   AudioStatus.queued_bytes    recorded and not read yet
+//   AudioStatus.free_bytes      room before the oldest is overwritten
+//   AudioStatus.headphone       1: a microphone is plugged into the jack
+//   AudioStatus.underruns       overruns: times recorded sound was lost
+//   AudioStatus.played_frames   recorded since the format was set
+//   AudioStatus.written_frames  read by the program
+//   AudioVolume                 capture gain 0..100 (AudioInfo.hw_volume),
+//                               and a mute that records silence
+//
+// AUDIO_IOCTL_CAPTURE, on /dev/audioctlN or /dev/micN, says whether the
+// microphone is recording and for which program, so the tray can show it.
+// The program name is the kernel's own (the executable's file name).
+//
 
 #define AUDIO_IOCTL_INFO        0x41550001u     // 'AU' 1: struct AudioInfo* to fill
 #define AUDIO_IOCTL_SET_FORMAT  0x41550002u     // const struct AudioFormat*
@@ -59,12 +95,14 @@
 #define AUDIO_IOCTL_SET_VOLUME  0x41550008u     // const struct AudioVolume*
 #define AUDIO_IOCTL_GET_VOLUME  0x41550009u     // struct AudioVolume* to fill
 #define AUDIO_IOCTL_REPORT      0x4155000Au     // struct AudioReport* to fill: what the driver found
+#define AUDIO_IOCTL_CAPTURE     0x4155000Bu     // struct AudioCapture* to fill: who records
 
 #define AUDIO_INFO_VERSION      1
 #define AUDIO_FORMAT_VERSION    1
 #define AUDIO_STATUS_VERSION    1
 #define AUDIO_VOLUME_VERSION    1
 #define AUDIO_REPORT_VERSION    1
+#define AUDIO_CAPTURE_VERSION   1
 
 // AudioFormat.format, and bits of AudioInfo.formats
 #define AUDIO_FORMAT_S16        0x0001
@@ -87,6 +125,11 @@
 #define AUDIO_OUT_SPEAKER       0x01
 #define AUDIO_OUT_HEADPHONE     0x02
 #define AUDIO_OUT_LINE          0x04
+
+// AudioInfo.outputs on /dev/micN, AudioCapture.source
+#define AUDIO_IN_MIC            0x01    // Microphone jack
+#define AUDIO_IN_INTERNAL_MIC   0x02    // Built-in microphone
+#define AUDIO_IN_LINE           0x04    // Line in
 
 // AudioStatus.state
 #define AUDIO_STATE_STOPPED     0       // Nothing playing; a write queues and may start it
@@ -152,6 +195,24 @@ struct AudioReport {
     char     text[AUDIO_REPORT_MAX];   // Lines: controller, codec, pins, paths
 };
 
+// AUDIO_IOCTL_CAPTURE
+#define AUDIO_CAPTURE_IDLE      0       // Nobody has /dev/micN open
+#define AUDIO_CAPTURE_OPEN      1       // Open, not recording
+#define AUDIO_CAPTURE_RUNNING   2       // Recording now
+
+struct AudioCapture {
+    uint32_t version;           // AUDIO_CAPTURE_VERSION
+    uint8_t  state;             // AUDIO_CAPTURE_*
+    uint8_t  source;            // AUDIO_IN_* being recorded (0: none)
+    uint8_t  present;           // 1: /dev/micN exists (the codec has an input)
+    uint8_t  reserved;
+    uint32_t pid;               // The program holding it (0: none)
+    uint32_t starts;            // Recordings started since boot: a change means one ran
+    uint32_t rate;
+    char     program[16];       // Its executable's name, NUL-terminated
+};
+
+_Static_assert(sizeof(struct AudioCapture) == 36, "AudioCapture is an ABI");
 _Static_assert(sizeof(struct AudioInfo) == 64, "AudioInfo is an ABI");
 _Static_assert(sizeof(struct AudioFormat) == 20, "AudioFormat is an ABI");
 _Static_assert(sizeof(struct AudioStatus) == 40, "AudioStatus is an ABI");

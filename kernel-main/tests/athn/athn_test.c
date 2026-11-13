@@ -24,10 +24,13 @@ static void fake_write(void* ctx, uint32_t reg, uint32_t value);
 static void fake_tick(void);
 static inline void io_wait(void) { fake_tick(); }
 
-#include "kernel/arch/x86/drivers/net/ar9485.c"
+// The driver is a file now (drivers/athn-pci); here its two sources are
+// built as they were when it was built in, against the fakes below
+// (ATHN_HOST_TEST, see its kshim.h)
+#include "drivers/athn-pci/ar9485.c"
 #include "kernel/arch/x86/drivers/net/wlan_scan.c"
 #include "kernel/arch/x86/drivers/net/wlan_dev.c"
-#include "kernel/arch/x86/drivers/net/athn_pci.c"
+#include "drivers/athn-pci/athn_pci.c"
 #include "kernel/driver/device.c"
 
 // Built separately (their static helpers would clash with ar9485.c's):
@@ -1102,8 +1105,7 @@ int main(void) {
     CHECK(pages_live == ATHN_PAGE_COUNT);
     CHECK((pci_cmd & PCI_COMMAND_BUS_MASTER) && (pci_cmd & PCI_COMMAND_INTX_DISABLE));
     printf("%s", log_text);
-    CHECK(strstr(log_text, "athn: wlan0: AR9485 rev 1 at pci 2:00.0") != NULL);
-    CHECK(strstr(log_text, "athn: wlan0: MAC 00:13:74:12:34:56") != NULL);
+    CHECK(strstr(log_text, "Atheros AR9485 rev 1\n") != NULL);     // The one boot line
 
     struct WlanInfo info;
     CHECK(wlan_info(0, &info) == SYS_OK && info.family == WLAN_FAMILY_AR9485 && info.mac_valid &&
@@ -1412,7 +1414,7 @@ int main(void) {
         CHECK(dev != NULL && dev->driver == &athn_pci_driver && pages_live == ATHN_PAGE_COUNT);
         cd = find_cd("wlan0");
         CHECK(cd != NULL && the_netif != NULL);
-        cur_pid = 7; cur_sec = SYS_SEC_NET;
+        cur_pid = 7; cur_sec = SYS_SEC_NET | SYS_SEC_NET_CONFIG;   // Connecting needs "network settings" too
         struct AthnAdapter* a = adapters[0];
 
         #define LINK_AT 3000

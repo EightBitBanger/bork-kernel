@@ -139,7 +139,19 @@ struct __attribute__((packed)) FSBlockHeader {
     // needs what reading needs. New objects inherit their parent's.
     uint32_t write_security;
 
-    uint8_t  reserved[8];           // Free for future use, zero on format
+    // Per-program permissions (files only; 0 on directories). The
+    // SYS_SEC_* "gated" bits (SYS_SEC_PROGRAM_GATED: network, microphone,
+    // input) this program is given every time it starts (exec_allow), and
+    // those it never gets, even when the program that starts it holds them
+    // or it asks at the permission prompt (exec_deny). A bit in neither is
+    // "ask": the program gets it only the usual ways. Both are cleared when
+    // the file's contents change (open for writing, truncate), so a grant
+    // can't outlive the program it was given to, and a copy starts with
+    // none. Only an admin can set them (SYS_SETEXECPERM). These took the
+    // place of reserved[8], which format zeroed, so older volumes read as
+    // "ask" for everything. basefs only stores them: sys_spawn applies them.
+    uint32_t exec_allow;
+    uint32_t exec_deny;
 };
 
 // File header. The allocation holding it continues with file data:

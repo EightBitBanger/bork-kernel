@@ -15,11 +15,21 @@
  * when the flight ends well: down on the ground, not crashed, and Escape
  * pressed. Crash, get shot down or eject and it is lost. Then this screen
  * says how the flight went, and whether it brought a promotion. The rank
- * follows the score (ranks below).
+ * follows the score (ranks below), which is the career total: every banked
+ * flight added up. The best single banked flight is kept beside it.
+ *
+ * Medals go by one flight's score, not the total (medals below). A banked
+ * flight earns one at most: the highest its score reaches that the pilot
+ * doesn't hold yet. Each is held once, so there are never more than
+ * COUNT(medals) of them. They show as small icons on the pilot's row and by
+ * the details, and stay there beside the tombstone if the pilot dies.
  *
  * The pilots are kept in the registry (PILOT_KEY in flight.h), saved each
- * time one is added, removed, scores or dies. A dead pilot's line has a
- * fourth field, "KIA"; lines without it (from before) are living pilots.
+ * time one is added, removed, scores or dies. A line is
+ * "name<TAB>score<TAB>rank<TAB>fate<TAB>best<TAB>medals": fate is "KIA" for
+ * a dead pilot ("-" otherwise), medals a number with bit n set for medals[n].
+ * Older lines stop after the rank or the fate: living or dead as they say,
+ * no best flight, no medals.
  */
 
 #include <errno.h>
@@ -64,10 +74,39 @@ static const rank_t ranks[] = {
     { 30000, "General",            "Gen."       },
 };
 
+// One flight scoring this much earns the medal, lowest first
 typedef struct {
-    char name[PILOT_NAME_MAX + 1];
-    int  score;
-    bool dead;                      // Crashed: on the list, but can't fly
+    int         score;
+    const char* name;
+    uint32_t    ribbon, stripe;     // The ribbon, and the stripe down its middle
+    uint32_t    metal, shade;       // What hangs from it, and its edge
+} medal_t;
+
+#define C_BRONZE        GFX_RGB(190, 120, 60)
+#define C_BRONZE_EDGE   GFX_RGB(110, 62, 24)
+#define C_SILVER        GFX_RGB(206, 212, 222)
+#define C_SILVER_EDGE   GFX_RGB(110, 116, 128)
+#define C_GOLD          GFX_RGB(240, 196, 50)
+#define C_GOLD_EDGE     GFX_RGB(150, 106, 10)
+
+static const medal_t medals[] = {
+    {  300, "Air Medal",                  GFX_RGB(40, 70, 170),   GFX_RGB(240, 180, 40),  C_BRONZE, C_BRONZE_EDGE },
+    {  600, "Bronze Star",                GFX_RGB(200, 40, 40),   GFX_RGB(40, 70, 170),   C_BRONZE, C_BRONZE_EDGE },
+    { 1000, "Silver Star",                GFX_RGB(40, 70, 170),   GFX_RGB(200, 40, 40),   C_SILVER, C_SILVER_EDGE },
+    { 1500, "Distinguished Flying Cross", GFX_RGB(240, 240, 240), GFX_RGB(200, 40, 40),   C_GOLD,   C_GOLD_EDGE   },
+    { 2500, "Medal of Honor",             GFX_RGB(110, 180, 240), GFX_RGB(240, 240, 240), C_GOLD,   C_GOLD_EDGE   },
+};
+
+#define MEDAL_W         7           // The icon; 11 high, like the tombstone
+#define MEDAL_H         11
+#define MEDAL_STEP      (MEDAL_W + 2)
+
+typedef struct {
+    char     name[PILOT_NAME_MAX + 1];
+    int      score;                 // The career: every banked flight added up
+    int      best;                  // The best single banked flight
+    uint32_t medals;                // Bit n: holds medals[n]
+    bool     dead;                  // Crashed: on the list, but can't fly
 } pilot_t;
 
 int  sortie_score;
@@ -83,6 +122,7 @@ static char     typed[PILOT_NAME_MAX + 1];
 static int      delete_armed = -1;  // Delete once more removes this one
 static char     note[128];          // How the last flight went, or what went wrong
 static bool     note_good;
+static char     note_more[96];      // Under it: a medal, a new best flight
 
 static rect_t   rows[MAX_PILOTS + 1], select_button, delete_button;
 static int      rows_n;
@@ -121,14 +161,16 @@ static const char* points(int n) {
 static void say(bool good, const char* fmt, const char* a, const char* b) {
     snprintf(note, sizeof(note), fmt, a, b);
     note_good = good;
+    note_more[0] = 0;
 }
 
 static void save(void) {
     char text[OS_REG_VALUE_MAX];
     size_t n = 0;
     for (int i = 0; i < pilot_count && n < sizeof(text); i++)
-        n += (size_t)snprintf(text + n, sizeof(text) - n, "%s\t%d\t%s%s\n", pilots[i].name, pilots[i].score,
-                              ranks[rank_of(pilots[i].score)].name, pilots[i].dead ? "\tKIA" : "");
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "%s\t%d\t%s\t%s\t%d\t%u\n", pilots[i].name, pilots[i].score,
+                              ranks[rank_of(pilots[i].score)].name, pilots[i].dead ? "KIA" : "-", pilots[i].best,
+                              (unsigned)pilots[i].medals);
     if (n >= sizeof(text))
         n = sizeof(text) - 1;
     text[n] = 0;
@@ -154,10 +196,17 @@ void pilot_init(void) {
                 p->score = atoi(tab + 1);
                 if (p->score < 0)
                     p->score = 0;
-                // name, score, rank, then "KIA" for a dead one (older lines stop at the rank)
+                // name, score, rank, fate ("KIA" for a dead one), best flight, medals.
+                // Older lines stop at the rank or the fate
                 char* rank = strchr(tab + 1, '\t');
                 char* fate = rank ? strchr(rank + 1, '\t') : NULL;
+                char* best = fate ? strchr(fate + 1, '\t') : NULL;
+                char* held = best ? strchr(best + 1, '\t') : NULL;
                 p->dead = fate && !strncmp(fate + 1, "KIA", 3);
+                p->best = best ? atoi(best + 1) : 0;
+                if (p->best < 0)
+                    p->best = 0;
+                p->medals = held ? (uint32_t)strtoul(held + 1, NULL, 10) & ((1u << COUNT(medals)) - 1) : 0;
                 if (p->name[0])
                     pilot_count++;
             }
@@ -194,14 +243,25 @@ int pilot_score(void) {
 void sortie_start(void) {
     sortie_score = 0;
     note[0] = 0;
+    note_more[0] = 0;
 }
 
 void sortie_add(int pts) {
     sortie_score += pts;
 }
 
+// The medal a flight scoring that much brings: the highest it reaches that
+// isn't held already (-1: none)
+static int medal_for(const pilot_t* p, int flight) {
+    for (int m = (int)COUNT(medals) - 1; m >= 0; m--)
+        if (flight >= medals[m].score && !(p->medals & (1u << m)))
+            return m;
+    return -1;
+}
+
 void sortie_end(bool safe) {
     note[0] = 0;
+    note_more[0] = 0;
     if (current < 0)
         return;
     pilot_t* p = &pilots[current];
@@ -232,6 +292,16 @@ void sortie_end(bool safe) {
         say(false, "Back safe, %s points. Demoted to %s", got, ranks[now].name);
     else
         say(true, "Back safe, %s points%s", got, "");
+    bool record = sortie_score > p->best;
+    if (record)
+        p->best = sortie_score;
+    int medal = medal_for(p, sortie_score);
+    if (medal >= 0) {
+        p->medals |= 1u << medal;
+        snprintf(note_more, sizeof(note_more), "Awarded the %s%s", medals[medal].name, record ? ". Best flight yet!" : "");
+    } else if (record) {
+        snprintf(note_more, sizeof(note_more), "Best flight yet!");
+    }
     sortie_score = 0;
     save();
 }
@@ -259,6 +329,7 @@ static bool choose(void) {
     current = sel;
     delete_armed = -1;
     note[0] = 0;
+    note_more[0] = 0;
     os_reg_set_string(PILOT_KEY, "last", pilots[current].name);
     return true;
 }
@@ -285,6 +356,8 @@ static void add_typed(void) {
     pilot_t* p = &pilots[pilot_count];
     snprintf(p->name, sizeof(p->name), "%s", name);
     p->score = 0;
+    p->best = 0;
+    p->medals = 0;
     p->dead = false;
     sel = pilot_count++;
     typing = false;
@@ -349,6 +422,7 @@ bool pilot_key(uint16_t key) {
                 typing = true;
                 typed[0] = 0;
                 note[0] = 0;
+                note_more[0] = 0;
                 return false;
             }
             return choose();
@@ -381,6 +455,7 @@ bool pilot_click(int32_t x, int32_t y, int clicks) {
             typing = true;
             typed[0] = 0;
             note[0] = 0;
+            note_more[0] = 0;
             return false;
         }
         return clicks >= 2 && choose();
@@ -402,6 +477,34 @@ static void tombstone(int32_t x, int32_t y) {
     fill_rect(x + 4, y + 3, 1, 5, C_STONE_EDGE, 1);     // The cross
     fill_rect(x + 3, y + 4, 3, 1, C_STONE_EDGE, 1);
     fill_rect(x, y + 10, 9, 1, C_GOOD, 1);              // Grass
+}
+
+// A tiny medal, 7 x 11: a ribbon with a stripe down it, a disc hanging below
+static void medal_icon(int32_t x, int32_t y, const medal_t* m) {
+    fill_rect(x + 1, y, 5, 4, m->ribbon, 1);
+    fill_rect(x + 3, y, 1, 4, m->stripe, 1);
+    fill_rect(x + 3, y + 4, 1, 1, m->shade, 1);         // The ring it hangs by
+    fill_rect(x + 2, y + 5, 3, 6, m->shade, 1);
+    fill_rect(x + 1, y + 6, 5, 4, m->shade, 1);
+    fill_rect(x + 2, y + 6, 3, 4, m->metal, 1);
+    fill_rect(x + 3, y + 7, 1, 2, m->shade, 1);         // Something struck on it
+}
+
+static int medal_count(const pilot_t* p) {
+    int n = 0;
+    for (int m = 0; m < (int)COUNT(medals); m++)
+        n += (p->medals >> m) & 1;
+    return n;
+}
+
+// The pilot's medals in a row ending at right, highest first
+static void medal_row(int32_t right, int32_t y, const pilot_t* p) {
+    int32_t x = right - medal_count(p) * MEDAL_STEP + 2;
+    for (int m = (int)COUNT(medals) - 1; m >= 0; m--)
+        if (p->medals & (1u << m)) {
+            medal_icon(x, y, &medals[m]);
+            x += MEDAL_STEP;
+        }
 }
 
 static const char* row_name(int i) {
@@ -439,8 +542,11 @@ void pilot_draw(void) {
     rows_n = menu_list(x + 12, top, w - 24, nrows, "PILOT", pilot_count + 1, sel, &first_row, true, row_name, rows);
     for (int i = 0; i < rows_n; i++) {
         int k = first_row + i;
-        if (k < pilot_count)
+        if (k < pilot_count) {
             text_at(rows[i].x + rows[i].w - 8, rows[i].y + 2, 1, C_TEXT, "%s", points(pilots[k].score));
+            // The medals, left of where the longest score would start
+            medal_row(rows[i].x + rows[i].w - 8 - cw * 8, rows[i].y + (rows[i].h - MEDAL_H) / 2, &pilots[k]);
+        }
         if (k < pilot_count && pilots[k].dead)
             tombstone(rows[i].x + 6 + (cw * 2 - 9) / 2, rows[i].y + (rows[i].h - 11) / 2);
     }
@@ -456,17 +562,31 @@ void pilot_draw(void) {
         int r = rank_of(p->score);
         text_at(dx, dy, -1, C_TEXT, "%s %s", ranks[r].name, p->name);
         if (p->dead)
+            tombstone(x + w - 12 - 9, dy + (lh - 11) / 2);
+        medal_row(x + w - 12 - (p->dead ? 9 + 4 : 0), dy + (lh - MEDAL_H) / 2, p);
+        if (p->dead)
             text_at(dx, dy + lh, -1, C_DEAD_TEXT, "Killed in action with %s points. Can't fly; Delete removes", points(p->score));
         else if (r + 1 < (int)COUNT(ranks))
-            text_at(dx, dy + lh, -1, C_TEXT, "%s points, %s more to %s", points(p->score),
+            text_at(dx, dy + lh, -1, C_TEXT, "%s career points, %s more to %s", points(p->score),
                     points(ranks[r + 1].score - p->score), ranks[r + 1].name);
         else
-            text_at(dx, dy + lh, -1, C_TEXT, "%s points, the top rank", points(p->score));
+            text_at(dx, dy + lh, -1, C_TEXT, "%s career points, the top rank", points(p->score));
+        int next = 0;                                   // The lowest one not held yet
+        while (next < (int)COUNT(medals) && (p->medals & (1u << next)))
+            next++;
+        if (p->dead || next >= (int)COUNT(medals))
+            text_at(dx, dy + lh * 2, -1, p->dead ? C_DEAD_TEXT : C_TEXT, "Best flight %s, %d of %d medals", points(p->best),
+                    medal_count(p), (int)COUNT(medals));
+        else
+            text_at(dx, dy + lh * 2, -1, C_TEXT, "Best flight %s. Next medal: a flight of %s", points(p->best),
+                    points(medals[next].score));
     } else {
         text_at(dx, dy, -1, C_TEXT, "Enter to sign up a new pilot");
     }
     if (note[0])
-        text_at(dx, dy + lh * 2 + 4, -1, note_good ? C_GOOD : C_TEXT_ALERT, "%s", note);
+        text_at(dx, dy + lh * 3 + 2, -1, note_good ? C_GOOD : C_TEXT_ALERT, "%s", note);
+    if (note[0] && note_more[0])
+        text_at(dx, dy + lh * 4 + 2, -1, C_GOOD, "%s", note_more);
 
     // SELECT and DELETE, and the keys
     int32_t bw = cw * 14, bh = lh + 8;

@@ -63,6 +63,7 @@
 
 // Random bytes from the kernel's pool (always allowed)
 #include <kernel/syscall/calls/sys_random.h>    // random
+#include <kernel/syscall/calls/sys_power.h>     // power
 
 typedef struct {
     const char* name;       // For traces and reports
@@ -169,6 +170,8 @@ static const SyscallEntry syscall_table[] = {
     [SYS_NET_RESOLVE] = { "net_resolve", sys_net_resolve, NET },
     [SYS_SETWRITESEC] = { "setwritesec", sys_setwritesec, SYS_SEC_ADMIN | W },
     [SYS_RANDOM]      = { "random",      sys_random,      0 },
+    [SYS_SETEXECPERM] = { "setexecperm", sys_setexecperm, SYS_SEC_ADMIN | W },
+    [SYS_POWER]       = { "power",       sys_power,       SYS_SEC_ADMIN },
 };
 
 #undef R

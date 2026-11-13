@@ -375,6 +375,67 @@ bool vfs_set_write_security(const char* path, uint32_t security) {
     return result;
 }
 
+// Per-program permissions (FsNodeAttr.exec_allow / exec_deny)
+static bool do_get_exec_permissions(const char* path, uint32_t* allow, uint32_t* deny) {
+    if (!vfs_path_fits(path) || allow == NULL || deny == NULL)
+        return false;
+    uint64_t address = resolve_path_to_address(path);
+    if (vfs_address_is_null(address))
+        return false;
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount == NULL || address == FS_NODE_NULL || address == 0)
+        return false;
+    FsNodeAttr attr;
+    if (!mount->type->get_attr(mount, address, &attr))
+        return false;
+    *allow = attr.exec_allow;
+    *deny  = attr.exec_deny;
+    return true;
+}
+
+// Only an administrator, and only on a file it may reach
+static bool do_set_exec_permissions(const char* path, uint32_t allow, uint32_t deny) {
+    if ((vfs_caller_clearance() & VFS_SECURITY_ADMIN) != VFS_SECURITY_ADMIN)
+        return false;
+    uint32_t old_allow = 0, old_deny = 0;
+    if (!do_get_exec_permissions(path, &old_allow, &old_deny))
+        return false;
+    if (!vfs_parent_allowed(path))
+        return false;
+    if (old_allow == allow && old_deny == deny)
+        return true;
+    uint64_t address = resolve_path_to_address(path);
+    struct FsMount* mount = vfs_device_get_context(path);
+    if (mount == NULL || mount->type->set_exec_permissions == NULL)
+        return false;   // The filesystem cannot store them (FAT)
+    if (mount->type->node_type(mount, address) != FS_NODE_FILE)
+        return false;   // Programs only
+    return mount->type->set_exec_permissions(mount, address, allow, deny);
+}
+
+void vfs_exec_permissions_clear_node(struct FsMount* mount, uint64_t address) {
+    if (mount == NULL || mount->type->set_exec_permissions == NULL || mount->type->get_attr == NULL)
+        return;
+    FsNodeAttr attr;
+    if (!mount->type->get_attr(mount, address, &attr) || (attr.exec_allow | attr.exec_deny) == 0)
+        return;
+    mount->type->set_exec_permissions(mount, address, 0, 0);
+}
+
+bool vfs_get_exec_permissions(const char* path, uint32_t* allow, uint32_t* deny) {
+    vfs_lock();
+    bool result = do_get_exec_permissions(path, allow, deny);
+    vfs_unlock();
+    return result;
+}
+
+bool vfs_set_exec_permissions(const char* path, uint32_t allow, uint32_t deny) {
+    vfs_lock();
+    bool result = do_set_exec_permissions(path, allow, deny);
+    vfs_unlock();
+    return result;
+}
+
 bool vfs_get_security(const char* path, uint32_t* security) {
     vfs_lock();
     bool result = do_get_security(path, security);

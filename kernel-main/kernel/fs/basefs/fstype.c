@@ -262,6 +262,7 @@ static bool basefs_get_attr(struct FsMount* m, uint64_t node, FsNodeAttr* out) {
     fs_file_get_security(ctx, node, &out->security);
     fs_file_get_write_security(ctx, node, &out->write_security);
     fs_file_get_policy(ctx, node, &out->policy);
+    fs_file_get_exec_permissions(ctx, node, &out->exec_allow, &out->exec_deny);
     fs_file_get_times(ctx, node, &out->created, &out->modified);
     return true;
 }
@@ -276,6 +277,10 @@ static bool basefs_set_security(struct FsMount* m, uint64_t node, uint32_t secur
 
 static bool basefs_set_write_security(struct FsMount* m, uint64_t node, uint32_t security) {
     return fs_file_set_write_security(basefs_ctx(m), node, security);
+}
+
+static bool basefs_set_exec_permissions(struct FsMount* m, uint64_t node, uint32_t allow, uint32_t deny) {
+    return fs_file_set_exec_permissions(basefs_ctx(m), node, allow, deny);
 }
 
 static bool basefs_set_policy(struct FsMount* m, uint64_t node, uint32_t policy) {
@@ -355,6 +360,7 @@ const struct FsType fs_type_basefs = {
     .set_security    = basefs_set_security,
     .set_policy      = basefs_set_policy,
     .set_write_security = basefs_set_write_security,
+    .set_exec_permissions = basefs_set_exec_permissions,
 
     .open            = basefs_open,
     .close           = basefs_close,

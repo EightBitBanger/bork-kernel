@@ -106,6 +106,10 @@ int console_cmd_execute(int arg_count, char** args, uint32_t security, uint8_t f
         .security   = (ProcessSecurity)security,
         .argc       = (uint32_t)arg_count,
         .argv       = argv,
+        // The kernel's own start (the desktop at boot, a command typed
+        // here): a trusted launcher. The mask is as given: the file's
+        // per-program permissions are for programs that programs start.
+        .trust      = PROCESS_TRUST_KERNEL,
     };
     ProcessId pid = CreateProcessLaunch(&launch);
 

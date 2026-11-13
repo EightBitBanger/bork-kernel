@@ -50,6 +50,8 @@ typedef struct {
     uint32_t security;              // VFS_SECURITY_* mask, 0 if the type has none
     uint32_t write_security;        // Extra bits writing needs on top of `security`, 0 if none
     uint32_t policy;                // Group policy id (POLICY_*), 0 if none or the type has none
+    uint32_t exec_allow;            // Per-program permissions: gated bits always given (files only),
+    uint32_t exec_deny;             // and never given; 0 if none or the type has none
     uint32_t created;               // Seconds since the Unix epoch, 0 = unknown
     uint32_t modified;
 } FsNodeAttr;
@@ -169,6 +171,7 @@ struct FsType {
     bool (*set_security)(struct FsMount* m, uint64_t node, uint32_t security);
     bool (*set_policy)(struct FsMount* m, uint64_t node, uint32_t policy);
     bool (*set_write_security)(struct FsMount* m, uint64_t node, uint32_t security);
+    bool (*set_exec_permissions)(struct FsMount* m, uint64_t node, uint32_t allow, uint32_t deny);
 
     //
     // Open files

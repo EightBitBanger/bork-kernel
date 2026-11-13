@@ -2,7 +2,8 @@
 # Clears all built program binaries
 #
 
-(cd ../programs/libc      && ./clear.sh)
+(cd ../libc      && ./clear.sh)
+
 (cd ../programs/stblib    && ./clear.sh)
 (cd ../programs/tlslib    && ./clear.sh)
 
@@ -38,6 +39,8 @@
 (cd ../programs/htmlview && ./clear.sh)
 (cd ../programs/httpd    && ./clear.sh)
 (cd ../programs/mediaplay && ./clear.sh)
+(cd ../programs/play      && ./clear.sh)
+(cd ../programs/rec       && ./clear.sh)
 
 # Games
 

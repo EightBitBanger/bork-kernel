@@ -31,6 +31,10 @@
  *                    given it; listening below port 1024 needs SEC_ADMIN too
  *   SEC_NET_CONFIG   join or leave a Wi-Fi network (with SEC_NET); only the
  *                    network tray has it
+ *   SEC_MICROPHONE   record sound from a microphone: os/audio.h mic_open
+ *                    (/dev/micN). Off unless a program is given it (ask
+ *                    with mic_request). Playing sound needs no bit of its
+ *                    own.
  *
  * Always available: exit, sbrk/malloc, sleep, yield, getpid, close, lseek,
  * getcwd, ipc_close, ipc_info, net_close, and reading this process's own mask.
@@ -64,6 +68,11 @@ typedef uint32_t sec_mask_t;
 #define SEC_ELEVATE      SYS_SEC_ELEVATE
 #define SEC_NET          SYS_SEC_NET
 #define SEC_NET_CONFIG   SYS_SEC_NET_CONFIG
+#define SEC_MICROPHONE   SYS_SEC_MICROPHONE
+
+// The bits a program file can be given or kept from by itself: its
+// per-program permissions (os_set_exec_permissions in os/os.h)
+#define SEC_PROGRAM_GATED SYS_SEC_PROGRAM_GATED
 
 #define SEC_NONE         SYS_SEC_NONE
 #define SEC_ALL          SYS_SEC_VALID      // Every bit the kernel knows

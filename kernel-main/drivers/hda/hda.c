@@ -2,25 +2,9 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include <kernel/arch/x86/bus/pci/pci.h>
-#include <kernel/arch/x86/drivers/audio/audio.h>
-#include <kernel/arch/x86/drivers/audio/hda.h>
-#include <kernel/arch/x86/drivers/audio/hda_regs.h>
-#include <kernel/arch/x86/drivers/serial.h>
-#include <kernel/arch/x86/io.h>
-#include <kernel/arch/x86/virtual/vmm.h>
-#include <kernel/driver/chardev.h>
-#include <kernel/driver/device.h>
-#include <kernel/driver/driver.h>
-
-#include <kernel/console/print.h>
-#include <kernel/malloc.h>
-#include <kernel/mutex.h>
-#include <kernel/scheduler/scheduler.h>
-#include <kernel/syscall/syscall.h>
-#include <kernel/util/snprint.h>
-#include <kernel/util/string.h>
-#include <kernel/util/timer.h>
+#include "kshim.h"
+#include "hda.h"
+#include "hda_regs.h"
 
 //
 // Intel High Definition Audio controllers, for the Realtek ALC269 codec
@@ -40,8 +24,31 @@
 // the drivers thread; what has been played is zeroed behind it, so a
 // program that stops writing gets silence, never the old ring again.
 //
-// Output only: no recording, no mixing, no resampling. One handle at a
-// time.
+// Recording: the first input stream, from a ring of HDA_CAP_PAGES pages,
+// as /dev/micN (audio.h), which only a program with SYS_SEC_MICROPHONE can
+// open. The codec routes one input (a microphone plugged into the jack,
+// else the built-in one) to its ADC while the stream runs and takes it down
+// again when it stops; the jack is watched while it runs and the input
+// follows a microphone being plugged in or pulled out. The stream's
+// position is read on every read and every HDA_POLL_MS; what the program
+// hasn't read when the ring comes round again is dropped, oldest first.
+//
+// Codec drivers (hda_codec_driver.h): what one machine's codec needs on top
+// of the generic codec code, registered from a driver file. Once the system
+// disk is mounted, the poll looks once for <home>/sys/drivers/hda-<codec
+// vendor id> for each codec no codec driver has claimed and loads it when
+// only an admin can change it; registering or unregistering one sets the
+// codec up again (hda_rebind).
+//
+// No mixing, no resampling. One handle at a time on each device.
+//
+// A driver file (sys/drivers/hda) since KAPI 4, not part of the kernel: the
+// kernel loads it when it finds an HD Audio controller (driver/autoload.c),
+// after the system disk is mounted, and "unload hda" takes it out again.
+// Everything it needs from the kernel goes through the driver table
+// (kapi.h); kshim.h keeps the names the code used while it was built in.
+// Codec driver files reach it through KernelApi.hda_codec_register, which
+// the kernel passes on here (hda_provider_set in kdrv_entry, below).
 //
 // DMA memory is ordinary cached kernel pages. Most controllers snoop the
 // CPU caches; for those that don't (the ATI SB4xx-SB8xx / Hudson ones need
@@ -57,6 +64,9 @@
 #define HDA_JACK_MS         250
 #define HDA_VERB_TIMEOUT_MS 20
 #define HDA_STREAM_TAG      1
+#define HDA_CAP_TAG         2           // The input stream's tag
+#define HDA_CAP_PAGES       32          // Recording ring: 128 KB, 680 ms of 48 kHz 16-bit stereo
+#define HDA_CAP_BYTES       (HDA_CAP_PAGES * PAGE_SIZE)
 #define HDA_DEFAULT_VOLUME  80
 
 static const struct DeviceMatch hda_match[] = {
@@ -97,7 +107,40 @@ struct HdaController {
     uint8_t*  page[HDA_BUF_PAGES];
     uint32_t  page_phys[HDA_BUF_PAGES];
 
+    // The input stream (cap_sd_base 0: the controller has none, or no input)
+    struct CharDevice* mic;         // /dev/micN
+    uint8_t   cap_sd;
+    uint32_t  cap_sd_base;
+    uint16_t  cap_fifo;
+    struct HdaBdlEntry* cap_bdl;
+    uint32_t  cap_bdl_phys;
+    uint8_t*  cap_page[HDA_CAP_PAGES];
+    uint32_t  cap_page_phys[HDA_CAP_PAGES];
+
     struct HdaCodec* codec;
+    bool      autoload_done;        // Looked for <home>/sys/drivers/hda-<codec id> (the poll)
+
+    // Recording state (hda_lock)
+    bool      cap_open;
+    bool      cap_running;
+    int       cap_path;             // hc->codec->in[] being recorded (-1: none)
+    uint32_t  cap_pid;
+    char      cap_program[16];
+    uint32_t  cap_starts;
+    uint32_t  cap_rate;
+    uint16_t  cap_format;           // AUDIO_FORMAT_*
+    uint16_t  cap_hda_format;
+    uint16_t  cap_frame_bytes;
+    uint32_t  cap_bytes_per_sec;
+    uint8_t   cap_gain;             // 0..100
+    bool      cap_muted;
+    uint64_t  cap_pos;              // Ring bytes the controller has filled since the start
+    uint64_t  cap_read_pos;         // Ring bytes handed to the program
+    uint32_t  cap_last_lpib;
+    uint64_t  cap_last_ms;
+    uint32_t  cap_overruns;
+    uint64_t  cap_recorded;         // Bytes since the format was set
+    uint64_t  cap_read_total;
 
     // State (hda_lock)
     bool      open;
@@ -122,18 +165,23 @@ struct HdaController {
     uint64_t  last_jack_ms;
 };
 
-static mutex_t hda_lock;
+const struct KernelApi* kapi;
+
+static mutex_t hda_lock;            // Made in kdrv_entry
 static bool hda_ready = false;
 static struct HdaController* controllers[HDA_MAX_CONTROLLERS];
+
+// Registered codec drivers (hda_lock, and changed only with the driver lock
+// held too: from a module's probe / remove)
+static const struct HdaCodecDriver* codec_drivers[HDA_CODEC_DRIVERS_MAX];
+
 
 //
 // Kernel log: one line at boot on the screen, details on COM1
 //
 
 static void hda_serial(const char* text) {
-    serial_puts("hda: ");
-    serial_puts(text);
-    serial_puts("\n");
+    kapi->log("hda: %s", text);     // "drv: hda: ..." on COM1
 }
 
 //
@@ -266,6 +314,36 @@ static void hda_free_pages(struct HdaController* hc) {
             vmm_free_pages(hc->page[i], 1);
         hc->page[i] = NULL;
     }
+    if (hc->cap_bdl != NULL)
+        vmm_free_pages(hc->cap_bdl, 1);
+    hc->cap_bdl = NULL;
+    for (uint32_t i = 0; i < HDA_CAP_PAGES; i++) {
+        if (hc->cap_page[i] != NULL)
+            vmm_free_pages(hc->cap_page[i], 1);
+        hc->cap_page[i] = NULL;
+    }
+}
+
+// The recording ring, only for a controller with an input stream and a
+// codec with an input. False (and nothing kept) when out of memory.
+static bool hda_alloc_capture(struct HdaController* hc) {
+    hc->cap_bdl = (struct HdaBdlEntry*)hda_page(&hc->cap_bdl_phys);
+    bool ok = hc->cap_bdl != NULL;
+    for (uint32_t i = 0; i < HDA_CAP_PAGES && ok; i++) {
+        hc->cap_page[i] = (uint8_t*)hda_page(&hc->cap_page_phys[i]);
+        ok = hc->cap_page[i] != NULL;
+    }
+    if (!ok) {
+        if (hc->cap_bdl != NULL)
+            vmm_free_pages(hc->cap_bdl, 1);
+        hc->cap_bdl = NULL;
+        for (uint32_t i = 0; i < HDA_CAP_PAGES; i++) {
+            if (hc->cap_page[i] != NULL)
+                vmm_free_pages(hc->cap_page[i], 1);
+            hc->cap_page[i] = NULL;
+        }
+    }
+    return ok;
 }
 
 static bool hda_alloc_pages(struct HdaController* hc) {
@@ -731,6 +809,189 @@ static uint32_t hda_free_bytes(const struct HdaController* hc) {
     return free / hc->frame_bytes * hc->frame_bytes;
 }
 
+
+//
+// The input stream (hda_lock held)
+//
+
+// Bytes behind the controller's position not read yet: the stretch it has
+// counted off the link but may still hold in its FIFO
+static uint32_t hda_cap_lag(const struct HdaController* hc) {
+    uint32_t g = (uint32_t)hc->cap_fifo + 64;
+    return (g + hc->cap_frame_bytes - 1) / hc->cap_frame_bytes * hc->cap_frame_bytes;
+}
+
+static uint32_t hda_cap_available(const struct HdaController* hc) {
+    uint32_t lag = hda_cap_lag(hc);
+    uint64_t ready = (hc->cap_pos > lag) ? hc->cap_pos - lag : 0;
+    return (ready > hc->cap_read_pos) ? (uint32_t)(ready - hc->cap_read_pos) : 0;
+}
+
+static void hda_cap_hw_stop(struct HdaController* hc) {
+    uint32_t base = hc->cap_sd_base;
+    uint8_t ctl = r8(hc, base + HDA_SD_CTL);
+    w8(hc, base + HDA_SD_CTL, (uint8_t)(ctl & ~(HDA_SD_CTL_RUN | 0x1C)));
+    hda_wait8(hc, base + HDA_SD_CTL, HDA_SD_CTL_RUN, 0, 20);
+    w8(hc, base + HDA_SD_STS, HDA_SD_STS_ALL);
+}
+
+// Stream stopped, its descriptor reset and pointed at the ring, emptied
+static void hda_cap_reset(struct HdaController* hc) {
+    hda_cap_hw_stop(hc);
+    uint32_t base = hc->cap_sd_base;
+    w8(hc, base + HDA_SD_CTL, (uint8_t)(r8(hc, base + HDA_SD_CTL) | HDA_SD_CTL_SRST));
+    hda_wait8(hc, base + HDA_SD_CTL, HDA_SD_CTL_SRST, HDA_SD_CTL_SRST, 20);
+    w8(hc, base + HDA_SD_CTL, (uint8_t)(r8(hc, base + HDA_SD_CTL) & ~HDA_SD_CTL_SRST));
+    hda_wait8(hc, base + HDA_SD_CTL, HDA_SD_CTL_SRST, 0, 20);
+
+    for (uint32_t i = 0; i < HDA_CAP_PAGES; i++) {
+        memset(hc->cap_page[i], 0, PAGE_SIZE);
+        hda_flush(hc->cap_page[i], PAGE_SIZE);
+        hc->cap_bdl[i].addr_lo = hc->cap_page_phys[i];
+        hc->cap_bdl[i].addr_hi = 0;
+        hc->cap_bdl[i].length  = PAGE_SIZE;
+        hc->cap_bdl[i].flags   = 0;
+    }
+    hda_flush(hc->cap_bdl, sizeof(struct HdaBdlEntry) * HDA_CAP_PAGES);
+
+    w32(hc, base + HDA_SD_BDPL, hc->cap_bdl_phys);
+    w32(hc, base + HDA_SD_BDPU, 0);
+    w32(hc, base + HDA_SD_CBL, HDA_CAP_BYTES);
+    w16(hc, base + HDA_SD_LVI, HDA_CAP_PAGES - 1);
+    w16(hc, base + HDA_SD_FMT, hc->cap_hda_format);
+    uint32_t ctl = r32(hc, base + HDA_SD_CTL) & 0x00FFFFFFu;
+    ctl = (ctl & ~0x00F00000u) | ((uint32_t)HDA_CAP_TAG << 20);
+    w32(hc, base + HDA_SD_CTL, ctl & ~(uint32_t)(HDA_SD_CTL_RUN | HDA_SD_CTL_SRST));
+    w8(hc, base + HDA_SD_STS, HDA_SD_STS_ALL);
+    hc->cap_fifo = r16(hc, base + HDA_SD_FIFOS);
+    if (hc->cap_fifo > 4096)
+        hc->cap_fifo = 4096;
+
+    hc->cap_pos       = 0;
+    hc->cap_read_pos  = 0;
+    hc->cap_last_lpib = 0;
+}
+
+// Catch up with the controller: count what came in, drop what is about to
+// be written over
+static void hda_cap_update(struct HdaController* hc) {
+    if (!hc->cap_running)
+        return;
+    uint64_t now  = timer_get_ms();
+    uint32_t lpib = r32(hc, hc->cap_sd_base + HDA_SD_LPIB);
+    if (lpib >= HDA_CAP_BYTES)
+        lpib = hc->cap_last_lpib;
+    uint32_t delta = (lpib + HDA_CAP_BYTES - hc->cap_last_lpib) % HDA_CAP_BYTES;
+    uint64_t away  = now - hc->cap_last_ms;
+    bool lost = hc->cap_bytes_per_sec != 0 &&
+                away * hc->cap_bytes_per_sec / 1000 + (uint64_t)hc->cap_frame_bytes * 64 >= HDA_CAP_BYTES;
+    hc->cap_last_lpib = lpib;
+    hc->cap_last_ms   = now;
+    if (lost) {
+        // Gone round more than once, maybe: only what is there now counts
+        uint64_t round = (hc->cap_pos - hc->cap_pos % HDA_CAP_BYTES) + HDA_CAP_BYTES;
+        uint64_t pos = round + lpib;
+        hc->cap_recorded += pos - hc->cap_pos;
+        hc->cap_pos = pos;
+        hc->cap_read_pos = pos;
+        hc->cap_overruns++;
+        return;
+    }
+    hc->cap_pos      += delta;
+    hc->cap_recorded += delta;
+    // The page ahead of the controller is being written: never read it
+    uint64_t keep = HDA_CAP_BYTES - PAGE_SIZE;
+    if (hc->cap_pos - hc->cap_read_pos > keep) {
+        hc->cap_read_pos = hc->cap_pos - keep;
+        hc->cap_read_pos -= hc->cap_read_pos % hc->cap_frame_bytes;
+        hc->cap_overruns++;
+    }
+}
+
+static void hda_cap_apply_gain(struct HdaController* hc) {
+    if (hc->cap_path >= 0)
+        hda_codec_capture_gain(hc, hda_verb, hc->codec, hc->cap_path, hc->cap_gain, hc->cap_muted);
+}
+
+static int32_t hda_cap_start(struct HdaController* hc) {
+    if (hc->cap_running)
+        return SYS_OK;
+    int path = hda_codec_capture_pick(hc, hda_verb, hc->codec);
+    if (path < 0)
+        return SYS_EIO;
+    hda_cap_reset(hc);
+    hc->cap_path = path;
+    hda_codec_capture(hc, hda_verb, hc->codec, path, HDA_CAP_TAG, hc->cap_hda_format);
+    hda_cap_apply_gain(hc);
+
+    w8(hc, hc->cap_sd_base + HDA_SD_STS, HDA_SD_STS_ALL);
+    uint8_t ctl = r8(hc, hc->cap_sd_base + HDA_SD_CTL);
+    w8(hc, hc->cap_sd_base + HDA_SD_CTL, (uint8_t)((ctl & ~0x1Cu) | HDA_SD_CTL_RUN));
+    hc->cap_running = true;
+    hc->cap_last_ms = timer_get_ms();
+    hc->cap_starts++;
+    return SYS_OK;
+}
+
+// What was recorded and not read stays readable until the next start
+static void hda_cap_stop(struct HdaController* hc) {
+    if (!hc->cap_running)
+        return;
+    hda_cap_update(hc);
+    hda_cap_hw_stop(hc);
+    hda_codec_capture(hc, hda_verb, hc->codec, -1, 0, 0);
+    hc->cap_running = false;
+    hc->cap_path = -1;
+}
+
+// A microphone plugged in or pulled out while recording: follow it
+static void hda_cap_jack(struct HdaController* hc) {
+    if (!hc->cap_running)
+        return;
+    int path = hda_codec_capture_pick(hc, hda_verb, hc->codec);
+    if (path < 0 || path == hc->cap_path)
+        return;
+    hda_codec_capture(hc, hda_verb, hc->codec, path, HDA_CAP_TAG, hc->cap_hda_format);
+    hc->cap_path = path;
+    hda_cap_apply_gain(hc);
+}
+
+static int32_t hda_cap_set_format(struct HdaController* hc, const struct AudioFormat* f) {
+    const struct HdaCodec* c = hc->codec;
+    uint16_t fmt;
+    uint32_t bit;
+    if (f->channels != 2 || !hda_rate(f->rate, &fmt, &bit) || !(c->in_rates & bit))
+        return SYS_EINVAL;
+    uint32_t formats = 0;
+    if (c->in_bits & 0x02) formats |= AUDIO_FORMAT_S16;
+    if (c->in_bits & 0x1C) formats |= AUDIO_FORMAT_S32;
+    if (!(formats & f->format) || (f->format != AUDIO_FORMAT_S16 && f->format != AUDIO_FORMAT_S32))
+        return SYS_EINVAL;
+    uint16_t frame;
+    if (f->format == AUDIO_FORMAT_S16) {
+        fmt |= HDA_FMT_BITS_16;
+        frame = 4;
+    } else {
+        uint32_t b = c->in_bits;
+        fmt |= (b & 0x10) ? HDA_FMT_BITS_32 : (b & 0x08) ? HDA_FMT_BITS_24 : HDA_FMT_BITS_20;
+        frame = 8;
+    }
+    fmt |= HDA_FMT_CHAN(2);
+
+    bool was = hc->cap_running;
+    hda_cap_stop(hc);
+    hc->cap_rate          = f->rate;
+    hc->cap_format        = f->format;
+    hc->cap_hda_format    = fmt;
+    hc->cap_frame_bytes   = frame;
+    hc->cap_bytes_per_sec = f->rate * frame;
+    hc->cap_overruns      = 0;
+    hc->cap_recorded      = 0;
+    hc->cap_read_total    = 0;
+    hc->cap_pos = hc->cap_read_pos = 0;
+    return was ? hda_cap_start(hc) : SYS_OK;
+}
+
 //
 // /dev/audioN
 //
@@ -830,14 +1091,56 @@ static void hda_fill_report(struct HdaController* hc, struct AudioReport* r) {
         for (uint32_t i = 0; line[i] != '\0' && used + 1 < sizeof(r->text); i++)
             r->text[used++] = line[i];
     }
-    hda_codec_report(hc->codec, r->text, sizeof(r->text), &used);
+    hda_codec_report(hc, hda_verb, hc->codec, r->text, sizeof(r->text), &used);
     snprintf(line, sizeof(line), "stream %u fifo %u format %04x lpib %u sts %02x\n",
              (unsigned)hc->sd, (unsigned)hc->fifo_bytes, (unsigned)hc->hda_format,
              (unsigned)r32(hc, hc->sd_base + HDA_SD_LPIB), (unsigned)r8(hc, hc->sd_base + HDA_SD_STS));
     for (uint32_t i = 0; line[i] != '\0' && used + 1 < sizeof(r->text); i++)
         r->text[used++] = line[i];
+    if (hc->mic != NULL) {
+        snprintf(line, sizeof(line), "input stream %u fifo %u format %04x lpib %u sts %02x %s\n",
+                 (unsigned)hc->cap_sd, (unsigned)hc->cap_fifo, (unsigned)hc->cap_hda_format,
+                 (unsigned)r32(hc, hc->cap_sd_base + HDA_SD_LPIB), (unsigned)r8(hc, hc->cap_sd_base + HDA_SD_STS),
+                 hc->cap_running ? "recording" : "idle");
+        for (uint32_t i = 0; line[i] != '\0' && used + 1 < sizeof(r->text); i++)
+            r->text[used++] = line[i];
+    }
     r->text[used] = '\0';
     r->length = used;
+}
+
+static void hda_fill_capture(struct HdaController* hc, struct AudioCapture* k) {
+    memset(k, 0, sizeof(*k));
+    k->version = AUDIO_CAPTURE_VERSION;
+    k->present = hc->mic != NULL ? 1 : 0;
+    k->state   = hc->cap_running ? AUDIO_CAPTURE_RUNNING : hc->cap_open ? AUDIO_CAPTURE_OPEN : AUDIO_CAPTURE_IDLE;
+    k->source  = (hc->cap_running && hc->cap_path >= 0) ? hc->codec->in[hc->cap_path].kind : 0;
+    k->pid     = hc->cap_open ? hc->cap_pid : 0;
+    k->starts  = hc->cap_starts;
+    k->rate    = hc->cap_rate;
+    if (hc->cap_open)
+        memcpy(k->program, hc->cap_program, sizeof(k->program));
+    k->program[sizeof(k->program) - 1] = '\0';
+}
+
+static int32_t hda_report_ioctl(struct HdaController* hc, uint32_t arg) {
+    struct AudioReport* rep = (struct AudioReport*)malloc(sizeof(struct AudioReport));
+    if (rep == NULL)
+        return SYS_ENOMEM;
+    mutex_lock(&hda_lock);
+    hda_fill_report(hc, rep);
+    mutex_unlock(&hda_lock);
+    bool ok = chardev_copy_to_user(arg, rep, sizeof(*rep));
+    free(rep);
+    return ok ? SYS_OK : SYS_EFAULT;
+}
+
+static int32_t hda_capture_ioctl(struct HdaController* hc, uint32_t arg) {
+    struct AudioCapture k;
+    mutex_lock(&hda_lock);
+    hda_fill_capture(hc, &k);
+    mutex_unlock(&hda_lock);
+    return chardev_copy_to_user(arg, &k, sizeof(k)) ? SYS_OK : SYS_EFAULT;
 }
 
 static int32_t hda_ioctl(struct CharDevice* cd, uint32_t request, uint32_t arg) {
@@ -939,21 +1242,199 @@ static int32_t hda_ioctl(struct CharDevice* cd, uint32_t request, uint32_t arg) 
             mutex_unlock(&hda_lock);
             return chardev_copy_to_user(arg, &v, sizeof(v)) ? SYS_OK : SYS_EFAULT;
         }
-        case AUDIO_IOCTL_REPORT: {
-            struct AudioReport* rep = (struct AudioReport*)malloc(sizeof(struct AudioReport));
-            if (rep == NULL)
-                return SYS_ENOMEM;
-            mutex_lock(&hda_lock);
-            hda_fill_report(hc, rep);
-            mutex_unlock(&hda_lock);
-            bool ok = chardev_copy_to_user(arg, rep, sizeof(*rep));
-            free(rep);
-            return ok ? SYS_OK : SYS_EFAULT;
-        }
+        case AUDIO_IOCTL_REPORT:
+            return hda_report_ioctl(hc, arg);
+        case AUDIO_IOCTL_CAPTURE:
+            return hda_capture_ioctl(hc, arg);
         default:
             return SYS_ENOTTY;
     }
 }
+
+//
+// /dev/micN
+//
+
+static int32_t hda_mic_open(struct CharDevice* cd, uint16_t flags) {
+    (void)flags;            // No write op: the VFS opens it for reading only
+    struct HdaController* hc = (struct HdaController*)cd->driver_data;
+    // Whose it is, by the kernel's own record, for the tray's "in use by"
+    char     name[16];
+    uint32_t pid = kapi->caller_process(name, sizeof(name));
+
+    mutex_lock(&hda_lock);
+    int32_t r = hc->cap_open ? SYS_EBUSY : SYS_OK;
+    if (r == SYS_OK) {
+        hc->cap_open = true;
+        hc->cap_pid  = pid;
+        memset(hc->cap_program, 0, sizeof(hc->cap_program));
+        strncpy(hc->cap_program, name, sizeof(hc->cap_program) - 1);
+        hc->cap_overruns   = 0;
+        hc->cap_recorded   = 0;
+        hc->cap_read_total = 0;
+        hc->cap_pos = hc->cap_read_pos = 0;
+    }
+    mutex_unlock(&hda_lock);
+    return r;
+}
+
+static void hda_mic_close(struct CharDevice* cd) {
+    struct HdaController* hc = (struct HdaController*)cd->driver_data;
+    mutex_lock(&hda_lock);
+    hda_cap_stop(hc);
+    hc->cap_open = false;
+    hc->cap_pid  = 0;
+    memset(hc->cap_program, 0, sizeof(hc->cap_program));
+    mutex_unlock(&hda_lock);
+}
+
+// What has come in, whole frames; starts the recording if it isn't running
+static int32_t hda_mic_read(struct CharDevice* cd, void* buffer, uint32_t size) {
+    struct HdaController* hc = (struct HdaController*)cd->driver_data;
+    mutex_lock(&hda_lock);
+    if (!hc->cap_running && hda_cap_available(hc) == 0) {
+        int32_t r = hda_cap_start(hc);
+        if (r != SYS_OK) {
+            mutex_unlock(&hda_lock);
+            return r;
+        }
+    }
+    hda_cap_update(hc);
+    uint32_t n = hda_cap_available(hc);
+    if (n > size)
+        n = size;
+    n = n / hc->cap_frame_bytes * hc->cap_frame_bytes;
+    uint8_t* dst = (uint8_t*)buffer;
+    for (uint32_t done = 0; done < n; ) {
+        uint32_t off = (uint32_t)((hc->cap_read_pos + done) % HDA_CAP_BYTES);
+        uint32_t pg  = off / PAGE_SIZE, in = off % PAGE_SIZE;
+        uint32_t len = PAGE_SIZE - in;
+        if (len > n - done)
+            len = n - done;
+        if (hc->cap_muted) {
+            memset(dst + done, 0, len);
+        } else {
+            // The controller wrote it behind the caches' back: drop any
+            // stale lines first
+            hda_flush(hc->cap_page[pg] + in, len);
+            memcpy(dst + done, hc->cap_page[pg] + in, len);
+        }
+        done += len;
+    }
+    hc->cap_read_pos   += n;
+    hc->cap_read_total += n;
+    mutex_unlock(&hda_lock);
+    return (int32_t)n;
+}
+
+static int32_t hda_mic_ioctl(struct CharDevice* cd, uint32_t request, uint32_t arg) {
+    struct HdaController* hc = (struct HdaController*)cd->driver_data;
+    int32_t r = SYS_OK;
+    switch (request) {
+        case AUDIO_IOCTL_INFO: {
+            struct AudioInfo info;
+            mutex_lock(&hda_lock);
+            hda_fill_info(hc, &info);
+            const struct HdaCodec* c = hc->codec;
+            info.rates     = c->in_rates;
+            info.formats   = ((c->in_bits & 0x02) ? AUDIO_FORMAT_S16 : 0) | ((c->in_bits & 0x1C) ? AUDIO_FORMAT_S32 : 0);
+            info.outputs   = c->inputs;
+            info.hw_volume = c->in_has_gain ? 1 : 0;
+            info.buffer_bytes = HDA_CAP_BYTES - PAGE_SIZE;
+            mutex_unlock(&hda_lock);
+            return chardev_copy_to_user(arg, &info, sizeof(info)) ? SYS_OK : SYS_EFAULT;
+        }
+        case AUDIO_IOCTL_SET_FORMAT: {
+            struct AudioFormat f;
+            if (!chardev_copy_from_user(&f, arg, sizeof(f)))
+                return SYS_EFAULT;
+            if (f.version != AUDIO_FORMAT_VERSION)
+                return SYS_EINVAL;
+            mutex_lock(&hda_lock);
+            r = hda_cap_set_format(hc, &f);
+            mutex_unlock(&hda_lock);
+            return r;
+        }
+        case AUDIO_IOCTL_GET_FORMAT: {
+            struct AudioFormat f;
+            memset(&f, 0, sizeof(f));
+            mutex_lock(&hda_lock);
+            f.version  = AUDIO_FORMAT_VERSION;
+            f.rate     = hc->cap_rate;
+            f.channels = 2;
+            f.format   = hc->cap_format;
+            mutex_unlock(&hda_lock);
+            return chardev_copy_to_user(arg, &f, sizeof(f)) ? SYS_OK : SYS_EFAULT;
+        }
+        case AUDIO_IOCTL_START:
+            mutex_lock(&hda_lock);
+            r = hda_cap_start(hc);
+            mutex_unlock(&hda_lock);
+            return r;
+        case AUDIO_IOCTL_PAUSE:
+        case AUDIO_IOCTL_STOP:
+            mutex_lock(&hda_lock);
+            hda_cap_stop(hc);
+            mutex_unlock(&hda_lock);
+            return SYS_OK;
+        case AUDIO_IOCTL_STATUS: {
+            struct AudioStatus st;
+            memset(&st, 0, sizeof(st));
+            mutex_lock(&hda_lock);
+            hda_cap_update(hc);
+            uint32_t avail = hda_cap_available(hc);
+            uint32_t room  = HDA_CAP_BYTES - PAGE_SIZE;
+            st.version        = AUDIO_STATUS_VERSION;
+            st.state          = hc->cap_running ? AUDIO_STATE_RUNNING : AUDIO_STATE_STOPPED;
+            st.headphone      = hc->codec->mic_present;
+            st.frame_bytes    = hc->cap_frame_bytes;
+            st.queued_bytes   = avail;
+            st.free_bytes     = avail < room ? room - avail : 0;
+            st.buffer_bytes   = room;
+            st.underruns      = hc->cap_overruns;
+            st.played_frames  = hc->cap_recorded / hc->cap_frame_bytes;
+            st.written_frames = hc->cap_read_total / hc->cap_frame_bytes;
+            mutex_unlock(&hda_lock);
+            return chardev_copy_to_user(arg, &st, sizeof(st)) ? SYS_OK : SYS_EFAULT;
+        }
+        case AUDIO_IOCTL_SET_VOLUME: {
+            struct AudioVolume v;
+            if (!chardev_copy_from_user(&v, arg, sizeof(v)))
+                return SYS_EFAULT;
+            if (v.version != AUDIO_VOLUME_VERSION || v.left > 100 || v.right > 100)
+                return SYS_EINVAL;
+            mutex_lock(&hda_lock);
+            hc->cap_gain  = v.left > v.right ? v.left : v.right;
+            hc->cap_muted = v.mute != 0;
+            hda_cap_apply_gain(hc);
+            mutex_unlock(&hda_lock);
+            return SYS_OK;
+        }
+        case AUDIO_IOCTL_GET_VOLUME: {
+            struct AudioVolume v;
+            memset(&v, 0, sizeof(v));
+            mutex_lock(&hda_lock);
+            v.version = AUDIO_VOLUME_VERSION;
+            v.left = v.right = hc->cap_gain;
+            v.mute = hc->cap_muted ? 1 : 0;
+            mutex_unlock(&hda_lock);
+            return chardev_copy_to_user(arg, &v, sizeof(v)) ? SYS_OK : SYS_EFAULT;
+        }
+        case AUDIO_IOCTL_REPORT:
+            return hda_report_ioctl(hc, arg);
+        case AUDIO_IOCTL_CAPTURE:
+            return hda_capture_ioctl(hc, arg);
+        default:
+            return SYS_ENOTTY;
+    }
+}
+
+static const struct CharDeviceOps hda_mic_ops = {
+    .open  = hda_mic_open,
+    .close = hda_mic_close,
+    .read  = hda_mic_read,
+    .ioctl = hda_mic_ioctl,
+};
 
 // /dev/audioctlN reads as empty; read is there so it opens read-only
 static int32_t hda_ctl_read(struct CharDevice* cd, void* buffer, uint32_t size) {
@@ -996,13 +1477,198 @@ static void hda_discard(struct HdaController* hc) {
     free(hc);
 }
 
-static int hda_probe(struct Device* dev) {
-    if (!hda_ready) {
-        mutex_init(&hda_lock);
-        hda_ready = true;
+//
+// Codec drivers
+//
+
+// The controller's ids on the codec, for the codec driver's link
+static void hda_codec_ids(const struct HdaController* hc, struct HdaCodec* c) {
+    c->pci_vendor    = hc->pci_vendor;
+    c->pci_device    = hc->pci_device;
+    c->pci_subvendor = pci_config_read16(hc->pci_bus, hc->pci_dev, hc->pci_func, 0x2C);
+    c->pci_subdevice = pci_config_read16(hc->pci_bus, hc->pci_dev, hc->pci_func, 0x2E);
+}
+
+// The first registered codec driver that claims `c` (just read), or NULL
+static const struct HdaCodecDriver* hda_pick_driver(struct HdaController* hc, struct HdaCodec* c) {
+    for (uint32_t i = 0; i < HDA_CODEC_DRIVERS_MAX; i++) {
+        if (codec_drivers[i] != NULL && hda_codec_driver_match(hc, hda_verb, c, codec_drivers[i]))
+            return codec_drivers[i];
     }
-    const struct PCIDeviceInfo* pci = (const struct PCIDeviceInfo*)dev->bus_data;
-    if (dev->bus != BUS_PCI || pci == NULL)
+    return NULL;
+}
+
+// Read the codec at `addr` into `c` and find its paths, with the codec
+// driver that claims it; if that driver's pin fixes leave no usable output,
+// read it again and take the generic setup. False: no analog output.
+static bool hda_codec_load(struct HdaController* hc, struct HdaCodec* c, uint8_t addr) {
+    if (!hda_codec_read(hc, hda_verb, c, addr))
+        return false;
+    hda_codec_ids(hc, c);
+    c->drv = hda_pick_driver(hc, c);
+    if (hda_codec_route(hc, hda_verb, c))
+        return true;
+    if (c->drv == NULL)
+        return false;
+    char line[128];
+    snprintf(line, sizeof(line), "codec %u: %s's pin defaults leave no output (%s): generic setup",
+             (unsigned)addr, c->drv->name, c->why != NULL ? c->why : "?");
+    hda_serial(line);
+    if (!hda_codec_read(hc, hda_verb, c, addr))
+        return false;
+    hda_codec_ids(hc, c);
+    return hda_codec_route(hc, hda_verb, c);
+}
+
+// The codec read and set up again, with whichever codec driver claims it
+// now. What plays keeps playing (the DAC gets the stream's format again),
+// a recording keeps recording, volume and mute stay. hda_lock held.
+static void hda_rebind(struct HdaController* hc) {
+    char line[128];
+    struct HdaCodec* tmp = (struct HdaCodec*)malloc(sizeof(struct HdaCodec));
+    if (tmp == NULL) {
+        // Can't read it again: at least nothing points at the driver any more
+        hc->codec->drv = NULL;
+        hc->codec->flags = 0;
+        hda_serial("codec setup again: out of memory, codec driver dropped");
+        return;
+    }
+    if (hc->cap_running)
+        hda_codec_capture(hc, hda_verb, hc->codec, -1, 0, 0);
+
+    hc->verb_failures = 0;
+    if (hda_codec_load(hc, tmp, hc->codec->addr)) {
+        memcpy(hc->codec, tmp, sizeof(*tmp));
+    } else {
+        snprintf(line, sizeof(line), "codec %u read again: %s; old setup kept", (unsigned)hc->codec->addr,
+                 tmp->why != NULL ? tmp->why : "?");
+        hda_serial(line);
+        hc->codec->drv = NULL;
+        hc->codec->flags = 0;
+    }
+    free(tmp);
+
+    hda_codec_setup(hc, hda_verb, hc->codec);
+    hda_codec_volume(hc, hda_verb, hc->codec, hc->vol_left, hc->vol_right, hc->muted);
+    if (hc->hda_format != 0)
+        hda_codec_stream(hc, hda_verb, hc->codec, HDA_STREAM_TAG, hc->hda_format);
+    if (hc->cap_running) {
+        int path = hda_codec_capture_pick(hc, hda_verb, hc->codec);
+        hc->cap_path = path;
+        if (path >= 0) {
+            hda_codec_capture(hc, hda_verb, hc->codec, path, HDA_CAP_TAG, hc->cap_hda_format);
+            hda_cap_apply_gain(hc);
+        }
+    }
+    snprintf(line, sizeof(line), "audio%u: %s, %s", (unsigned)hc->index, hc->codec->name,
+             hc->codec->drv != NULL ? "codec driver" : "generic setup");
+    hda_serial(line);
+}
+
+bool hda_codec_register(const struct HdaCodecDriver* d) {
+    if (d == NULL || d->version < 1 || d->size < sizeof(struct HdaCodecDriver) || d->match == NULL ||
+        strnlen(d->name, sizeof(d->name)) >= sizeof(d->name))
+        return false;
+    mutex_lock(&hda_lock);
+    int slot = -1;
+    for (int i = 0; i < HDA_CODEC_DRIVERS_MAX; i++) {
+        if (codec_drivers[i] == d) {
+            mutex_unlock(&hda_lock);
+            return false;
+        }
+        if (codec_drivers[i] == NULL && slot < 0)
+            slot = i;
+    }
+    if (slot < 0) {
+        mutex_unlock(&hda_lock);
+        return false;
+    }
+    codec_drivers[slot] = d;
+    for (int i = 0; i < HDA_MAX_CONTROLLERS; i++) {
+        struct HdaController* hc = controllers[i];
+        if (hc != NULL && hc->codec->drv == NULL && hda_codec_driver_match(hc, hda_verb, hc->codec, d))
+            hda_rebind(hc);
+    }
+    mutex_unlock(&hda_lock);
+    return true;
+}
+
+void hda_codec_unregister(const struct HdaCodecDriver* d) {
+    if (d == NULL || !hda_ready)
+        return;
+    mutex_lock(&hda_lock);
+    for (int i = 0; i < HDA_CODEC_DRIVERS_MAX; i++) {
+        if (codec_drivers[i] == d)
+            codec_drivers[i] = NULL;
+    }
+    for (int i = 0; i < HDA_MAX_CONTROLLERS; i++) {
+        struct HdaController* hc = controllers[i];
+        if (hc == NULL || hc->codec->drv != d)
+            continue;
+        hda_codec_driver_release(hc, hda_verb, hc->codec);
+        hda_rebind(hc);
+    }
+    mutex_unlock(&hda_lock);
+}
+
+// From the poll, no lock held: once the system disk is there, load
+// <home>/sys/drivers/hda-<codec vendor id> for each codec that has no codec
+// driver yet (the kernel checks that only an admin can change the file).
+// One look per controller per boot.
+#define HDA_AUTOLOAD_MS     500         // How often to look for the system disk until it is there
+
+static void hda_autoload(void) {
+    static uint64_t last_ms = 0;
+    uint64_t now = timer_get_ms();
+    if (last_ms != 0 && now - last_ms < HDA_AUTOLOAD_MS)
+        return;
+    last_ms = now;
+    uint32_t ids[HDA_MAX_CONTROLLERS];
+    uint32_t wanted = 0;
+    mutex_lock(&hda_lock);
+    for (int i = 0; i < HDA_MAX_CONTROLLERS; i++) {
+        struct HdaController* hc = controllers[i];
+        ids[i] = 0;
+        if (hc == NULL || hc->autoload_done)
+            continue;
+        wanted++;
+        if (hc->codec->drv != NULL) {
+            hc->autoload_done = true;
+            continue;
+        }
+        ids[i] = hc->codec->vendor_id;
+    }
+    mutex_unlock(&hda_lock);
+    if (wanted == 0)
+        return;
+
+    bool no_home = false;
+    for (int i = 0; i < HDA_MAX_CONTROLLERS && !no_home; i++) {
+        if (ids[i] == 0)
+            continue;
+        bool repeat = false;
+        for (int j = 0; j < i; j++)
+            repeat = repeat || ids[j] == ids[i];
+        if (repeat)
+            continue;
+        char name[DRIVER_NAME_MAX];
+        snprintf(name, sizeof(name), "hda-%08x", (unsigned)ids[i]);
+        no_home = kapi->system_driver_load(name) == KAPI_LOAD_NO_HOME;
+    }
+    if (no_home)
+        return;                     // No system disk yet: next poll
+
+    mutex_lock(&hda_lock);
+    for (int i = 0; i < HDA_MAX_CONTROLLERS; i++) {
+        if (controllers[i] != NULL)
+            controllers[i]->autoload_done = true;
+    }
+    mutex_unlock(&hda_lock);
+}
+
+static int hda_probe(struct Device* dev) {
+    uint8_t bus, slot, func;
+    if (dev->bus != BUS_PCI || !kapi->pci_location(dev, &bus, &slot, &func))
         return PROBE_NOT_MINE;
 
     struct HdaController* hc = (struct HdaController*)malloc(sizeof(struct HdaController));
@@ -1010,11 +1676,11 @@ static int hda_probe(struct Device* dev) {
         return PROBE_FAILED;
     memset(hc, 0, sizeof(*hc));
     hc->dev        = dev;
-    hc->pci_bus    = pci->bus;
-    hc->pci_dev    = pci->dev;
-    hc->pci_func   = pci->func;
-    hc->pci_vendor = pci->vendor_id;
-    hc->pci_device = pci->device_id;
+    hc->pci_bus    = bus;
+    hc->pci_dev    = slot;
+    hc->pci_func   = func;
+    hc->pci_vendor = (uint16_t)dev->vendor;
+    hc->pci_device = (uint16_t)dev->product;
 
     char line[128];
     char id[16];
@@ -1022,8 +1688,8 @@ static int hda_probe(struct Device* dev) {
 
     pci_enable_command_bits(hc->pci_bus, hc->pci_dev, hc->pci_func,
                             PCI_COMMAND_MEMORY | PCI_COMMAND_INTX_DISABLE);
-    hc->regs = (volatile uint8_t*)pci_map_bar(hc->pci_bus, hc->pci_dev, hc->pci_func, 0, HDA_MMIO_SIZE,
-                                              VM_PRESENT | VM_READWRITE | VM_PCD);
+    hc->regs = (volatile uint8_t*)kapi->pci_map_bar(hc->pci_bus, hc->pci_dev, hc->pci_func, 0, HDA_MMIO_SIZE,
+                                                    true);
     if (hc->regs == NULL) {
         snprintf(line, sizeof(line), "%s: BAR 0 could not be mapped", id);
         hda_serial(line);
@@ -1063,8 +1729,8 @@ static int hda_probe(struct Device* dev) {
         w8(hc, HDA_RIRBCTL, 0);
     }
 
-    // The codec to use: the ALC269 if there is one, else the first with an
-    // analog output
+    // The codec to use: one a codec driver claims, else the ALC269 if there
+    // is one, else the first with an analog output
     hc->codec = (struct HdaCodec*)malloc(sizeof(struct HdaCodec));
     struct HdaCodec* tmp = (struct HdaCodec*)malloc(sizeof(struct HdaCodec));
     bool have = false;
@@ -1077,15 +1743,15 @@ static int hda_probe(struct Device* dev) {
             if (!hda_verb(hc, HDA_VERB(a, 0, HDA_GET_PARAMETER, HDA_PAR_VENDOR_ID), &vendor))
                 continue;
             hc->codec_ids[a] = vendor;
-            if (have && hc->codec->vendor_id == 0x10EC0269u)
+            if (have && (hc->codec->drv != NULL || hc->codec->vendor_id == 0x10EC0269u))
                 continue;
-            if (!hda_codec_parse(hc, hda_verb, tmp, a)) {
+            if (!hda_codec_load(hc, tmp, a)) {
                 snprintf(line, sizeof(line), "%s: codec %u (%08x) left alone: %s", id, (unsigned)a,
                          (unsigned)vendor, tmp->why != NULL ? tmp->why : "?");
                 hda_serial(line);
                 continue;
             }
-            if (!have || tmp->vendor_id == 0x10EC0269u) {
+            if (!have || tmp->drv != NULL || tmp->vendor_id == 0x10EC0269u) {
                 memcpy(hc->codec, tmp, sizeof(*tmp));
                 have = true;
             }
@@ -1151,6 +1817,36 @@ static int hda_probe(struct Device* dev) {
         snprintf(line, sizeof(line), "%s: /dev/%s could not be made", id, ctl_name);
         hda_serial(line);
     }
+    // The microphone: the first input stream, when there is one and the
+    // codec has an input. Missing it is not fatal either.
+    hc->cap_path = -1;
+    if (HDA_GCAP_ISS(hc->gcap) > 0 && hc->codec->in_count > 0 && hc->codec->in_rates != 0 &&
+        (hc->codec->in_bits & 0x1E) != 0) {
+        hc->cap_sd      = 0;
+        hc->cap_sd_base = HDA_SD_BASE;
+        struct AudioFormat cf = { AUDIO_FORMAT_VERSION, 48000, 2, AUDIO_FORMAT_S16, 0, 0 };
+        if (!(hc->codec->in_rates & AUDIO_RATE_48000))
+            cf.rate = (hc->codec->in_rates & AUDIO_RATE_44100) ? 44100 : 16000;
+        if (!(hc->codec->in_bits & 0x02))
+            cf.format = AUDIO_FORMAT_S32;
+        if (!hda_alloc_capture(hc)) {
+            hda_serial("no memory for the recording ring: no microphone");
+        } else if (hda_cap_set_format(hc, &cf) != SYS_OK) {
+            snprintf(line, sizeof(line), "%s: inputs take neither 48, 44.1 nor 16 kHz (rates %03x bits %02x)", id,
+                     (unsigned)hc->codec->in_rates, (unsigned)hc->codec->in_bits);
+            hda_serial(line);
+        } else {
+            hc->cap_gain = hda_codec_capture_default_gain(hc->codec, 0);
+            char mic_name[CHARDEV_NAME_MAX];
+            snprintf(mic_name, sizeof(mic_name), "mic%d", index);
+            hc->mic = chardev_register(mic_name, &hda_mic_ops, hc, SYS_SEC_MICROPHONE);
+            if (hc->mic == NULL) {
+                snprintf(line, sizeof(line), "%s: /dev/%s could not be made", id, mic_name);
+                hda_serial(line);
+            }
+        }
+    }
+
     mutex_lock(&hda_lock);
     controllers[index] = hc;
     mutex_unlock(&hda_lock);
@@ -1163,6 +1859,13 @@ static int hda_probe(struct Device* dev) {
              (o & AUDIO_OUT_HEADPHONE) ? " headphone" : "",
              ((o & AUDIO_OUT_HEADPHONE) && (o & AUDIO_OUT_LINE)) ? "," : "",
              (o & AUDIO_OUT_LINE) ? " line out" : "", name);
+    if (hc->mic != NULL) {
+        // "... (audio0), microphone (mic0)"
+        uint32_t n = (uint32_t)strlen(line);
+        if (n > 0 && line[n - 1] == '\n')
+            line[--n] = '\0';
+        snprintf(line + n, sizeof(line) - n, ", microphone (mic%d)\n", index);
+    }
     print(line);
     snprintf(line, sizeof(line), "%s: %s on %s, %s", name, hc->codec->name, id,
              hc->immediate ? "immediate commands" : "CORB/RIRB");
@@ -1177,6 +1880,8 @@ static void hda_remove(struct Device* dev) {
     if (hc == NULL)
         return;
     // Revokes open handles and waits out a call in progress
+    if (hc->mic != NULL)
+        chardev_unregister(hc->mic);
     if (hc->ctl != NULL)
         chardev_unregister(hc->ctl);
     chardev_unregister(hc->cd);
@@ -1190,6 +1895,7 @@ static void hda_remove(struct Device* dev) {
 static void hda_poll(void) {
     if (!hda_ready)
         return;
+    hda_autoload();
     mutex_lock(&hda_lock);
     uint64_t now = timer_get_ms();
     for (int i = 0; i < HDA_MAX_CONTROLLERS; i++) {
@@ -1197,9 +1903,11 @@ static void hda_poll(void) {
         if (hc == NULL)
             continue;
         hda_update(hc);
+        hda_cap_update(hc);
         if (now - hc->last_jack_ms >= HDA_JACK_MS) {
             hc->last_jack_ms = now;
             hda_codec_jack(hc, hda_verb, hc->codec);
+            hda_cap_jack(hc);
         }
     }
     mutex_unlock(&hda_lock);
@@ -1208,12 +1916,27 @@ static void hda_poll(void) {
 static const struct Driver hda_driver = {
     .name    = "hda",
     .abi     = DRIVER_ABI,
-    .flags   = DRIVER_BUILTIN,
-    .version = "0.1",
+    .version = "0.2",
     .match   = hda_match,
     .probe   = hda_probe,
     .remove  = hda_remove,
     .poll    = hda_poll,
     .poll_ms = HDA_POLL_MS,
 };
-DRIVER_BUILTIN_DECLARE(hda_driver);
+
+// Loaded by the kernel from <home>/sys/drivers/hda when it finds an HD Audio
+// controller (driver/autoload.c), or by "load" in the console. The kernel
+// then offers it the controllers nobody has taken.
+KDRV_ENTRY(api) {
+    kapi = api;
+    if (api->version < 4 || api->size < sizeof(struct KernelApi) || api->hda_provider_set == NULL)
+        return NULL;
+    if (!hda_ready) {
+        hda_lock = api->mutex_create();
+        if (hda_lock == NULL)
+            return NULL;
+        hda_ready = true;
+    }
+    api->hda_provider_set(&hda_driver, hda_codec_register, hda_codec_unregister);
+    return &hda_driver;
+}

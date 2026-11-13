@@ -29,6 +29,11 @@
  * (volume, mute), and set again when the service starts, so it survives a
  * restart; each program's under .../audio/apps, by the name it shows.
  *
+ * The microphone: while a program records (/dev/mic0, os/audio.h mic_*),
+ * a red microphone icon sits beside the speaker, and pointing at it names
+ * the program, as the kernel knows it. It looks twice a second and keeps
+ * the icon at least MIC_HOLD_MS, so even a short recording shows.
+ *
  * One at a time: a second copy finds the "audiosrv" port taken and stops.
  *
  * Permissions: file read and write (the registry and /dev/audio0 need
@@ -51,6 +56,9 @@
 #include "mixer.h"
 
 #define ICON_ID             1
+#define MIC_ICON_ID         2
+#define MIC_POLL_MS         500         // Who records, looked at this often
+#define MIC_HOLD_MS         3000        // The microphone icon stays at least this long
 #define ICON_PX             16
 #define INSTANCE_PORT       "audiosrv"
 #define REG_KEY             "hkey_user/control/audio"
@@ -116,6 +124,14 @@ static struct {
     char        tip[64];
     bool        menu_kept;          // The desktop opens the right-click menu itself
     bool        menu_mute;          // What it was sent with
+
+    // The microphone icon
+    bool        mic_shown;
+    uint32_t    mic_starts;         // audio_capture_t.starts last seen
+    bool        mic_have_starts;
+    uint64_t    mic_poll_at;
+    uint64_t    mic_until;          // Shown at least until then
+    char        mic_tip[64];
 
     // The panel
     wm_window_t popup;
@@ -313,6 +329,96 @@ static void icon_update(void) {
         strcpy(as.tip, tip);
     if (as.menu_kept && as.menu_mute != as.mute)
         menu_send();
+}
+
+//
+// The microphone icon
+//
+
+static void draw_mic(uint32_t* pic) {
+    memset(pic, 0, ICON_PX * ICON_PX * sizeof(uint32_t));
+    uint32_t red = 0xFFE04848u, dark = 0xFF902020u;
+    // The head: a capsule
+    for (int y = 1; y <= 9; y++) {
+        for (int x = 5; x <= 10; x++) {
+            bool corner = (y == 1 || y == 9) && (x == 5 || x == 10);
+            if (!corner)
+                put(pic, x, y, red);
+        }
+    }
+    for (int y = 3; y <= 7; y += 2)             // Grille lines
+        for (int x = 6; x <= 9; x++)
+            put(pic, x, y, dark);
+    // The holder: a U round the lower half
+    for (int y = 6; y <= 10; y++) {
+        put(pic, 3, y, red);
+        put(pic, 12, y, red);
+    }
+    for (int x = 4; x <= 11; x++)
+        put(pic, x, 11 + (x == 4 || x == 11 ? 0 : 1), red);
+    put(pic, 4, 11, red);
+    put(pic, 11, 11, red);
+    // Stem and foot
+    put(pic, 7, 13, red);
+    put(pic, 8, 13, red);
+    for (int x = 5; x <= 10; x++)
+        put(pic, x, 14, red);
+}
+
+static const char* mic_source(int source) {
+    switch (source) {
+        case AUDIO_IN_MIC:          return "microphone jack";
+        case AUDIO_IN_INTERNAL_MIC: return "built-in microphone";
+        case AUDIO_IN_LINE:         return "line in";
+        default:                    return NULL;
+    }
+}
+
+// Who records, from the control device; the icon shown or taken away
+static void mic_check(void) {
+    audio_capture_t k;
+    bool ok = as.fd >= 0 && audio_capture_status(as.fd, &k) == 0;
+    uint64_t t = now();
+    bool active = false;
+    if (ok) {
+        bool ran = as.mic_have_starts && k.starts != as.mic_starts;
+        as.mic_starts = k.starts;
+        as.mic_have_starts = true;
+        active = k.state == AUDIO_CAPTURE_RUNNING;
+        if (active || ran)
+            as.mic_until = t + MIC_HOLD_MS;
+    }
+    bool show = active || (as.mic_until != 0 && t < as.mic_until);
+
+    if (show) {
+        char tip[64];
+        if (ok && k.state != AUDIO_CAPTURE_IDLE && k.program[0] != '\0') {
+            const char* src = mic_source(k.source);
+            if (src != NULL)
+                snprintf(tip, sizeof(tip), "Microphone in use by %.15s (%s)", k.program, src);
+            else
+                snprintf(tip, sizeof(tip), "Microphone in use by %.15s", k.program);
+        } else if (as.mic_tip[0] != '\0') {
+            snprintf(tip, sizeof(tip), "%s", as.mic_tip);        // Just ended: keep the name
+        } else {
+            snprintf(tip, sizeof(tip), "Microphone in use");
+        }
+        if (!as.mic_shown) {
+            static uint32_t pic[ICON_PX * ICON_PX];
+            draw_mic(pic);
+            if (wm_tray_add(MIC_ICON_ID, pic, ICON_PX, ICON_PX, tip) == 0) {
+                as.mic_shown = true;
+                snprintf(as.mic_tip, sizeof(as.mic_tip), "%s", tip);
+            }
+        } else if (strcmp(tip, as.mic_tip) != 0 && wm_tray_set_tip(MIC_ICON_ID, tip) == 0) {
+            snprintf(as.mic_tip, sizeof(as.mic_tip), "%s", tip);
+        }
+    } else if (as.mic_shown) {
+        wm_tray_remove(MIC_ICON_ID);
+        as.mic_shown = false;
+        as.mic_tip[0] = '\0';
+        as.mic_until = 0;
+    }
 }
 
 //
@@ -824,10 +930,16 @@ static void tick(void) {
             popup_draw();
         }
     }
+    if (t >= as.mic_poll_at) {
+        as.mic_poll_at = t + MIC_POLL_MS;
+        mic_check();
+    }
 }
 
 static int32_t timeout(void) {
     uint64_t due = as.poll_at;
+    if (as.mic_poll_at < due)
+        due = as.mic_poll_at;
     if (as.save_at != 0 && as.save_at < due)
         due = as.save_at;
     uint64_t t = now();
@@ -916,6 +1028,8 @@ int main(void) {
         settings_save();
     if (as.popup != 0)
         wm_window_destroy(as.popup);
+    if (as.mic_shown)
+        wm_tray_remove(MIC_ICON_ID);
     wm_tray_remove(ICON_ID);
     device_close();
     ipc_close(as.instance);

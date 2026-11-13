@@ -126,6 +126,17 @@ int os_set_security(const char* path, uint32_t mask);
    system that keeps no write mask (FAT). */
 int os_set_write_security(const char* path, uint32_t mask);
 
+/* Set a program file's per-program permissions (os_finfo's exec_allow and
+   exec_deny), kept with the file: the SEC_PROGRAM_GATED bits (network,
+   microphone, input) it is given when it starts, and those it never gets,
+   not even by asking (sec_elevate is EPERM for them). The given ones count
+   when the program is started by the desktop, the explorer, the console or
+   another program in sys/ or bin/ started that way, or by a program that
+   holds the bit itself; started by any other program they are "ask". A bit in neither is "ask". Writing to the file clears both, and a
+   copy starts with none. Needs admin, like os_set_policy; EINVAL for other
+   bits or a bit in both, EISDIR for a folder, EACCES on FAT. */
+int os_set_exec_permissions(const char* path, uint32_t allow, uint32_t deny);
+
 /* The name of a group policy ("admin"), NULL for SYS_POLICY_NONE or an id
    this library doesn't know */
 const char* os_policy_name(uint32_t policy);
@@ -137,6 +148,13 @@ const char* os_policy_name(uint32_t policy);
    that must survive a power cut. 0, or -1 with errno: EIO, EPERM (no file
    write clearance). */
 int os_sync(void);
+
+/* Turn the machine off, or restart it (SYS_POWER): the kernel writes every
+   file system out first. Does not return on success; -1 with errno EPERM
+   without admin. Close what you have open (and os_sync your own files)
+   before calling: running programs are not told. */
+int os_poweroff(void);
+int os_restart(void);
 
 char* os_abspath(const char* path, char* out, size_t size);
 

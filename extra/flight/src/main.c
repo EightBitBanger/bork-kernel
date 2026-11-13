@@ -10,6 +10,8 @@
  * flight counts once you are down safe on the ground and press Escape. A
  * crash, being shot down or ejecting loses that flight's score, and a crash
  * or being shot down (not ejecting) kills the pilot for good.
+ * A flight that scores well enough earns a medal, shown by the pilot's name
+ * (and beside the tombstone afterwards).
  *
  * Then the menu lists the theaters (the endless made-up world, and every .map
  * file in maps/, here or next to the program) and the aircraft, each type

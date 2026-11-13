@@ -7,10 +7,11 @@
 #include <kernel/arch/x86/drivers/net/wlan.h>
 
 //
-// Scan helpers with no hardware in them: the Realtek USB receive buffer,
-// 802.11 beacons, the results table. Everything they read came off the air
-// or out of the adapter, so every length is checked against what is there
-// before a byte is read.
+// Scan helpers with no hardware in them: 802.11 beacons and the results
+// table. Everything they read came off the air, so every length is checked
+// against what is there before a byte is read. The Wi-Fi card drivers are
+// files (sys/drivers/athn-pci, rtw-usb) and reach these through the driver
+// table (driver/kapi.h).
 //
 
 // One received frame, as the adapter's descriptor describes it
@@ -24,13 +25,6 @@ struct WlanRxFrame {
 #define WLAN_RSSI_UNKNOWN       (-127)
 
 typedef void (*WlanRxFn)(void* ctx, const struct WlanRxFrame* frame);
-
-// Walk one USB receive transfer of a Realtek 802.11n/ac chip (24-byte RX
-// descriptors, each followed by an optional PHY status and the frame, the
-// next one 8-byte aligned). Frames with a CRC or ICV error, chip reports
-// (C2H) and anything cut short are skipped. Returns how many frames were
-// handed to `fn`.
-uint32_t wlan_rx_walk(const uint8_t* buffer, uint32_t length, bool cck_hipwr, WlanRxFn fn, void* ctx);
 
 // A beacon or probe response into `out` (zeroed first). `channel` is used
 // when the frame names none. False for anything else, or a frame too

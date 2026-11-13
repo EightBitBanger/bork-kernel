@@ -21,7 +21,7 @@
 // "File details")
 //
 
-_Static_assert(sizeof(SysFileInfo) == 40, "SysFileInfo is part of the user ABI");
+_Static_assert(sizeof(SysFileInfo) == 48, "SysFileInfo is part of the user ABI");
 _Static_assert(SYS_POLICY_NONE == POLICY_NONE && SYS_POLICY_USER == POLICY_USER &&
                SYS_POLICY_ADMIN == POLICY_ADMIN && SYS_POLICY_SYSTEM == POLICY_SYSTEM &&
                SYS_POLICY_NETWORK == POLICY_NETWORK, "SYS_POLICY_* must match POLICY_*");
@@ -208,6 +208,11 @@ static int32_t sys_finfo_locked(SysProcessFiles* t, const SyscallArgs* args) {
     uint32_t policy = POLICY_NONE;
     if (vfs_get_policy(path, &policy))
         info.policy = policy;
+    uint32_t exec_allow = 0, exec_deny = 0;
+    if (vfs_get_exec_permissions(path, &exec_allow, &exec_deny)) {
+        info.exec_allow = exec_allow;
+        info.exec_deny  = exec_deny;
+    }
     if (vfs_check_access(path))
         info.flags |= SYS_FINFO_ACCESS;
     if (vfs_check_access(path) && vfs_check_write_access(path))
@@ -364,6 +369,35 @@ static int32_t sys_setwritesec_locked(SysProcessFiles* t, const SyscallArgs* arg
 
 static int32_t sys_setwritesec(const SyscallArgs* args) {
     return sys_files_call(sys_setwritesec_locked, args);
+}
+
+//
+// setexecperm(path, allow, deny)
+//
+
+static int32_t sys_setexecperm_locked(SysProcessFiles* t, const SyscallArgs* args) {
+    uint32_t allow = args->arg2, deny = args->arg3;
+    if (((allow | deny) & ~SYS_SEC_PROGRAM_GATED) != 0 || (allow & deny) != 0)
+        return SYS_EINVAL;
+
+    char path[SYS_PATH_MAX];
+    int32_t result = sys_user_path(process_current_space(), t->cwd, args->arg1, path);
+    if (result < 0)
+        return result;
+
+    uint32_t old_mask = 0;
+    vfs_lock();
+    result = sys_secure_refusal(path, 0, true, &old_mask);
+    if (result == SYS_OK && vfs_directory_check(path))
+        result = SYS_EISDIR;
+    if (result == SYS_OK && !vfs_set_exec_permissions(path, allow, deny))
+        result = SYS_EACCES;    // A file system that keeps none (FAT)
+    vfs_unlock();
+    return result;
+}
+
+static int32_t sys_setexecperm(const SyscallArgs* args) {
+    return sys_files_call(sys_setexecperm_locked, args);
 }
 
 #endif

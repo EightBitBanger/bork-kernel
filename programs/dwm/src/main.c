@@ -73,7 +73,8 @@
  *                          there), the games folder (<home>/games), the
  *                          home drive and the drives; the shut down button
  *                          ("ui_shutdown") over the right end of the search
- *                          box; typing searches every
+ *                          box, the restart button ("ui_restart") left of
+ *                          it; typing searches every
  *                          drive for files and folders by name, and a
  *                          result opens as its icon would. Window buttons
  *                          bring windows to the front or minimize them.
@@ -1683,10 +1684,24 @@ static int compare_programs(const void* a, const void* b) {
     return strcasecmp(((const start_program_t*)a)->label, ((const start_program_t*)b)->label);
 }
 
-// The shut down button: the desktop ends, and main() saves the icons'
-// places and writes every file system out before it returns
+// What main() does once the desktop has ended: nothing (back to the
+// console: Esc and the like), or power off / restart
+typedef enum { POWER_STAY = 0, POWER_OFF, POWER_RESTART } power_after_t;
+static power_after_t power_after;
+
+// The shut down and restart buttons: the desktop ends, main() saves the
+// icons' places, closes every window and writes every file system out,
+// then asks the kernel to turn the machine off or restart it (SYS_POWER,
+// which the desktop's admin clearance allows)
 static void start_shutdown(const char* arg) {
     (void)arg;
+    power_after = POWER_OFF;
+    dwm_quit();
+}
+
+static void start_restart(const char* arg) {
+    (void)arg;
+    power_after = POWER_RESTART;
     dwm_quit();
 }
 
@@ -1887,6 +1902,7 @@ int main(void) {
     build_start_menu();
     dwm_start_set_open(open_path);          // Search results; the roots stay /mnt
     dwm_start_set_shutdown(start_shutdown); // The button over the search box's right end
+    dwm_start_set_restart(start_restart);   // ... and the one left of it
 
     if (layout_load() < 0)
         dwm_notifyf(DWM_NOTIFY_ERROR, "Layout not loaded", "%s", strerror(errno));
@@ -1914,5 +1930,11 @@ int main(void) {
     layout_free();
     imagelib_free();
     fontlib_free();
+
+    // Only returns if the kernel refused (no admin): back to the console
+    if (power_after == POWER_OFF)
+        os_poweroff();
+    else if (power_after == POWER_RESTART)
+        os_restart();
     return rc < 0 ? 1 : 0;
 }

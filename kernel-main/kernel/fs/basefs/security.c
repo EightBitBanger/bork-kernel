@@ -41,6 +41,30 @@ bool fs_file_set_write_security(struct FSDeviceContext* ctx, uint64_t address, u
     return true;
 }
 
+// Per-program permissions (FSBlockHeader.exec_allow / exec_deny)
+bool fs_file_get_exec_permissions(struct FSDeviceContext* ctx, uint64_t address,
+                                  uint32_t* allow, uint32_t* deny) {
+    if (!ctx || address == FS_NULL || allow == NULL || deny == NULL) return false;
+    struct FSBlockHeader header;
+    fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
+    *allow = header.exec_allow;
+    *deny  = header.exec_deny;
+    return true;
+}
+
+bool fs_file_set_exec_permissions(struct FSDeviceContext* ctx, uint64_t address,
+                                  uint32_t allow, uint32_t deny) {
+    if (!ctx || address == FS_NULL) return false;
+    struct FSBlockHeader header;
+    fs_mem_read(ctx, address, &header, sizeof(struct FSBlockHeader));
+    if (header.exec_allow == allow && header.exec_deny == deny)
+        return true;    // Nothing to write (the open-for-write path calls this every time)
+    header.exec_allow = allow;
+    header.exec_deny  = deny;
+    fs_mem_write(ctx, address, &header, sizeof(struct FSBlockHeader));
+    return true;
+}
+
 bool fs_file_get_security_flag(struct FSDeviceContext* ctx, uint64_t address, uint8_t* security) {
     if (!ctx || address == FS_NULL || security == NULL) return false;
     struct FSBlockHeader header;

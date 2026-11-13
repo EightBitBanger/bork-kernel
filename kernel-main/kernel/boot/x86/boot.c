@@ -326,6 +326,7 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
         // one that shows them the prompt (SYS_ELEVATE_AGENT). SYS_SEC_NET is
         // the same: the dwm doesn't use the network, it can hand it to the
         // programs it starts (none get it unless their mask asks for it).
+        // SYS_SEC_MICROPHONE likewise, for when there is sound input.
         if (start_desktop) {
             strncat(sys_path, "/dwm", sizeof(sys_path) - strlen(sys_path) - 1);
             char* args[] = { sys_path, NULL };
@@ -333,7 +334,8 @@ void kmain(uint32_t magic, struct MultibootInfo* mbi) {
             uint32_t proc_sec = SYS_SEC_FILE_RW | SYS_SEC_ADMIN | 
                                 SYS_SEC_GFX | SYS_SEC_GFX_SCREEN | 
                                 SYS_SEC_IPC | SYS_SEC_INPUT | SYS_SEC_EXEC |
-                                SYS_SEC_ELEVATE | SYS_SEC_NET | SYS_SEC_NET_CONFIG;
+                                SYS_SEC_ELEVATE | SYS_SEC_NET | SYS_SEC_NET_CONFIG |
+                                SYS_SEC_MICROPHONE;
             
             console_cmd_execute(1, args, proc_sec, CONSOLE_THREAD_BLOCK | CONSOLE_THREAD_NO_BREAK);
         } else {

@@ -99,6 +99,10 @@ void dwm_start_set_open(dwm_start_action_t open);
 // has closed. NULL: no button (the default).
 void dwm_start_set_shutdown(dwm_start_action_t action);
 
+// The restart button, left of the shut down button: the same, "ui_restart"
+// (24x24) or a drawn arrow. NULL: no button (the default).
+void dwm_start_set_restart(dwm_start_action_t action);
+
 // Folders the search walks (copied, at most 8). NULL / 0: "/mnt".
 void dwm_start_set_search_roots(const char* const* roots, size_t count);
 

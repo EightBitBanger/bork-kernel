@@ -114,6 +114,11 @@ bool vfs_fs_node_allowed(struct FsMount* mount, uint64_t address);
 bool vfs_remove_allowed(struct FsMount* mount, uint64_t address);
 bool vfs_path_allowed(const char* path);
 bool vfs_parent_allowed(const char* path);
+
+// Drop a file's per-program permissions (exec_allow / exec_deny) because
+// its contents change. Nothing if it has none or the type stores none.
+// The caller holds the VFS lock.
+void vfs_exec_permissions_clear_node(struct FsMount* mount, uint64_t address);
 // The same for writing: the object's security | write_security
 // (vfs_remove_allowed already uses it, for the object and all below it)
 bool vfs_fs_node_write_allowed(struct FsMount* mount, uint64_t address);

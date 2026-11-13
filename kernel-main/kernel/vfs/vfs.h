@@ -471,6 +471,23 @@ bool vfs_check_parent_write_access(const char* path);
 bool vfs_get_write_security(const char* path, uint32_t* security);
 bool vfs_set_write_security(const char* path, uint32_t security);
 
+// Per-program permissions of a program file (FsNodeAttr.exec_allow /
+// exec_deny, basefs: FSBlockHeader): the gated SYS_SEC_* bits it is always
+// given when started, and those it never gets. Reading needs nothing (like
+// stat); 0 / 0 on a filesystem that stores none (FAT). Setting needs
+// VFS_SECURITY_ADMIN and fails on a directory or a filesystem that can't
+// store them. Opening the file for writing, writing to it, or truncating
+// it clears both: they belong to the contents they were set on.
+bool vfs_get_exec_permissions(const char* path, uint32_t* allow, uint32_t* deny);
+bool vfs_set_exec_permissions(const char* path, uint32_t allow, uint32_t deny);
+
+// The same for an open file, read from the object the handle is on (not
+// from whatever stands at its path by now), with what writing it needs
+// (security | write_security). Any pointer may be NULL. False for a handle
+// that is not a file on a mounted device. The loader goes by this, so the
+// permissions it applies are those of the image it loads.
+bool vfs_file_exec_info(File file, uint32_t* allow, uint32_t* deny, uint32_t* write_required);
+
 // Kernel nodes
 //
 // Revoke every open handle on kernel node `address` before its owner frees

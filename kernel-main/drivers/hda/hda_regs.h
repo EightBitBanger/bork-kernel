@@ -226,11 +226,19 @@ struct HdaBdlEntry {
 #define HDA_PINCAP_OUTPUT       (1u << 4)
 #define HDA_PINCAP_INPUT        (1u << 5)
 #define HDA_PINCAP_HDMI         (1u << 7)
+#define HDA_PINCAP_VREF_50      (1u << 9)   // Bits 15:8: the bias levels it can give
+#define HDA_PINCAP_VREF_80      (1u << 12)
+#define HDA_PINCAP_VREF_100     (1u << 13)
 #define HDA_PINCAP_EAPD         (1u << 16)
 #define HDA_PINCAP_DP           (1u << 24)
 
 // Pin widget control
+#define HDA_PINCTL_IN           (1u << 5)
 #define HDA_PINCTL_OUT          (1u << 6)
+#define HDA_PINCTL_VREF_HIZ     0x0     // Bits 2:0: microphone bias
+#define HDA_PINCTL_VREF_50      0x1
+#define HDA_PINCTL_VREF_80      0x4
+#define HDA_PINCTL_VREF_100     0x5
 #define HDA_PINCTL_HP           (1u << 7)
 
 #define HDA_EAPD_ENABLE         (1u << 1)
@@ -252,6 +260,8 @@ struct HdaBdlEntry {
 #define HDA_DEV_LINE_OUT        0x0
 #define HDA_DEV_SPEAKER         0x1
 #define HDA_DEV_HP_OUT          0x2
+#define HDA_DEV_LINE_IN         0x8
+#define HDA_DEV_MIC_IN          0xA
 
 #define HDA_CFG_MISC_NO_DETECT  (1u << 0)   // Jack detect override
 

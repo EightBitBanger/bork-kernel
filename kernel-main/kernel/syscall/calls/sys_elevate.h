@@ -9,6 +9,7 @@
 #include <kernel/syscall/calls/sys_user.h>
 #include <kernel/scheduler/process.h>
 #include <kernel/security/elevate.h>
+#include <kernel/vfs/vfs.h>
 
 //
 // elevate(reason or 0, bits or 0) -> 0 once `bits` (0: SYS_SEC_ADMIN) are held
@@ -33,6 +34,16 @@ static int32_t sys_elevate(const SyscallArgs* args) {
             return length;
     }
     uint32_t bits = (args->arg2 != 0) ? args->arg2 : SYS_SEC_ADMIN;
+
+    // A bit the program's file denies it (SYS_SETEXECPERM) is never asked for
+    char name[PROCESS_NAME_MAX], path[PROCESS_PATH_MAX];
+    uint32_t allow = 0, deny = 0;
+    if ((bits & SYS_SEC_PROGRAM_GATED) != 0 &&
+        ProcessGetImage(process_current_id(), name, path) &&
+        vfs_get_exec_permissions(path, &allow, &deny) &&
+        (bits & deny & SYS_SEC_PROGRAM_GATED) != 0)
+        return SYS_EPERM;
+
     return elevate_request(reason, bits);
 }
 

@@ -2,8 +2,11 @@
 #define _OS_AUDIO_H
 
 /*
- * Sound output: raw PCM to /dev/audioN (the kernel's HDA driver, for the
- * Realtek ALC269 and other HDA codecs).
+ * Sound output (and input: mic_open, below) for the HDA driver.
+ *
+ * Sound output: raw PCM to /dev/audioN (the HDA driver file,
+ * <home>/sys/drivers/hda, for the Realtek ALC269 and other HDA codecs; with
+ * that file gone there is no /dev/audioN and audio_open fails).
  *
  * One stream per device, played exactly as written. The kernel does no
  * mixing, resampling or format conversion: to play several sounds at once,
@@ -70,12 +73,14 @@
 #define AUDIO_IOCTL_SET_VOLUME  0x41550008u
 #define AUDIO_IOCTL_GET_VOLUME  0x41550009u
 #define AUDIO_IOCTL_REPORT      0x4155000Au
+#define AUDIO_IOCTL_CAPTURE     0x4155000Bu
 
 #define AUDIO_INFO_VERSION      1
 #define AUDIO_FORMAT_VERSION    1
 #define AUDIO_STATUS_VERSION    1
 #define AUDIO_VOLUME_VERSION    1
 #define AUDIO_REPORT_VERSION    1
+#define AUDIO_CAPTURE_VERSION   1
 
 #define AUDIO_FORMAT_S16        0x0001
 #define AUDIO_FORMAT_S32        0x0002
@@ -95,6 +100,16 @@
 #define AUDIO_OUT_SPEAKER       0x01
 #define AUDIO_OUT_HEADPHONE     0x02
 #define AUDIO_OUT_LINE          0x04
+
+/* audio_info().outputs on a microphone descriptor, audio_capture_t.source */
+#define AUDIO_IN_MIC            0x01    /* Microphone jack */
+#define AUDIO_IN_INTERNAL_MIC   0x02    /* Built-in microphone */
+#define AUDIO_IN_LINE           0x04    /* Line in */
+
+/* audio_capture_t.state */
+#define AUDIO_CAPTURE_IDLE      0       /* Nobody has the microphone */
+#define AUDIO_CAPTURE_OPEN      1       /* Open, not recording */
+#define AUDIO_CAPTURE_RUNNING   2       /* Recording now */
 
 #define AUDIO_STATE_STOPPED     0
 #define AUDIO_STATE_RUNNING     1
@@ -156,6 +171,19 @@ typedef struct {
     char     text[AUDIO_REPORT_MAX];
 } audio_report_t;
 
+typedef struct {
+    uint32_t version;
+    uint8_t  state;             /* AUDIO_CAPTURE_* */
+    uint8_t  source;            /* AUDIO_IN_* being recorded (0: none) */
+    uint8_t  present;           /* 1: the device has a microphone */
+    uint8_t  reserved;
+    uint32_t pid;               /* Who holds it (0: nobody) */
+    uint32_t starts;            /* Recordings started since boot: a change means one ran */
+    uint32_t rate;
+    char     program[16];       /* Its executable's name, as the kernel knows it */
+} audio_capture_t;
+
+_Static_assert(sizeof(audio_capture_t) == 36, "audio_capture_t is the kernel's AudioCapture");
 _Static_assert(sizeof(audio_info_t) == 64, "audio_info_t is the kernel's AudioInfo");
 _Static_assert(sizeof(audio_format_t) == 20, "audio_format_t is the kernel's AudioFormat");
 _Static_assert(sizeof(audio_status_t) == 40, "audio_status_t is the kernel's AudioStatus");
@@ -209,6 +237,67 @@ int  audio_get_volume(int fd, audio_volume_t* volume);
 /* What the driver found (controller, codec, pins, routes) as text lines,
    for bug reports. NUL-terminated; returns its length. */
 int  audio_report(int fd, char* text, size_t size);
+
+/* Who is recording: on an audio_ctl_open or mic_open descriptor. Any
+   program may ask (the tray shows a microphone icon while one records). */
+int  audio_capture_status(int fd, audio_capture_t* status);
+
+/*
+ * Sound input: the microphone, /dev/mic<index> (the same HDA driver).
+ *
+ * Needs the microphone permission, SEC_MICROPHONE (os/security.h). A
+ * program doesn't have it unless its Properties say Allow for Microphone,
+ * or the user says yes to mic_request()'s prompt (Deny there: EPERM, no
+ * prompt). Taking the bit away (sec_drop) stops a descriptor already open.
+ *
+ *     if (mic_request("Record a voice note") < 0)          // the prompt, if needed
+ *         return;                                          // errno says why
+ *     int fd = mic_open(0);
+ *     mic_set_format(fd, 48000, 2, AUDIO_FORMAT_S16);      // optional: that is the default
+ *     mic_start(fd);                                       // or the first read starts it
+ *     long n = mic_read(fd, buf, sizeof(buf));             // what has come in; never waits
+ *     ...
+ *     mic_close(fd);                                       // stops recording
+ *
+ * Frames are like audio output's: signed little-endian, left then right
+ * (the same sound twice for a mono microphone). Rates are the ADC's,
+ * audio_info(fd).rates (the ALC269: 44.1, 48, 96 kHz). The driver keeps
+ * about 680 ms at 48 kHz 16-bit (audio_info().buffer_bytes); what isn't
+ * read in time is dropped, oldest first, and audio_status().underruns
+ * counts the times. audio_status on a microphone: queued_bytes is what
+ * waits to be read, played_frames what was recorded, written_frames what
+ * was read, headphone 1 while a microphone is plugged into the jack.
+ *
+ * The input recorded is a microphone in the jack when one is plugged in
+ * (and the jack can tell), else the built-in one; it follows a plug going
+ * in or out while recording. One program at a time (EBUSY).
+ *
+ * While a program records, the volume tray shows a microphone icon, and
+ * pointing at it names the program.
+ */
+
+/* SEC_MICROPHONE for this program: 0 at once when held, else the
+   permission prompt (sec_elevate_bits) with `reason` under it. -1 with
+   errno: EACCES the user said no, EPERM this program is denied the
+   microphone (or may not ask), ETIMEDOUT, EAGAIN no desktop, EBUSY. */
+int  mic_request(const char* reason);
+/* /dev/mic<index> for reading. -1 with errno: EACCES (no SEC_MICROPHONE),
+   ENOENT (no microphone), EBUSY (another program records). */
+int  mic_open(int index);
+int  mic_close(int fd);
+/* The default is 48 kHz (else 44.1) S16 stereo. Stops a recording. */
+int  mic_set_format(int fd, uint32_t rate, int channels, int format);
+int  mic_start(int fd);
+int  mic_stop(int fd);          /* Stop recording; what came in can still be read */
+/* What has come in, whole frames, at most `bytes`: the bytes read (0:
+   nothing yet). Starts recording when it isn't. Never waits. */
+long mic_read(int fd, void* data, size_t bytes);
+/* All `bytes` (whole frames), sleeping as needed: bytes, or -1 */
+long mic_read_all(int fd, void* data, size_t bytes);
+/* Capture gain 0..100 (0 dB is where it starts; audio_info().hw_volume 0:
+   none), and a mute that records silence */
+int  mic_set_gain(int fd, int level, int mute);
+int  mic_get_gain(int fd, int* level, int* mute);
 
 /* Helpers */
 int      audio_frame_bytes(int format, int channels);   /* 4 for S16 stereo, 0 if unknown */
